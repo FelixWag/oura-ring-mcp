@@ -151,3 +151,107 @@ oura-mcp/
   tsconfig.json
   README.md
   CLAUDE.md
+```
+
+## Future Roadmap
+
+Do not implement these unless asked, but design the code so they are possible later:
+
+## v0.2
+
+* Better summaries and derived metrics.
+* Natural language helper tools, e.g. “compare last 7 days to previous 7 days”.
+* Better error handling and API rate-limit handling.
+
+## v0.3
+
+* Read/write support for tags, if supported by the Oura API.
+* Ability to add annotations such as illness, alcohol, travel, workout, stress, etc.
+
+## v0.4
+
+* Local SQLite database.
+* Sync Oura data locally.
+* Query historical data without repeatedly hitting the Oura API.
+* Let the LLM analyze longer-term patterns.
+
+## v0.5
+
+* Visualizations or export tools.
+* Weekly/monthly health reports.
+
+## Development Process
+
+Before making code changes, first create a plan.
+
+The plan should include:
+
+1. Proposed architecture.
+2. Files to create or modify.
+3. Exact MCP tools to implement.
+4. OAuth flow approach.
+5. Security considerations.
+6. Testing strategy.
+7. Any assumptions or open questions.
+
+Do not start implementation until I approve the plan.
+
+## Definition of Done for v0.1
+
+The first version is done when:
+
+1. The project installs with npm install.
+2. The project builds with npm run build.
+3. The MCP server can be started locally.
+4. Claude Code can connect to it as an MCP server.
+5. At least one Oura API query tool works end-to-end.
+6. Tokens and secrets are not committed.
+7. README explains setup clearly.
+8. .env.example documents required variables.
+
+## Prompt for Claude Code
+
+```text
+I want to build a personal Oura Ring MCP server for Claude Code.
+
+Please read the repository context and the `CLAUDE.md` file carefully first.
+
+Important: do not start coding immediately. First create a detailed implementation plan and wait for my approval.
+
+The goal for v0.1 is a minimal read-only MCP server that lets Claude Code query my Oura Ring data through the official Oura API v2 using OAuth2.
+
+Please plan the project with the following priorities:
+
+1. TypeScript / Node.js implementation.
+2. Use the official MCP TypeScript SDK where appropriate.
+3. Implement OAuth2 authentication for Oura.
+4. Store tokens locally but never commit them.
+5. Add `.env.example` and `.gitignore`.
+6. Implement a small number of read-only MCP tools first:
+   - `oura_get_daily_summary`
+   - `oura_get_sleep`
+   - `oura_get_activity`
+   - `oura_get_heartrate`
+   - optionally `oura_get_personal_info`
+7. Keep the code clean and GitHub-publishable.
+8. Include a README with setup instructions for Claude Code.
+9. Keep future extensions in mind, especially:
+   - adding tags/activities later,
+   - syncing data into a local SQLite database later,
+   - allowing longer-term LLM analysis.
+
+In your plan, please include:
+
+- proposed architecture,
+- file structure,
+- exact packages to install,
+- OAuth flow design,
+- MCP server design,
+- Oura API endpoints you intend to call,
+- local token storage design,
+- security considerations,
+- testing strategy,
+- expected commands for setup and running,
+- how to connect the MCP server to Claude Code.
+
+After presenting the plan, stop and ask me for approval before implementing.
