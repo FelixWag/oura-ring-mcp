@@ -70,6 +70,19 @@ web_modules/
 .env.*
 !.env.example
 
+# Local OAuth tokens — never commit
+tokens.json
+*.tokens.json
+
+# Local SQLite databases (future v0.4)
+*.sqlite
+*.sqlite-journal
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+
 # parcel-bundler cache (https://parceljs.org/)
 .cache
 .parcel-cache
