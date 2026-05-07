@@ -98,7 +98,12 @@ async function main(): Promise<void> {
       }
     });
     server.on('error', reject);
-    server.listen(port, '127.0.0.1', () => {
+    // Bind to whatever the redirect URI says. If "localhost", let Node resolve
+    // it (handles IPv6-default systems where ::1 resolves first); otherwise
+    // bind to the literal IP. Hardcoding 127.0.0.1 here would break setups
+    // where `localhost` resolves to ::1.
+    const listenHost = redirectUrl.hostname === 'localhost' ? 'localhost' : redirectUrl.hostname;
+    server.listen(port, listenHost, () => {
       // Wait briefly so the listener is ready before we open the browser.
       setTimeout(() => openInBrowser(authUrl), 250);
     });
