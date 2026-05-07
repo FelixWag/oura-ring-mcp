@@ -13,12 +13,13 @@ Read-only, OAuth2, runs locally over stdio. Personal project — but clean and e
 ## Features
 
 - OAuth2 authorization-code flow with automatic token refresh.
-- Five read-only MCP tools:
-  - `oura_get_daily_summary` — merged sleep/readiness/activity per day
-  - `oura_get_sleep` — detailed sleep periods
-  - `oura_get_activity` — daily activity records
-  - `oura_get_heartrate` — heart-rate time series
-  - `oura_get_personal_info` — basic profile
+- Eight read-only MCP tools — five raw-data tools plus three derived-metric tools:
+  - `oura_get_daily_summary` / `oura_get_sleep` / `oura_get_activity` / `oura_get_heartrate` / `oura_get_personal_info`
+  - `oura_get_recent_summary` — last N days, no date math required
+  - `oura_compare_periods` — averages + deltas between two periods (this week vs last, etc.)
+  - `oura_get_trends` — rolling averages + linear trend direction
+- Compact-by-default responses keep payloads small enough for LLMs to reason over.
+- Automatic token refresh + 429 / Retry-After-aware rate-limit handling.
 - Local token storage at `~/.config/oura-ring-mcp/tokens.json`.
 - TypeScript, no exotic dependencies, MIT licensed.
 
@@ -73,21 +74,38 @@ Or edit `~/.claude.json` manually:
 }
 ```
 
-Restart Claude Code, then run `/mcp` — you should see `oura` listed with five tools.
+Restart Claude Code, then run `/mcp` — you should see `oura` listed with all eight tools.
 Try asking: _"Show my Oura daily summary for the last 7 days."_
 
 ## Tools
 
+### Raw access
+
 | Tool                     | Inputs                                      | Notes                                             |
 | ------------------------ | ------------------------------------------- | ------------------------------------------------- |
-| `oura_get_daily_summary` | `start_date`, `end_date` (YYYY-MM-DD)       | Merges daily sleep, readiness, activity per date. |
-| `oura_get_sleep`         | `start_date`, `end_date`                    | Detailed per-sleep-period records.                |
-| `oura_get_activity`      | `start_date`, `end_date`                    | Daily activity rows.                              |
+| `oura_get_daily_summary` | `start_date`, `end_date`, `verbose?`        | Merges daily sleep, readiness, activity per date. |
+| `oura_get_sleep`         | `start_date`, `end_date`, `verbose?`        | Detailed per-sleep-period records.                |
+| `oura_get_activity`      | `start_date`, `end_date`, `verbose?`        | Daily activity rows.                              |
 | `oura_get_heartrate`     | `start_datetime`, `end_datetime` (ISO 8601) | Time-series; prefer narrow windows.               |
 | `oura_get_personal_info` | none                                        | Profile metadata.                                 |
 
-All date-range tools cap requests at 90 days. Pagination follows up to 5 pages
-(Oura's `next_token`). The response includes `truncated: true` when there is more.
+### Derived metrics (v0.2)
+
+| Tool                      | Inputs                                            | Notes                                             |
+| ------------------------- | ------------------------------------------------- | ------------------------------------------------- |
+| `oura_get_recent_summary` | `days` (1–90)                                     | Convenience wrapper for "the last N days".        |
+| `oura_compare_periods`    | `days` **or** `a_start`/`a_end`/`b_start`/`b_end` | Per-metric averages + deltas + direction.         |
+| `oura_get_trends`         | `start_date`, `end_date`, `window?` (default 7)   | Rolling averages + linear trend (improving/etc.). |
+
+### Notes
+
+- All date-range tools cap requests at 90 days. Pagination follows up to 5 pages
+  (Oura's `next_token`). The response includes `truncated: true` when there is more.
+- **`verbose` defaults to `false`** — responses are compact projections (scores,
+  key contributors, durations). Pass `verbose: true` when you actually need the
+  raw nested API rows. Compact responses are typically 10–20× smaller and far
+  easier for an LLM to reason over.
+- Future-dated requests are rejected before any API call is made.
 
 ## Configuration
 
@@ -121,8 +139,10 @@ src/
     tools.ts        # tool definitions
   oura/
     auth.ts         # OAuth helpers, token storage
-    client.ts       # API client with auto-refresh
+    client.ts       # API client with auto-refresh + 429 retry
     endpoints.ts    # endpoint paths
+    shape.ts        # raw API → compact projections
+    derive.ts       # averages, deltas, rolling means, trend
 scripts/
   oauth-login.ts    # interactive OAuth flow
   setup.ts          # writes .env interactively
@@ -153,16 +173,16 @@ stderr; tokens are never logged.
 - Token files are written atomically with `0600` perms.
 - Refresh tokens rotate; the client saves the new one immediately.
 - Tools are strictly read-only in this version.
-- The MCP server only exposes the five tools above — no shell exec, no fs access.
+- The MCP server only exposes the eight tools above — no shell exec, no fs access.
 
 ## Roadmap
 
-- v0.2 — derived metrics ("compare last 7 days to previous 7 days"), better
-  rate-limit handling.
-- v0.3 — write tools (tags, manual annotations like illness, alcohol, travel).
-- v0.4 — local SQLite mirror so the LLM can reason over long histories without
+- ✅ **v0.1** — read-only OAuth2, five raw tools.
+- ✅ **v0.2** — derived metrics, compact-by-default responses, 429 handling.
+- **v0.3** — write tools (tags, manual annotations like illness, alcohol, travel).
+- **v0.4** — local SQLite mirror so the LLM can reason over long histories without
   re-hitting the API.
-- v0.5 — exports and reports.
+- **v0.5** — exports and reports.
 
 ## License
 

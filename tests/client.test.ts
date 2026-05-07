@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import { saveTokens, type StoredTokens } from '../src/oura/auth.js';
-import { OuraClient } from '../src/oura/client.js';
+import { OuraClient, parseRetryAfter } from '../src/oura/client.js';
 
 function tokens(overrides: Partial<StoredTokens> = {}): StoredTokens {
   return {
@@ -138,5 +138,95 @@ describe('OuraClient', () => {
     await expect(client.getCollection('/usercollection/daily_sleep', {})).rejects.toThrow(
       /No saved tokens/,
     );
+  });
+
+  it('retries once on 429 honoring Retry-After', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oura-cli-'));
+    const path = join(dir, 'tokens.json');
+    await saveTokens(path, tokens());
+
+    let calls = 0;
+    const fetchImpl = vi.fn(async () => {
+      calls += 1;
+      if (calls === 1) {
+        return new Response('rate limited', {
+          status: 429,
+          headers: { 'Retry-After': '0' },
+        });
+      }
+      return jsonResponse({ data: [{ day: 'd1' }], next_token: null });
+    });
+
+    const sleepCalls: number[] = [];
+    const sleepImpl = async (ms: number) => {
+      sleepCalls.push(ms);
+    };
+
+    const client = new OuraClient({
+      clientId: 'cid',
+      clientSecret: 'csec',
+      tokenPath: path,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      sleepImpl,
+    });
+
+    const r = await client.getCollection('/usercollection/daily_sleep', {
+      start_date: '2026-01-01',
+      end_date: '2026-01-02',
+    });
+    expect(r.data).toHaveLength(1);
+    expect(calls).toBe(2);
+    expect(sleepCalls).toEqual([0]);
+  });
+
+  it('gives up after the rate-limit retry budget', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oura-cli-'));
+    const path = join(dir, 'tokens.json');
+    await saveTokens(path, tokens());
+
+    const fetchImpl = vi.fn(
+      async () => new Response('rate limited', { status: 429, headers: { 'Retry-After': '0' } }),
+    );
+    const sleepImpl = async () => {};
+
+    const client = new OuraClient({
+      clientId: 'cid',
+      clientSecret: 'csec',
+      tokenPath: path,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      sleepImpl,
+    });
+
+    await expect(
+      client.getCollection('/usercollection/daily_sleep', {
+        start_date: '2026-01-01',
+        end_date: '2026-01-02',
+      }),
+    ).rejects.toThrow(/429/);
+    // Initial + 2 retries = 3 calls total.
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
+  });
+});
+
+describe('parseRetryAfter', () => {
+  it('parses integer seconds', () => {
+    expect(parseRetryAfter('5')).toBe(5000);
+  });
+
+  it('parses fractional seconds', () => {
+    expect(parseRetryAfter('1.5')).toBe(1500);
+  });
+
+  it('parses HTTP-date strings', () => {
+    const future = new Date(Date.now() + 2000).toUTCString();
+    const result = parseRetryAfter(future);
+    expect(result).toBeGreaterThan(0);
+    expect(result).toBeLessThanOrEqual(2000);
+  });
+
+  it('returns undefined on missing or unparseable input', () => {
+    expect(parseRetryAfter(null)).toBeUndefined();
+    expect(parseRetryAfter('')).toBeUndefined();
+    expect(parseRetryAfter('not a date')).toBeUndefined();
   });
 });
