@@ -164,12 +164,30 @@ const DAILY_PLAN: Array<{ collection: SyncCollection; table: DailyTable; path: s
   { collection: 'daily_readiness', table: 'daily_readiness', path: ENDPOINTS.dailyReadiness },
   { collection: 'daily_activity', table: 'daily_activity', path: ENDPOINTS.dailyActivity },
   { collection: 'daily_spo2', table: 'daily_spo2', path: ENDPOINTS.spo2 },
+  { collection: 'daily_stress', table: 'daily_stress', path: ENDPOINTS.dailyStress },
+  {
+    collection: 'daily_resilience',
+    table: 'daily_resilience',
+    path: ENDPOINTS.dailyResilience,
+  },
+  {
+    collection: 'daily_cardiovascular_age',
+    table: 'daily_cardiovascular_age',
+    path: ENDPOINTS.dailyCardiovascularAge,
+  },
+  { collection: 'vo2_max', table: 'vo2_max', path: ENDPOINTS.vo2Max },
+  { collection: 'sleep_time', table: 'sleep_time', path: ENDPOINTS.sleepTime },
 ];
 
 const EVENT_PLAN: Array<{ collection: SyncCollection; table: EventTable; path: string }> = [
   { collection: 'sleep_periods', table: 'sleep_periods', path: ENDPOINTS.sleep },
   { collection: 'workouts', table: 'workouts', path: ENDPOINTS.workout },
   { collection: 'sessions', table: 'sessions', path: ENDPOINTS.session },
+  {
+    collection: 'rest_mode_periods',
+    table: 'rest_mode_periods',
+    path: ENDPOINTS.restModePeriod,
+  },
 ];
 
 async function syncDaily(

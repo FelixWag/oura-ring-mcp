@@ -11,7 +11,7 @@
 
 import type { Db } from '../index.js';
 
-export type EventTable = 'sleep_periods' | 'workouts' | 'sessions';
+export type EventTable = 'sleep_periods' | 'workouts' | 'sessions' | 'rest_mode_periods';
 
 export interface EventRow {
   oura_id: string;

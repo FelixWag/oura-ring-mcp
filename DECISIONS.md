@@ -336,3 +336,60 @@ fragile and the wrong shape for "stargazer-friendly" UX. Per-chunk
 audit rows keep the failure model precise (a partial backfill failure
 shows exactly which window threw, not a mystery aggregate). Sequential
 chunks within a collection let the existing 429-handling stay simple.
+
+---
+
+## 2026-05-09 — v0.4.2: missing daily collections + JSON-first storage convention
+
+**Context.** v0.4 shipped 4 daily-keyed collections (`daily_sleep`,
+`daily_readiness`, `daily_activity`, `daily_spo2`) and 3 event-keyed ones
+(`sleep`, `workout`, `session`). The Oura API exposes more: `daily_stress`,
+`daily_resilience`, `daily_cardiovascular_age`, `vO2_max`, `sleep_time`,
+and `rest_mode_period`. After auditing the spec for completeness — to make
+sure no analytically-useful data is missing from the local mirror — these
+six were identified as v0.4.2 scope. Heart rate / IBI / device metadata
+remain out of scope (heartrate already planned for v0.4.3).
+
+**Decision.** Schema migration v4 adds 6 tables matching the existing
+patterns (5 daily + 1 event). `ENDPOINTS`, `DAILY_PLAN`, `EVENT_PLAN`, and
+the type unions extend by 6 entries. `oura_sync` automatically picks them
+up — no new MCP tool. Result: `oura_sync` now covers 14 collections.
+
+**Sub-decision: JSON-first storage for non-numeric / multi-field scores.**
+Some new collections don't fit the existing `(day, score INTEGER, data
+TEXT)` shape:
+
+- `daily_stress` returns `recovery_high` and `stress_high` separately,
+  no aggregate score.
+- `daily_resilience` returns a STRING `level` (`ok`/`good`/`great`/…),
+  not a numeric score.
+- `sleep_time` is a recommendations object, no score.
+- `daily_cardiovascular_age` and `vo2_max` use different field names
+  (`vascular_age`, `vo2_max`) for their numeric value.
+
+Adopted convention: the `data` JSON column is the lossless source of
+truth for every daily table. The indexed `score INTEGER` column is a
+fast-lookup convenience populated via a per-table `SCORE_FIELDS`
+mapping (in `src/db/repos/daily.ts`). Tables without a single canonical
+numeric score leave `score` NULL. Floats (vo2_max) are rounded for the
+indexed column; the exact value remains in `data`.
+
+To make the JSON path ergonomic, `DailyCollectionRepo` gains
+`extractField<T>(day, '$.path')` and
+`extractFieldRange<T>(start, end, '$.path')` — thin wrappers around
+SQLite's `json_extract` returning typed values. Future tools that
+correlate, e.g., resilience level with sleep score across a date range
+use these without writing raw SQL.
+
+**Rationale.** Forcing every daily collection into a single integer
+`score` column would either (a) drop information (resilience.level), (b)
+arbitrarily map strings to numbers, or (c) require per-table schema
+divergence. JSON-first preserves data losslessly with a single
+storage shape, while the indexed `score` stays available where it makes
+sense. The `extractField*` helpers keep query ergonomics good without
+spreading raw SQL across the codebase.
+
+**Out of scope (deferred to v0.4.3+):** `heartrate`, `interbeat_interval`,
+`ring_battery_level`, `ring_configuration`. Heart rate is the next
+meaningful addition; the others are ring-telemetry rather than
+health data and may never be added.

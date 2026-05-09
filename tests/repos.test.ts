@@ -63,6 +63,78 @@ describe('DailyCollectionRepo', () => {
     ]);
     expect(result).toEqual({ inserted: 2, updated: 1 });
   });
+
+  it('extracts the score from a non-default field name (cardiovascular_age → vascular_age)', () => {
+    const repo = new DailyCollectionRepo(db, 'daily_cardiovascular_age');
+    repo.upsert({ day: '2026-05-09', vascular_age: 30, id: 'cva_1' });
+    const row = repo.get('2026-05-09')!;
+    expect(row.score).toBe(30);
+  });
+
+  it('rounds float scores when copying to the indexed column (vo2_max)', () => {
+    const repo = new DailyCollectionRepo(db, 'vo2_max');
+    repo.upsert({ day: '2026-05-09', vo2_max: 42.7, id: 'vo2_1' });
+    const row = repo.get('2026-05-09')!;
+    expect(row.score).toBe(43); // rounded
+    // Float preserved verbatim in data.
+    expect((row.data as { vo2_max: number }).vo2_max).toBe(42.7);
+  });
+
+  it('leaves score NULL for tables that have no aggregate score (daily_stress)', () => {
+    const repo = new DailyCollectionRepo(db, 'daily_stress');
+    repo.upsert({
+      day: '2026-05-09',
+      id: 's1',
+      recovery_high: 12_000,
+      stress_high: 30_000,
+    });
+    const row = repo.get('2026-05-09')!;
+    expect(row.score).toBeNull();
+  });
+
+  it('leaves score NULL for daily_resilience (string-valued level)', () => {
+    const repo = new DailyCollectionRepo(db, 'daily_resilience');
+    repo.upsert({ day: '2026-05-09', id: 'r1', level: 'good', contributors: {} });
+    const row = repo.get('2026-05-09')!;
+    expect(row.score).toBeNull();
+  });
+});
+
+describe('DailyCollectionRepo JSON-field helpers', () => {
+  it('extractField returns the requested path or null', () => {
+    const repo = new DailyCollectionRepo(db, 'daily_resilience');
+    repo.upsert({ day: '2026-05-08', id: 'a', level: 'great', contributors: { sleep: 80 } });
+    repo.upsert({ day: '2026-05-09', id: 'b', level: 'ok' });
+
+    expect(repo.extractField<string>('2026-05-08', '$.level')).toBe('great');
+    expect(repo.extractField<string>('2026-05-09', '$.level')).toBe('ok');
+    expect(repo.extractField<number>('2026-05-08', '$.contributors.sleep')).toBe(80);
+    expect(repo.extractField<number>('2026-05-09', '$.contributors.sleep')).toBeNull();
+    expect(repo.extractField<string>('2026-04-01', '$.level')).toBeNull(); // missing day
+  });
+
+  it('extractFieldRange returns one row per stored day in [start, end] sorted ascending', () => {
+    const repo = new DailyCollectionRepo(db, 'daily_stress');
+    repo.upsert({ day: '2026-05-07', id: 'a', recovery_high: 9000 });
+    repo.upsert({ day: '2026-05-09', id: 'c', recovery_high: 12_000 });
+    repo.upsert({ day: '2026-05-08', id: 'b', recovery_high: 10_000 });
+
+    const series = repo.extractFieldRange<number>('2026-05-07', '2026-05-09', '$.recovery_high');
+    expect(series).toEqual([
+      { day: '2026-05-07', value: 9000 },
+      { day: '2026-05-08', value: 10_000 },
+      { day: '2026-05-09', value: 12_000 },
+    ]);
+  });
+
+  it('extractFieldRange skips days outside the range', () => {
+    const repo = new DailyCollectionRepo(db, 'daily_stress');
+    repo.upsert({ day: '2026-05-01', id: 'old', recovery_high: 1 });
+    repo.upsert({ day: '2026-05-07', id: 'in', recovery_high: 9000 });
+    const series = repo.extractFieldRange<number>('2026-05-05', '2026-05-09', '$.recovery_high');
+    expect(series).toHaveLength(1);
+    expect(series[0]).toEqual({ day: '2026-05-07', value: 9000 });
+  });
 });
 
 describe('EventCollectionRepo', () => {

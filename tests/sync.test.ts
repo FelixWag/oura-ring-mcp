@@ -110,9 +110,19 @@ describe('runSync orchestrator', () => {
       '/usercollection/daily_readiness': [{ day: '2026-05-08', score: 83 }],
       '/usercollection/daily_activity': [{ day: '2026-05-08', score: 75 }],
       '/usercollection/daily_spo2': [],
+      '/usercollection/daily_stress': [{ day: '2026-05-08', id: 's1', recovery_high: 9000 }],
+      '/usercollection/daily_resilience': [{ day: '2026-05-08', id: 'r1', level: 'good' }],
+      '/usercollection/daily_cardiovascular_age': [
+        { day: '2026-05-08', id: 'cv1', vascular_age: 30 },
+      ],
+      '/usercollection/vO2_max': [{ day: '2026-05-08', id: 'v1', vo2_max: 42.5 }],
+      '/usercollection/sleep_time': [
+        { day: '2026-05-08', id: 'st1', optimal_bedtime: { start_offset: 0, end_offset: 3600 } },
+      ],
       '/usercollection/sleep': [],
       '/usercollection/workout': [],
       '/usercollection/session': [],
+      '/usercollection/rest_mode_period': [],
       '/usercollection/enhanced_tag': [
         {
           id: 'oura_xyz',
@@ -131,8 +141,8 @@ describe('runSync orchestrator', () => {
       { todayUtc: '2026-05-09' },
     );
 
-    // 8 collections — 4 daily, 3 events, 1 enhanced_tag.
-    expect(result.collections).toHaveLength(8);
+    // 14 collections — 9 daily, 4 events, 1 enhanced_tag.
+    expect(result.collections).toHaveLength(14);
     expect(result.collections.every((c) => c.ok)).toBe(true);
 
     // Daily sleep got upserted.
@@ -156,7 +166,7 @@ describe('runSync orchestrator', () => {
 
     // sync_runs has rows for every collection.
     const runs = db.prepare('SELECT collection, ok FROM sync_runs').all();
-    expect(runs).toHaveLength(8);
+    expect(runs).toHaveLength(14);
   });
 
   it('re-syncing the same day is idempotent: row count unchanged, last_synced_at advances', async () => {
@@ -218,9 +228,15 @@ describe('runSync orchestrator', () => {
       '/usercollection/daily_readiness': [],
       '/usercollection/daily_activity': [],
       '/usercollection/daily_spo2': [],
+      '/usercollection/daily_stress': [],
+      '/usercollection/daily_resilience': [],
+      '/usercollection/daily_cardiovascular_age': [],
+      '/usercollection/vO2_max': [],
+      '/usercollection/sleep_time': [],
       '/usercollection/sleep': [],
       '/usercollection/workout': [],
       '/usercollection/session': [],
+      '/usercollection/rest_mode_period': [],
       '/usercollection/enhanced_tag': [],
     };
     const { client, calls } = makeFakeClient(fakeData);
@@ -232,8 +248,8 @@ describe('runSync orchestrator', () => {
       { since_days: 240, todayUtc: '2026-05-09' },
     );
 
-    // 8 collections × 3 chunks = 24 API calls.
-    expect(calls).toHaveLength(24);
+    // 14 collections × 3 chunks = 42 API calls.
+    expect(calls).toHaveLength(42);
 
     // Each collection saw exactly 3 chunks, contiguous, covering the full window.
     const byPath = new Map<string, typeof calls>();
