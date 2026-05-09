@@ -5,6 +5,8 @@ import {
   type Annotation,
   type AnnotationRepo,
 } from '../db/annotations.js';
+import type { DailyCollectionRepo } from '../db/repos/daily.js';
+import type { SyncOptions, SyncResult } from '../db/sync.js';
 import { acceptedTagTypeCodes } from '../db/tag_types.js';
 import type { OuraClient } from '../oura/client.js';
 import {
@@ -21,6 +23,7 @@ import {
   shapeDailyReadiness,
   shapeDailySleep,
   shapeSleep,
+  type CompactDay,
 } from '../oura/shape.js';
 import { shapeEnhancedTag } from '../oura/tags.js';
 
@@ -117,23 +120,157 @@ async function handle<T>(fn: () => Promise<T>) {
   }
 }
 
+export type ReadPreference = 'auto' | 'local' | 'api';
+
+const preferSchema = z
+  .enum(['auto', 'local', 'api'])
+  .optional()
+  .describe(
+    "Where to read from. 'auto' (default) uses local SQLite data when available, " +
+      "fetching missing/recent days from the API. 'local' is offline-only — missing " +
+      "days return empty. 'api' force-refetches from Oura on every call.",
+  );
+
+interface FetchCompactDaysResult {
+  days: CompactDay[];
+  truncated: boolean;
+  /** Where the data came from: local DB, API, or a mix (when local was incomplete). */
+  source: 'local' | 'api' | 'mixed';
+}
+
+/**
+ * Enumerate every YYYY-MM-DD between start_date and end_date inclusive.
+ */
+function enumerateDays(start_date: string, end_date: string): string[] {
+  const out: string[] = [];
+  const tStart = Date.parse(start_date + 'T00:00:00Z');
+  const tEnd = Date.parse(end_date + 'T00:00:00Z');
+  for (let t = tStart; t <= tEnd; t += 24 * 60 * 60 * 1000) {
+    out.push(new Date(t).toISOString().slice(0, 10));
+  }
+  return out;
+}
+
+/**
+ * Days that always need an API hit even in local-first mode: today and
+ * yesterday, since Oura is still re-scoring those. Older days, if present
+ * locally, are considered settled.
+ */
+function isFreshDay(day: string): boolean {
+  const today = todayUtc();
+  return day === today || day === shiftDate(today, -1);
+}
+
+interface DailyRepos {
+  sleep: DailyCollectionRepo;
+  readiness: DailyCollectionRepo;
+  activity: DailyCollectionRepo;
+}
+
+/**
+ * Local-first fetch of merged daily summaries. When `prefer === 'auto'`:
+ *   - Uses local rows for "settled" days (more than 1 day old) when available.
+ *   - Fetches the API for any missing day, plus today/yesterday regardless.
+ *   - Upserts API results into local so subsequent calls are faster.
+ *
+ * When `prefer === 'local'`: returns whatever's local; never calls the API.
+ * When `prefer === 'api'`: skips local lookup, always calls the API.
+ *
+ * If `repos` is undefined, behavior is forced to 'api' regardless of prefer.
+ */
 async function fetchCompactDays(
   client: OuraClient,
   start_date: string,
   end_date: string,
-): Promise<{ days: ReturnType<typeof mergeDays>; truncated: boolean }> {
+  repos?: DailyRepos,
+  prefer: ReadPreference = 'auto',
+): Promise<FetchCompactDaysResult> {
   const q = { start_date, end_date };
-  const [sleep, readiness, activity] = await Promise.all([
-    client.getCollection<unknown>(ENDPOINTS.dailySleep, q),
-    client.getCollection<unknown>(ENDPOINTS.dailyReadiness, q),
-    client.getCollection<unknown>(ENDPOINTS.dailyActivity, q),
-  ]);
+  const apiOnly = !repos || prefer === 'api';
+
+  if (apiOnly) {
+    const [sleep, readiness, activity] = await Promise.all([
+      client.getCollection<unknown>(ENDPOINTS.dailySleep, q),
+      client.getCollection<unknown>(ENDPOINTS.dailyReadiness, q),
+      client.getCollection<unknown>(ENDPOINTS.dailyActivity, q),
+    ]);
+    if (repos) {
+      // Even on prefer='api' we still want to populate local for next time.
+      repos.sleep.upsertMany(sleep.data);
+      repos.readiness.upsertMany(readiness.data);
+      repos.activity.upsertMany(activity.data);
+    }
+    const days = mergeDays(
+      sleep.data.map(shapeDailySleep),
+      readiness.data.map(shapeDailyReadiness),
+      activity.data.map(shapeDailyActivity),
+    );
+    return {
+      days,
+      truncated: sleep.truncated || readiness.truncated || activity.truncated,
+      source: 'api',
+    };
+  }
+
+  // Local-first path. Read everything we have locally, then figure out what's
+  // missing or too recent to trust.
+  const localSleep = repos.sleep.listRange(start_date, end_date);
+  const localReadiness = repos.readiness.listRange(start_date, end_date);
+  const localActivity = repos.activity.listRange(start_date, end_date);
+
+  const haveSleep = new Set(localSleep.map((r) => r.day));
+  const haveReadiness = new Set(localReadiness.map((r) => r.day));
+  const haveActivity = new Set(localActivity.map((r) => r.day));
+
+  const wanted = enumerateDays(start_date, end_date);
+  const needsApiCall =
+    prefer !== 'local' &&
+    wanted.some(
+      (d) => isFreshDay(d) || !haveSleep.has(d) || !haveReadiness.has(d) || !haveActivity.has(d),
+    );
+
+  let truncated = false;
+  let mixedSource = false;
+  let apiSleep: unknown[] = [];
+  let apiReadiness: unknown[] = [];
+  let apiActivity: unknown[] = [];
+
+  if (needsApiCall) {
+    mixedSource = haveSleep.size > 0 || haveReadiness.size > 0 || haveActivity.size > 0;
+    const [s, r, a] = await Promise.all([
+      client.getCollection<unknown>(ENDPOINTS.dailySleep, q),
+      client.getCollection<unknown>(ENDPOINTS.dailyReadiness, q),
+      client.getCollection<unknown>(ENDPOINTS.dailyActivity, q),
+    ]);
+    apiSleep = s.data;
+    apiReadiness = r.data;
+    apiActivity = a.data;
+    truncated = s.truncated || r.truncated || a.truncated;
+    repos.sleep.upsertMany(apiSleep);
+    repos.readiness.upsertMany(apiReadiness);
+    repos.activity.upsertMany(apiActivity);
+  }
+
+  // Re-read after the upsert so we get a single uniform view.
+  const finalSleep = needsApiCall ? repos.sleep.listRange(start_date, end_date) : localSleep;
+  const finalReadiness = needsApiCall
+    ? repos.readiness.listRange(start_date, end_date)
+    : localReadiness;
+  const finalActivity = needsApiCall
+    ? repos.activity.listRange(start_date, end_date)
+    : localActivity;
+
   const days = mergeDays(
-    sleep.data.map(shapeDailySleep),
-    readiness.data.map(shapeDailyReadiness),
-    activity.data.map(shapeDailyActivity),
+    finalSleep.map((r) => shapeDailySleep(r.data)),
+    finalReadiness.map((r) => shapeDailyReadiness(r.data)),
+    finalActivity.map((r) => shapeDailyActivity(r.data)),
   );
-  return { days, truncated: sleep.truncated || readiness.truncated || activity.truncated };
+
+  return {
+    days,
+    truncated,
+    source: needsApiCall ? (mixedSource ? 'mixed' : 'api') : 'local',
+  };
 }
 
 /**
@@ -153,18 +290,23 @@ function annotationsByDay(rows: Annotation[]): Map<string, Annotation[]> {
 
 export interface RegisterToolsOptions {
   client: OuraClient;
-  /** Required. v0.3+ tools that touch the local DB are skipped if absent. */
+  /** v0.3+ tools that touch the local annotations DB are skipped if absent. */
   annotations?: AnnotationRepo;
+  /** v0.4: daily score repos. When absent, summary tools fall back to API-only. */
+  daily?: DailyRepos;
+  /** v0.4: sync runner. When absent, the `oura_sync` tool is not registered. */
+  sync?: (options: SyncOptions) => Promise<SyncResult>;
 }
 
 export function registerTools(server: McpServer, opts: RegisterToolsOptions): void {
-  const { client, annotations: repo } = opts;
+  const { client, annotations: repo, daily, sync } = opts;
 
   const dateRangeShape = {
     start_date: dateSchema.describe('Start date, inclusive (YYYY-MM-DD).'),
     end_date: dateSchema.describe('End date, inclusive (YYYY-MM-DD).'),
     verbose: verboseSchema,
     include_annotations: includeAnnotationsSchema,
+    prefer: preferSchema,
   };
 
   // -------------------------- Existing tools (compact-by-default) --------
@@ -180,11 +322,13 @@ export function registerTools(server: McpServer, opts: RegisterToolsOptions): vo
         'Max 90 days per call.',
       inputSchema: dateRangeShape,
     },
-    async ({ start_date, end_date, verbose, include_annotations }) => {
+    async ({ start_date, end_date, verbose, include_annotations, prefer }) => {
       const err = validateDateRange(start_date, end_date);
       if (err) return errorResult(err);
       return handle(async () => {
         if (verbose) {
+          // Verbose path stays API-only — when callers ask for raw rows they
+          // typically want the freshest representation Oura has.
           const q = { start_date, end_date };
           const [sleep, readiness, activity] = await Promise.all([
             client.getCollection<Record<string, unknown>>(ENDPOINTS.dailySleep, q),
@@ -194,18 +338,26 @@ export function registerTools(server: McpServer, opts: RegisterToolsOptions): vo
           return {
             range: { start_date, end_date },
             verbose: true,
+            source: 'api',
             truncated: sleep.truncated || readiness.truncated || activity.truncated,
             sleep: sleep.data,
             readiness: readiness.data,
             activity: activity.data,
           };
         }
-        const { days, truncated } = await fetchCompactDays(client, start_date, end_date);
+        const { days, truncated, source } = await fetchCompactDays(
+          client,
+          start_date,
+          end_date,
+          daily,
+          prefer,
+        );
         const wantAnnotations = include_annotations !== false;
         const annsByDay =
           wantAnnotations && repo ? annotationsByDay(repo.list({ start_date, end_date })) : null;
         return {
           range: { start_date, end_date },
+          source,
           truncated,
           count: days.length,
           days: days.map((d) => ({
@@ -332,7 +484,7 @@ export function registerTools(server: McpServer, opts: RegisterToolsOptions): vo
         'Convenience wrapper for "the last N days". Computes start/end dates internally so the ' +
         'caller does not have to do date arithmetic. Returns the same compact shape as ' +
         'oura_get_daily_summary. Joins local annotations by default (set ' +
-        'include_annotations:false to skip).',
+        'include_annotations:false to skip). Uses local SQLite cache when present (prefer=auto).',
       inputSchema: {
         days: z
           .number()
@@ -341,13 +493,18 @@ export function registerTools(server: McpServer, opts: RegisterToolsOptions): vo
           .max(MAX_RANGE_DAYS)
           .describe('How many days back from today (1–90). Today is included.'),
         include_annotations: includeAnnotationsSchema,
+        prefer: preferSchema,
       },
     },
-    async ({ days, include_annotations }) => {
+    async ({ days, include_annotations, prefer }) => {
       return handle(async () => {
         const end = todayUtc();
         const start = shiftDate(end, -(days - 1));
-        const { days: rows, truncated } = await fetchCompactDays(client, start, end);
+        const {
+          days: rows,
+          truncated,
+          source,
+        } = await fetchCompactDays(client, start, end, daily, prefer);
         const wantAnnotations = include_annotations !== false;
         const annsByDay =
           wantAnnotations && repo
@@ -355,6 +512,7 @@ export function registerTools(server: McpServer, opts: RegisterToolsOptions): vo
             : null;
         return {
           range: { start_date: start, end_date: end, days },
+          source,
           truncated,
           count: rows.length,
           days: rows.map((d) => ({
@@ -477,7 +635,13 @@ export function registerTools(server: McpServer, opts: RegisterToolsOptions): vo
       if (err) return errorResult(err);
       const w = window ?? 7;
       return handle(async () => {
-        const { days, truncated } = await fetchCompactDays(client, start_date, end_date);
+        const { days, truncated } = await fetchCompactDays(
+          client,
+          start_date,
+          end_date,
+          daily,
+          'auto',
+        );
         const sleepSeries = days.map((d) => d.sleep?.score);
         const readinessSeries = days.map((d) => d.readiness?.score);
         const activitySeries = days.map((d) => d.activity?.score);
@@ -507,6 +671,48 @@ export function registerTools(server: McpServer, opts: RegisterToolsOptions): vo
       });
     },
   );
+
+  // -------------------------- v0.4: sync ---------------------------
+
+  if (sync) {
+    server.registerTool(
+      'oura_sync',
+      {
+        title: 'Oura: Sync',
+        description:
+          'Pull recent Oura data into the local SQLite mirror so subsequent summary / trend ' +
+          'queries answer locally without hitting the API. Default behavior is incremental: ' +
+          'each collection picks up where it left off, plus a 7-day re-fetch window so ' +
+          'recently re-scored days get refreshed. Returns per-collection counts.',
+        inputSchema: {
+          since_days: z
+            .number()
+            .int()
+            .min(1)
+            .max(90)
+            .optional()
+            .describe('Force-refetch the last N days regardless of stored state.'),
+          full: z
+            .boolean()
+            .optional()
+            .describe('Re-fetch every collection across the full lookback window.'),
+          tags_only: z
+            .boolean()
+            .optional()
+            .describe('Sync only enhanced_tag (and refresh discovered_tag_types).'),
+        },
+      },
+      async ({ since_days, full, tags_only }) => {
+        return handle(() =>
+          sync({
+            since_days,
+            full,
+            tags_only,
+          }),
+        );
+      },
+    );
+  }
 
   // -------------------------- v0.3: Oura tag read --------------------
 

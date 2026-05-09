@@ -77,7 +77,14 @@ function isIsoDateTime(v: string): boolean {
   return !Number.isNaN(Date.parse(v));
 }
 
-function validateInput(input: NewAnnotationInput): void {
+/**
+ * Predicate used to check whether a `tag_type_code` is accepted. Defaults to
+ * the static `KNOWN_TAG_TYPE_CODES` shortlist. v0.4 wires in a wider check
+ * that also accepts codes seen in synced Oura data (`discovered_tag_types`).
+ */
+export type CodeKnownPredicate = (code: string) => boolean;
+
+function validateInput(input: NewAnnotationInput, isCodeKnown: CodeKnownPredicate): void {
   if (!DATE_RE.test(input.start_day)) {
     throw new AnnotationValidationError('start_day must be YYYY-MM-DD.');
   }
@@ -97,12 +104,14 @@ function validateInput(input: NewAnnotationInput): void {
     throw new AnnotationValidationError('end_time cannot be before start_time.');
   }
 
-  // Mirror Oura's enum semantics: code must be null, 'custom', or known.
+  // Mirror Oura's enum semantics: code must be null, 'custom', or known
+  // (either in the static list or in the user's synced Oura data).
   if (input.tag_type_code != null) {
-    if (input.tag_type_code !== 'custom' && !isKnownTagTypeCode(input.tag_type_code)) {
+    if (input.tag_type_code !== 'custom' && !isCodeKnown(input.tag_type_code)) {
       const accepted = acceptedTagTypeCodes().join(', ');
       throw new AnnotationValidationError(
-        `Unknown tag_type_code "${input.tag_type_code}". Accepted: ${accepted}, or null. ` +
+        `Unknown tag_type_code "${input.tag_type_code}". Accepted: ${accepted}, or any code ` +
+          'observed in your synced Oura data (run `npm run sync`), or null. ' +
           'Use tag_type_code="custom" with a custom_name for ad-hoc types.',
       );
     }
@@ -134,8 +143,30 @@ function validateInput(input: NewAnnotationInput): void {
 export class AnnotationRepo {
   constructor(private readonly db: Db) {}
 
+  /**
+   * A code is "known" if it's in the static KNOWN_TAG_TYPE_CODES list OR
+   * has been observed in synced Oura data (`discovered_tag_types` table).
+   * Cheap: an indexed point lookup. Falls back to false if the v0.4 table
+   * doesn't exist yet (migration not yet applied).
+   */
+  private isCodeKnown = (code: string): boolean => {
+    if (isKnownTagTypeCode(code)) return true;
+    try {
+      const row = this.db
+        .prepare<
+          unknown[],
+          { code: string }
+        >('SELECT code FROM discovered_tag_types WHERE code = ?')
+        .get(code);
+      return !!row;
+    } catch {
+      // discovered_tag_types not yet present (e.g. running on a pre-v0.4 DB).
+      return false;
+    }
+  };
+
   add(input: NewAnnotationInput): Annotation {
-    validateInput(input);
+    validateInput(input, this.isCodeKnown);
     const now = nowIso();
     const stmt = this.db.prepare(`
       INSERT INTO annotations
@@ -217,7 +248,7 @@ export class AnnotationRepo {
       source: existing.source,
       oura_id: existing.oura_id,
     };
-    validateInput(merged);
+    validateInput(merged, this.isCodeKnown);
 
     const stmt = this.db.prepare(`
       UPDATE annotations SET

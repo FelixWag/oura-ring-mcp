@@ -250,3 +250,64 @@ for everything). Inferred codes are flagged so v0.4's planned "refresh
 canonical list from synced enhanced_tags" can correct them automatically;
 any local rows using a wrong inferred code can be migrated with the same
 pattern as v2 (a one-line UPDATE inside a versioned migration).
+
+---
+
+## 2026-05-09 — v0.4 plan approved: local SQLite mirror of Oura data
+
+**Context.** Up through v0.3.1, every MCP tool that reads Oura data hits the
+API on every call. That works but (a) eats rate limits on long-window
+analyses, (b) re-fetches data that hasn't changed in months, and (c) blocks
+reasoning over multi-month / multi-year windows because each request is
+capped at 90 days. Time to mirror Oura's daily data into the existing
+SQLite database.
+
+**Decision.** Ship v0.4 with the following scope:
+
+1. **Hybrid storage shape** — for each mirrored collection: indexed key
+   columns (`day` / `oura_id`, `score` where present, `last_synced_at`,
+   `first_seen_at`) plus a raw `data` JSON column carrying the entire Oura
+   row verbatim. Lossless storage; queryable via SQL; no migration churn
+   when Oura adds fields.
+
+2. **Tables added (schema migration v3):** `daily_sleep`, `daily_readiness`,
+   `daily_activity`, `daily_spo2`, `sleep_periods`, `workouts`, `sessions`,
+   `discovered_tag_types`, `sync_runs`. `enhanced_tag` continues to land in
+   the existing `annotations` table with `source='oura'` (the schema-
+   mirroring decision from v0.3 pays off).
+
+3. **`npm run sync` script** — incremental by default; re-fetches the **last
+   7 days** every run regardless of state, addressing the "Oura re-scores
+   recent days as more data arrives" constraint recorded for v0.2. Flags:
+   `--full`, `--since N`, `--tags-only`. Concurrent across collections,
+   sequential within a collection (paginated). Logs each run to `sync_runs`.
+
+4. **`oura_sync` MCP tool** — thin wrapper around the same code path, so the
+   LLM can refresh before an analysis without dropping to the shell.
+   No auto-sync on MCP startup (would slow spawn time and add magic).
+
+5. **Local-first summary tools** — `oura_get_daily_summary` and
+   `oura_get_recent_summary` modified in place to prefer local rows for
+   stable days, falling back to the API for missing/recent days.
+   Response shape unchanged; new `prefer: 'auto'|'local'|'api'` parameter
+   defaults to `auto`. Adds a `source: 'local'|'api'|'mixed'` field to
+   responses for traceability.
+
+6. **`tag_type_code` self-correction** — every `enhanced_tag` sync upserts
+   each row's code into `discovered_tag_types` (with `first_seen_at`,
+   `last_seen_at`, `occurrence_count`). The annotation validator now
+   accepts a code if it's in `KNOWN_TAG_TYPE_CODES` **or** in
+   `discovered_tag_types`. v0.3.1's inferred codes converge to reality
+   without manual edits; the static list becomes a bootstrap.
+
+7. **Out of scope:** heartrate timeseries (too high-volume for v0.4 local
+   storage; on-demand via the existing tool), personal_info (single row,
+   refresh on demand), auto-sync on startup.
+
+**Rationale.** Hybrid schema is the right tradeoff between query
+ergonomics and lossless mirroring. Re-fetch window of 7 days is
+empirically motivated by the nap → score-update behavior we already
+observed. Local-first is the actual user value of v0.4 (instant queries,
+no rate limits, no payload caps); modifying the existing tools in place
+keeps the LLM's tool surface unchanged. `discovered_tag_types` resolves
+the v0.3.1 inference risk cleanly without forcing manual list curation.
