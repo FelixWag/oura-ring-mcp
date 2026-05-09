@@ -13,15 +13,17 @@ Read-only, OAuth2, runs locally over stdio. Personal project — but clean and e
 ## Features
 
 - OAuth2 authorization-code flow with automatic token refresh.
-- Eight read-only MCP tools — five raw-data tools plus three derived-metric tools:
-  - `oura_get_daily_summary` / `oura_get_sleep` / `oura_get_activity` / `oura_get_heartrate` / `oura_get_personal_info`
-  - `oura_get_recent_summary` — last N days, no date math required
-  - `oura_compare_periods` — averages + deltas between two periods (this week vs last, etc.)
-  - `oura_get_trends` — rolling averages + linear trend direction
+- Thirteen MCP tools across three categories:
+  - **Raw access**: `oura_get_daily_summary` / `oura_get_sleep` / `oura_get_activity` / `oura_get_heartrate` / `oura_get_personal_info`
+  - **Derived metrics**: `oura_get_recent_summary` / `oura_compare_periods` / `oura_get_trends`
+  - **Tags & annotations** (v0.3): `oura_get_enhanced_tags` (read Oura tags), plus a local SQLite-backed annotation system (`oura_add_annotation` / `oura_list_annotations` / `oura_update_annotation` / `oura_delete_annotation`).
+- Local annotations mirror Oura's enhanced_tag schema, so the LLM can
+  reason about both Oura-logged tags and your own context (illness, alcohol,
+  travel, etc.) in one uniform shape.
 - Compact-by-default responses keep payloads small enough for LLMs to reason over.
 - Automatic token refresh + 429 / Retry-After-aware rate-limit handling.
-- Local token storage at `~/.config/oura-ring-mcp/tokens.json`.
-- TypeScript, no exotic dependencies, MIT licensed.
+- Local data at `~/.config/oura-ring-mcp/` (tokens + SQLite, both `0600`).
+- TypeScript, MIT licensed.
 
 ## Quick start
 
@@ -74,8 +76,11 @@ Or edit `~/.claude.json` manually:
 }
 ```
 
-Restart Claude Code, then run `/mcp` — you should see `oura` listed with all eight tools.
+Restart Claude Code, then run `/mcp` — you should see `oura` listed with all thirteen tools.
 Try asking: _"Show my Oura daily summary for the last 7 days."_
+
+> Upgrading from v0.2 → v0.3? Re-run `npm run oauth-login` once. v0.3 requests
+> the additional `tag` scope so it can read Oura's enhanced_tag endpoint.
 
 ## Tools
 
@@ -97,6 +102,43 @@ Try asking: _"Show my Oura daily summary for the last 7 days."_
 | `oura_compare_periods`    | `days` **or** `a_start`/`a_end`/`b_start`/`b_end` | Per-metric averages + deltas + direction.         |
 | `oura_get_trends`         | `start_date`, `end_date`, `window?` (default 7)   | Rolling averages + linear trend (improving/etc.). |
 
+### Tags & annotations (v0.3)
+
+| Tool                     | Inputs                                                  | Notes                                                                  |
+| ------------------------ | ------------------------------------------------------- | ---------------------------------------------------------------------- |
+| `oura_get_enhanced_tags` | `start_date`, `end_date`, `verbose?`                    | Read tags you logged in the Oura app. Compact projection by default.   |
+| `oura_add_annotation`    | tag fields (see below)                                  | Store a local annotation in SQLite. Mirrors Oura's enhanced_tag shape. |
+| `oura_list_annotations`  | `start_date?`, `end_date?`, `tag_type_code?`, `source?` | List local annotations (and any synced Oura tags).                     |
+| `oura_update_annotation` | `id`, partial tag fields                                | Patch an annotation; re-validated on every change.                     |
+| `oura_delete_annotation` | `id`                                                    | Delete by id.                                                          |
+
+The `oura_get_daily_summary` and `oura_get_recent_summary` tools default to
+`include_annotations: true` — each day record is joined with any matching
+local annotations so the LLM can correlate context with metrics in one call.
+Pass `include_annotations: false` to skip the join.
+
+#### Annotation schema
+
+Annotations are stored locally in SQLite at `~/.config/oura-ring-mcp/data.sqlite`
+and use the **same column names as Oura's `EnhancedTagModel`** so the two
+sources are interchangeable:
+
+| Field           | Type    | Notes                                                                             |
+| --------------- | ------- | --------------------------------------------------------------------------------- |
+| `tag_type_code` | string? | Canonical Oura type (e.g. `alcohol`, `sick`, `traveled`), or `custom`, or `null`. |
+| `custom_name`   | string? | Required iff `tag_type_code = 'custom'`.                                          |
+| `start_time`    | string  | ISO 8601 datetime.                                                                |
+| `end_time`      | string? | ISO 8601 datetime; optional, for events with duration.                            |
+| `start_day`     | string  | YYYY-MM-DD.                                                                       |
+| `end_day`       | string? | YYYY-MM-DD; optional, for multi-day events like travel.                           |
+| `comment`       | string? | Free-form text. Required when `tag_type_code = null` (text-only annotation).      |
+| `source`        | string  | `'local'` for entries you add; `'oura'` for synced Oura tags (v0.4+).             |
+| `oura_id`       | string? | The Oura tag's id when `source='oura'`.                                           |
+
+The current canonical `tag_type_code` shortlist (extend in `src/db/tag_types.ts`):
+`alcohol, caffeine, nicotine, sick, stressed, mood_good, mood_bad, traveled, ate_late, napped, meditated, workout, period, intercourse`. Anything else uses
+`tag_type_code='custom'` with a `custom_name`.
+
 ### Notes
 
 - All date-range tools cap requests at 90 days. Pagination follows up to 5 pages
@@ -115,6 +157,7 @@ Try asking: _"Show my Oura daily summary for the last 7 days."_
 | `OURA_CLIENT_SECRET` | —                                     | Required. From your Oura OAuth app.                            |
 | `OURA_REDIRECT_URI`  | `http://127.0.0.1:8765/callback`      | Must match what you registered with Oura.                      |
 | `OURA_TOKEN_PATH`    | `~/.config/oura-ring-mcp/tokens.json` | Token file location.                                           |
+| `OURA_DB_PATH`       | `~/.config/oura-ring-mcp/data.sqlite` | Local SQLite database (annotations).                           |
 | `OURA_DEBUG`         | unset                                 | Set to `1` for verbose logs on stderr (still redacts secrets). |
 
 `.env` in the project root is loaded automatically.
@@ -143,6 +186,12 @@ src/
     endpoints.ts    # endpoint paths
     shape.ts        # raw API → compact projections
     derive.ts       # averages, deltas, rolling means, trend
+    tags.ts         # enhanced_tag shape helper (v0.3)
+  db/                       # local SQLite layer (v0.3+)
+    index.ts        # open + bootstrap with migrations
+    schema.ts       # versioned DDL
+    annotations.ts  # typed CRUD repo (mirrors EnhancedTagModel)
+    tag_types.ts    # canonical tag_type_code shortlist
 scripts/
   oauth-login.ts    # interactive OAuth flow
   setup.ts          # writes .env interactively
@@ -169,20 +218,26 @@ stderr; tokens are never logged.
 
 ## Security
 
-- `.env` and `tokens.json` are git-ignored.
-- Token files are written atomically with `0600` perms.
+- `.env`, `tokens.json`, and `data.sqlite*` are git-ignored.
+- Token and DB files are written with `0600` perms; the parent dir with `0700`.
+- All SQL uses prepared statements with parameter binding — never string interpolation.
 - Refresh tokens rotate; the client saves the new one immediately.
-- Tools are strictly read-only in this version.
-- The MCP server only exposes the eight tools above — no shell exec, no fs access.
+- Tools are **read-only against the Oura API**. v0.3 annotation tools write
+  only to the local SQLite database — never to any external service.
+- The MCP server only exposes the documented tools — no shell exec, no
+  arbitrary fs access.
 
 ## Roadmap
 
 - ✅ **v0.1** — read-only OAuth2, five raw tools.
 - ✅ **v0.2** — derived metrics, compact-by-default responses, 429 handling.
-- **v0.3** — write tools (tags, manual annotations like illness, alcohol, travel).
-- **v0.4** — local SQLite mirror so the LLM can reason over long histories without
-  re-hitting the API.
-- **v0.5** — exports and reports.
+- ✅ **v0.3** — local SQLite annotations (mirroring `EnhancedTagModel`),
+  read-only Oura enhanced_tag tool, automatic annotation join in summary tools.
+- **v0.4** — full local sync of Oura data into the same SQLite database
+  (idempotent on `(metric, day)` with `last_synced_at`), enabling long-range
+  analysis without re-hitting the API. Adds a "refresh tag_type_codes from
+  your data" capability.
+- **v0.5** — exports, weekly/monthly reports.
 
 ## License
 

@@ -1,6 +1,6 @@
 {
   "name": "oura-ring-mcp",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "A Model Context Protocol server that lets Claude Code (and any MCP client) query your Oura Ring data through the official Oura API v2.",
   "type": "module",
   "bin": {
@@ -43,10 +43,12 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
+    "better-sqlite3": "^12.9.0",
     "dotenv": "^17.4.2",
     "zod": "^4.4.3"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^22.0.0",
     "prettier": "^3.8.3",
     "tsx": "^4.21.0",

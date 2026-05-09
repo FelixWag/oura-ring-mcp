@@ -2,209 +2,178 @@
 
 ## Goal
 
-Build a small personal Model Context Protocol server that allows Claude Code to query my Oura Ring data through the official Oura API.
+A small personal Model Context Protocol server that lets Claude Code (and any
+MCP client) read Oura Ring data through the official Oura API v2 — and store
+the user's own contextual annotations in a local SQLite database for richer
+LLM analysis.
 
-This is a personal fun project, but it should be clean enough to publish on GitHub.
+This is a personal project, but kept clean enough to publish on GitHub.
 
-The first version should be intentionally minimal: read-only access to Oura data. Later versions may add tag/activity creation and a local database for longer-term analysis.
+## Current State (May 2026)
 
-## Current Scope: v0.1
+- **v0.1** — shipped. Read-only OAuth2 client, five core MCP tools.
+- **v0.2** — shipped. Compact-by-default responses, derived metrics
+  (`oura_get_recent_summary`, `oura_compare_periods`, `oura_get_trends`),
+  429 / Retry-After handling.
+- **v0.3** — in progress. Local SQLite annotations + Oura `enhanced_tag` reads.
+- **v0.4 onward** — see Roadmap below.
 
-Implement a basic MCP server that can:
+See `DECISIONS.md` for a chronological log of architectural decisions and
+the reasoning behind each one. New decisions belong there too.
 
-1. Authenticate with the Oura API using OAuth2.
-2. Store and refresh tokens locally.
-3. Expose simple read-only MCP tools for querying Oura data.
-4. Return clean JSON summaries that are easy for an LLM to inspect.
+## Hard Constraints
 
-The Oura API uses OAuth2. Do not assume that personal access tokens are available. Use the official Oura API v2 and OAuth2 flow.
+### The Oura API is read-only
 
-Relevant Oura scopes may include:
+Confirmed against the official OpenAPI spec
+(`https://cloud.ouraring.com/v2/static/json/openapi-1.29.json`):
+**every user-data endpoint supports `GET` only.** The only write endpoints in
+the entire API are webhook-subscription management. There is no public way to
+create, update, or delete tags, workouts, sessions, or any other piece of user
+data via the API.
 
-- `daily`
-- `heartrate`
-- `workout`
-- `session`
-- `spo2`
-- `tag`
-- `personal`
+This means: any "write tags from Claude" feature lives in our **local SQLite
+database**, not in Oura's servers. Our local annotation schema is designed to
+mirror Oura's `EnhancedTagModel` 1:1 so the two data sources can be queried
+uniformly.
 
-For v0.1, request the smallest useful set of scopes, probably `daily heartrate workout session spo2 personal`. Only include `tag` if needed for reading tags.
+### Local annotations mirror Oura's enhanced_tag schema
 
-## Preferred Tech Stack
+Our `annotations` table columns map directly to Oura's `EnhancedTagModel`
+(`tag_type_code`, `start_time`, `end_time`, `start_day`, `end_day`, `comment`,
+`custom_name`) plus two extras (`source`, `oura_id`) so v0.4 can sync Oura
+enhanced_tags into the same table without losing track of provenance. See
+`DECISIONS.md` for the rationale.
 
-Use TypeScript / Node.js unless there is a strong reason not to.
+### Tag types are constrained, with `custom` as the escape hatch
 
-Use the official MCP TypeScript SDK where possible.
+Following Oura's own design: `tag_type_code` must be `null`, `'custom'`, or
+one of a known shortlist of canonical codes. `'custom'` requires a
+`custom_name`. The shortlist is seeded with common codes for v0.3; v0.4 will
+add a sync that pulls the user's actual tag history to expand the list
+dynamically.
 
-The MCP server should run locally and be connectable from Claude Code.
+### Score values can change after the day ends
 
-## Expected Tools
+Oura re-scores days as more data arrives (a nap added later in the day will
+update that day's sleep score). Any future local sync (v0.4+) must be
+**idempotent on `(metric, day)` with a `last_synced_at` timestamp**, so we can
+re-fetch and overwrite same-day records correctly.
 
-Implement a small set of MCP tools first:
+## Tech Stack
 
-### `oura_get_daily_summary`
+- **TypeScript / Node.js** (engines.node >= 22 from v0.3 onward).
+- **MCP SDK**: `@modelcontextprotocol/sdk` (official).
+- **OAuth2**: Authorization Code flow, no PKCE (Oura is a confidential client).
+- **HTTP**: native `fetch` (Node 20+).
+- **Validation**: zod.
+- **Local DB (v0.3+)**: `better-sqlite3` (synchronous, mature, well-typed).
+- **Tests**: vitest.
+- **Format**: prettier.
+- **Transport**: stdio only (default for Claude Code).
 
-Fetch daily Oura summaries for a given date range.
+## OAuth Scopes
 
-Inputs:
+Currently requested: `daily heartrate workout session spo2 personal`.
 
-- `start_date`: string, format `YYYY-MM-DD`
-- `end_date`: string, format `YYYY-MM-DD`
+If/when we add `oura_get_enhanced_tags` (v0.3), we will need the `tag` scope as
+well. Re-running `npm run oauth-login` re-authorizes with the updated scope set.
 
-Should return sleep, readiness, and activity summaries if available.
-
-### `oura_get_sleep`
-
-Fetch sleep-related data for a given date range.
-
-Inputs:
-
-- `start_date`
-- `end_date`
-
-### `oura_get_activity`
-
-Fetch daily activity data for a given date range.
-
-Inputs:
-
-- `start_date`
-- `end_date`
-
-### `oura_get_heartrate`
-
-Fetch heart-rate time series for a given date range or datetime range.
-
-Inputs:
-
-- `start_datetime`
-- `end_datetime`
-
-### `oura_get_personal_info`
-
-Fetch basic personal metadata from Oura, if the required scope is available.
-
-## Authentication Requirements
-
-Implement OAuth2 carefully.
-
-The server should support:
-
-1. Reading credentials from environment variables:
-   - `OURA_CLIENT_ID`
-   - `OURA_CLIENT_SECRET`
-   - `OURA_REDIRECT_URI`
-
-2. A local OAuth setup command or helper script that:
-   - opens or prints the Oura authorization URL,
-   - receives or accepts the callback code,
-   - exchanges the code for access and refresh tokens,
-   - stores tokens locally.
-
-3. Token storage:
-   - store tokens outside the Git repository by default,
-   - never commit tokens,
-   - add token files to `.gitignore`,
-   - document the expected token path clearly.
-
-4. Refresh handling:
-   - refresh the access token automatically when needed,
-   - persist the new refresh token if Oura rotates refresh tokens.
-
-## Security Requirements
-
-This project handles sensitive health data.
-
-Important rules:
-
-- Never commit `.env`, tokens, or local database files.
-- Keep OAuth client secrets out of source control.
-- Add `.env.example`.
-- Add clear warnings in the README.
-- Avoid logging access tokens, refresh tokens, authorization codes, or full API responses unless explicitly in debug mode.
-- Keep the MCP tools read-only in v0.1.
-- Validate all tool inputs.
-- Do not expose arbitrary shell execution or file-system access.
-
-## Project Structure Suggestion
-
-Use a clean structure similar to:
+## Project Structure
 
 ```text
-oura-mcp/
+oura-ring-mcp/
   src/
-    index.ts
+    index.ts              # binary entry
+    config.ts             # env loading, paths
     mcp/
       server.ts
       tools.ts
     oura/
-      client.ts
-      auth.ts
+      auth.ts             # OAuth2 + token storage
+      client.ts           # API client with auto-refresh + 429 retry
       endpoints.ts
-    config.ts
+      shape.ts            # raw → compact projections
+      derive.ts           # averages, deltas, rolling means, trend
+      tags.ts             # (v0.3) shape helpers for enhanced_tag
+    db/                   # (v0.3+)
+      index.ts            # open + bootstrap
+      schema.ts           # DDL + migrations
+      annotations.ts      # typed CRUD repo
+      tag_types.ts        # canonical tag_type_code shortlist
   scripts/
     oauth-login.ts
+    setup.ts
   .env.example
-  .gitignore
-  package.json
-  tsconfig.json
+  PRIVACY.md
+  TERMS.md
   README.md
-  CLAUDE.md
+  CLAUDE.md               # this file
+  DECISIONS.md            # chronological architectural log
 ```
 
-## Future Roadmap
+## Authentication & Token Storage
 
-Do not implement these unless asked, but design the code so they are possible later:
+- Credentials read from env: `OURA_CLIENT_ID`, `OURA_CLIENT_SECRET`,
+  `OURA_REDIRECT_URI`. `.env` loaded automatically.
+- `npm run oauth-login` runs the full Authorization Code flow, captures the
+  callback on a local loopback HTTP server (default
+  `http://localhost:8765/callback`), and stores tokens to
+  `~/.config/oura-ring-mcp/tokens.json` with `0600` perms.
+- Listener binds to whatever hostname the redirect URI specifies (so
+  `localhost` works on IPv6-default systems).
+- Tokens refresh automatically on 401 and proactively when within 60 s of
+  expiry. Refresh-token rotation is honored (new refresh token persisted).
 
-## v0.2
+## Security Requirements
 
-* Better summaries and derived metrics.
-* Natural language helper tools, e.g. “compare last 7 days to previous 7 days”.
-* Better error handling and API rate-limit handling.
+- Never commit `.env`, token files, or local database files (all in `.gitignore`).
+- All file writes that touch credentials or DB use `0600` perms (parent dir 0700).
+- All SQL via prepared statements with parameter binding — never string interpolation.
+- All HTTP requests over HTTPS; loopback HTTP only for the OAuth redirect listener.
+- Logging: errors only by default; tokens, codes, and full API bodies redacted.
+  `OURA_DEBUG=1` enables verbose stderr logs that still redact secrets.
+- Tools are **read-only against the Oura API** at every version. Local DB
+  writes (v0.3+) only touch `~/.config/oura-ring-mcp/data.sqlite`.
+- All tool inputs validated with zod; future-dated date ranges rejected upfront.
+- No shell exec, no arbitrary file-system access exposed via MCP tools.
 
-## v0.3
+## Roadmap
 
-* Read/write support for tags, if supported by the Oura API.
-* Ability to add annotations such as illness, alcohol, travel, workout, stress, etc.
-
-## v0.4
-
-* Local SQLite database.
-* Sync Oura data locally.
-* Query historical data without repeatedly hitting the Oura API.
-* Let the LLM analyze longer-term patterns.
-
-## v0.5
-
-* Visualizations or export tools.
-* Weekly/monthly health reports.
+- ✅ **v0.1** — read-only OAuth2 + five raw tools.
+- ✅ **v0.2** — derived metrics, compact-by-default, rate-limit handling.
+- 🚧 **v0.3** — local SQLite annotations (mirroring `EnhancedTagModel`),
+  read-only Oura enhanced_tag tool, `include_annotations` join into summary tools.
+- **v0.4** — full local sync of Oura data into the same SQLite database
+  (idempotent on `(metric, day)` with `last_synced_at`), enabling long-range
+  analysis without re-hitting the API. Adds a "refresh tag_type_codes from
+  your data" capability.
+- **v0.5** — exports, weekly/monthly reports, possibly visualizations.
 
 ## Development Process
 
-Before making code changes, first create a plan.
-
-The plan should include:
+Before making code changes, first create a plan in chat. The plan must include:
 
 1. Proposed architecture.
 2. Files to create or modify.
 3. Exact MCP tools to implement.
-4. OAuth flow approach.
+4. OAuth flow / scope changes (if any).
 5. Security considerations.
 6. Testing strategy.
 7. Any assumptions or open questions.
 
-Do not start implementation until I approve the plan.
+**Do not start implementation until I approve the plan.**
 
-## Definition of Done for v0.1
+When a plan is approved and implemented, append a one-paragraph entry to
+`DECISIONS.md` summarizing what was decided and why.
 
-The first version is done when:
+## Workflow
 
-1. The project installs with npm install.
-2. The project builds with npm run build.
-3. The MCP server can be started locally.
-4. Claude Code can connect to it as an MCP server.
-5. At least one Oura API query tool works end-to-end.
-6. Tokens and secrets are not committed.
-7. README explains setup clearly.
-8. .env.example documents required variables.
+- **Branch per change**: never commit directly to `main`. Create
+  `feat/<name>` or `fix/<name>` branches.
+- **PR per change**: push the branch, open a PR via the GitHub URL, merge
+  through the GitHub UI.
+- **CI gate**: every PR runs typecheck, tests, build, and `format:check`
+  on Node 20/22/24 (matrix may evolve as we drop older versions).
+- **After merge**: switch back to `main`, `git pull`, delete the local
+  branch, run `npm run build` so Claude Code spawns the new binary.
