@@ -13,13 +13,13 @@ beforeEach(async () => {
 describe('AnnotationRepo.add', () => {
   it('inserts a known-type annotation and returns the row', () => {
     const row = repo.add({
-      tag_type_code: 'alcohol',
+      tag_type_code: 'tag_sleep_alcohol',
       start_time: '2026-05-02T22:00:00Z',
       start_day: '2026-05-02',
       comment: '2 beers',
     });
     expect(row.id).toBeGreaterThan(0);
-    expect(row.tag_type_code).toBe('alcohol');
+    expect(row.tag_type_code).toBe('tag_sleep_alcohol');
     expect(row.source).toBe('local');
     expect(row.created_at).toBeTruthy();
     expect(row.created_at).toBe(row.updated_at);
@@ -27,7 +27,7 @@ describe('AnnotationRepo.add', () => {
 
   it('accepts a multi-day annotation with end_day and end_time', () => {
     const row = repo.add({
-      tag_type_code: 'traveled',
+      tag_type_code: 'tag_generic_airplane',
       start_time: '2026-05-10T08:00:00Z',
       end_time: '2026-05-12T20:00:00Z',
       start_day: '2026-05-10',
@@ -41,7 +41,7 @@ describe('AnnotationRepo.add', () => {
   it('rejects an unknown tag_type_code with a useful message', () => {
     expect(() =>
       repo.add({
-        tag_type_code: 'partying',
+        tag_type_code: 'not_a_real_oura_code',
         start_time: '2026-05-02T22:00:00Z',
         start_day: '2026-05-02',
       }),
@@ -82,7 +82,7 @@ describe('AnnotationRepo.add', () => {
   it('rejects end_day before start_day', () => {
     expect(() =>
       repo.add({
-        tag_type_code: 'traveled',
+        tag_type_code: 'tag_generic_airplane',
         start_time: '2026-05-10T08:00:00Z',
         start_day: '2026-05-10',
         end_day: '2026-05-09',
@@ -93,7 +93,7 @@ describe('AnnotationRepo.add', () => {
 
   it('honors source="oura" with an oura_id', () => {
     const row = repo.add({
-      tag_type_code: 'caffeine',
+      tag_type_code: 'tag_generic_tea',
       start_time: '2026-05-02T07:00:00Z',
       start_day: '2026-05-02',
       source: 'oura',
@@ -106,7 +106,7 @@ describe('AnnotationRepo.add', () => {
   it('rejects source="oura" without an oura_id', () => {
     expect(() =>
       repo.add({
-        tag_type_code: 'caffeine',
+        tag_type_code: 'tag_generic_tea',
         start_time: '2026-05-02T07:00:00Z',
         start_day: '2026-05-02',
         source: 'oura',
@@ -118,24 +118,24 @@ describe('AnnotationRepo.add', () => {
 describe('AnnotationRepo.list', () => {
   beforeEach(() => {
     repo.add({
-      tag_type_code: 'alcohol',
+      tag_type_code: 'tag_sleep_alcohol',
       start_time: '2026-05-01T22:00:00Z',
       start_day: '2026-05-01',
       comment: 'wine',
     });
     repo.add({
-      tag_type_code: 'sick',
+      tag_type_code: 'tag_generic_diarrhea',
       start_time: '2026-05-03T10:00:00Z',
       start_day: '2026-05-03',
     });
     repo.add({
-      tag_type_code: 'alcohol',
+      tag_type_code: 'tag_sleep_alcohol',
       start_time: '2026-05-05T20:00:00Z',
       start_day: '2026-05-05',
       comment: 'beer',
     });
     repo.add({
-      tag_type_code: 'caffeine',
+      tag_type_code: 'tag_generic_tea',
       start_time: '2026-05-06T07:00:00Z',
       start_day: '2026-05-06',
       source: 'oura',
@@ -159,9 +159,9 @@ describe('AnnotationRepo.list', () => {
   });
 
   it('filters by tag_type_code', () => {
-    const rows = repo.list({ tag_type_code: 'alcohol' });
+    const rows = repo.list({ tag_type_code: 'tag_sleep_alcohol' });
     expect(rows).toHaveLength(2);
-    expect(rows.every((r) => r.tag_type_code === 'alcohol')).toBe(true);
+    expect(rows.every((r) => r.tag_type_code === 'tag_sleep_alcohol')).toBe(true);
   });
 
   it('filters by source', () => {
@@ -173,7 +173,7 @@ describe('AnnotationRepo.list', () => {
 describe('AnnotationRepo.update', () => {
   it('partially updates and re-validates', async () => {
     const row = repo.add({
-      tag_type_code: 'alcohol',
+      tag_type_code: 'tag_sleep_alcohol',
       start_time: '2026-05-02T22:00:00Z',
       start_day: '2026-05-02',
       comment: '1 beer',
@@ -182,7 +182,7 @@ describe('AnnotationRepo.update', () => {
     await new Promise((r) => setTimeout(r, 2));
     const updated = repo.update(row.id, { comment: '2 beers (corrected)' });
     expect(updated?.comment).toBe('2 beers (corrected)');
-    expect(updated?.tag_type_code).toBe('alcohol'); // unchanged
+    expect(updated?.tag_type_code).toBe('tag_sleep_alcohol'); // unchanged
     expect(updated?.updated_at).not.toBe(row.updated_at);
   });
 
@@ -205,7 +205,7 @@ describe('AnnotationRepo.update', () => {
 describe('AnnotationRepo.delete', () => {
   it('returns true when a row was deleted, false otherwise', () => {
     const row = repo.add({
-      tag_type_code: 'alcohol',
+      tag_type_code: 'tag_sleep_alcohol',
       start_time: '2026-05-02T22:00:00Z',
       start_day: '2026-05-02',
       comment: 'wine',

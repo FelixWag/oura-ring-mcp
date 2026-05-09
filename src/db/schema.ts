@@ -62,6 +62,31 @@ const MIGRATIONS: readonly Migration[] = [
       CREATE INDEX IF NOT EXISTS idx_annotations_source    ON annotations(source);
     `,
   },
+  {
+    version: 2,
+    // Background: the v0.3 KNOWN_TAG_TYPE_CODES seed list used bare names
+    // (alcohol, caffeine, traveled, …) that did not match Oura's actual
+    // canonical codes (tag_sleep_alcohol, tag_generic_caffeine, …) once we
+    // inspected real data via the enhanced_tag endpoint. Any rows already
+    // inserted with the v0.3 guesses need to be remapped so they validate
+    // against the new code list (and so they will join cleanly with v0.4
+    // synced Oura rows).
+    //
+    // We only remap codes we KNOW (have observed in real Oura data). Codes
+    // we never saw in the user's history are left untouched — if a user
+    // somehow inserted one, the v0.3.1 validator will surface it on the
+    // next update and they can correct it manually.
+    //
+    // This migration is idempotent: re-running it just no-ops on already-
+    // migrated rows.
+    name: 'remap v0.3 guess-codes to canonical Oura codes',
+    sql: `
+      UPDATE annotations
+         SET tag_type_code = 'tag_sleep_alcohol',
+             updated_at    = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+       WHERE tag_type_code = 'alcohol';
+    `,
+  },
 ];
 
 export function currentSchemaVersion(db: Database): number {
