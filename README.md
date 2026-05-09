@@ -13,13 +13,16 @@ Read-only, OAuth2, runs locally over stdio. Personal project — but clean and e
 ## Features
 
 - OAuth2 authorization-code flow with automatic token refresh.
-- Thirteen MCP tools across three categories:
+- Fourteen MCP tools across four categories:
   - **Raw access**: `oura_get_daily_summary` / `oura_get_sleep` / `oura_get_activity` / `oura_get_heartrate` / `oura_get_personal_info`
   - **Derived metrics**: `oura_get_recent_summary` / `oura_compare_periods` / `oura_get_trends`
-  - **Tags & annotations** (v0.3): `oura_get_enhanced_tags` (read Oura tags), plus a local SQLite-backed annotation system (`oura_add_annotation` / `oura_list_annotations` / `oura_update_annotation` / `oura_delete_annotation`).
+  - **Tags & annotations** (v0.3): `oura_get_enhanced_tags` (read Oura tags), plus local SQLite annotations (`oura_add_annotation` / `oura_list_annotations` / `oura_update_annotation` / `oura_delete_annotation`).
+  - **Local mirror** (v0.4): `oura_sync` mirrors Oura data into local SQLite so summary tools answer instantly without hitting the API.
 - Local annotations mirror Oura's enhanced_tag schema, so the LLM can
   reason about both Oura-logged tags and your own context (illness, alcohol,
   travel, etc.) in one uniform shape.
+- **Local-first reads** (v0.4): `oura_get_daily_summary` and `oura_get_recent_summary` use the local SQLite mirror by default. Stable past days come instantly from cache; today/yesterday and missing days fall back to the API.
+- **Self-correcting tag-code list**: every sync of `enhanced_tag` records the codes Oura actually returns; the annotation validator accepts both the static seed list and your discovered codes.
 - Compact-by-default responses keep payloads small enough for LLMs to reason over.
 - Automatic token refresh + 429 / Retry-After-aware rate-limit handling.
 - Local data at `~/.config/oura-ring-mcp/` (tokens + SQLite, both `0600`).
@@ -76,11 +79,23 @@ Or edit `~/.claude.json` manually:
 }
 ```
 
-Restart Claude Code, then run `/mcp` — you should see `oura` listed with all thirteen tools.
+Restart Claude Code, then run `/mcp` — you should see `oura` listed with all fourteen tools.
 Try asking: _"Show my Oura daily summary for the last 7 days."_
 
 > Upgrading from v0.2 → v0.3? Re-run `npm run oauth-login` once. v0.3 requests
 > the additional `tag` scope so it can read Oura's enhanced_tag endpoint.
+
+### Optional: prime the local cache
+
+```bash
+npm run sync
+```
+
+This is optional but recommended. It pulls your last ~30 days of Oura data
+into the local SQLite mirror so every subsequent summary / trend query
+answers instantly from cache. Future runs are incremental — see
+`npm run sync -- --help` for flags. You can also trigger this from inside
+Claude Code with the `oura_sync` tool.
 
 ## Tools
 
@@ -98,7 +113,7 @@ Try asking: _"Show my Oura daily summary for the last 7 days."_
 
 | Tool                      | Inputs                                            | Notes                                             |
 | ------------------------- | ------------------------------------------------- | ------------------------------------------------- |
-| `oura_get_recent_summary` | `days` (1–90)                                     | Convenience wrapper for "the last N days".        |
+| `oura_get_recent_summary` | `days` (1–90), `prefer?`                          | Convenience wrapper for "the last N days".        |
 | `oura_compare_periods`    | `days` **or** `a_start`/`a_end`/`b_start`/`b_end` | Per-metric averages + deltas + direction.         |
 | `oura_get_trends`         | `start_date`, `end_date`, `window?` (default 7)   | Rolling averages + linear trend (improving/etc.). |
 
@@ -116,6 +131,29 @@ The `oura_get_daily_summary` and `oura_get_recent_summary` tools default to
 `include_annotations: true` — each day record is joined with any matching
 local annotations so the LLM can correlate context with metrics in one call.
 Pass `include_annotations: false` to skip the join.
+
+### Local mirror (v0.4)
+
+| Tool        | Inputs                                      | Notes                                                                                   |
+| ----------- | ------------------------------------------- | --------------------------------------------------------------------------------------- |
+| `oura_sync` | `since_days?` (1–90), `full?`, `tags_only?` | Pull recent Oura data into local SQLite. Default: incremental + 7-day re-fetch overlap. |
+
+`oura_get_daily_summary` and `oura_get_recent_summary` gained a new `prefer`
+parameter:
+
+- `auto` (default) — read from local SQLite when available; fall back to
+  the API for missing days and for today/yesterday (still being re-scored
+  by Oura). API results are upserted into local for next time.
+- `local` — offline mode; missing days return empty.
+- `api` — force-refetch from Oura on every call (still upserts local).
+
+Each response carries a `source: 'local' | 'api' | 'mixed'` field for
+traceability.
+
+The same code path is also exposed as `npm run sync` for cron-style
+backfilling. Heart-rate timeseries are intentionally **not** mirrored —
+their volume is too high; use the `oura_get_heartrate` tool for ad-hoc
+windows.
 
 #### Annotation schema
 
@@ -167,7 +205,7 @@ when we sync your actual tag history. Anything not in the list uses
 | `OURA_CLIENT_SECRET` | —                                     | Required. From your Oura OAuth app.                            |
 | `OURA_REDIRECT_URI`  | `http://127.0.0.1:8765/callback`      | Must match what you registered with Oura.                      |
 | `OURA_TOKEN_PATH`    | `~/.config/oura-ring-mcp/tokens.json` | Token file location.                                           |
-| `OURA_DB_PATH`       | `~/.config/oura-ring-mcp/data.sqlite` | Local SQLite database (annotations).                           |
+| `OURA_DB_PATH`       | `~/.config/oura-ring-mcp/data.sqlite` | Local SQLite database (annotations + Oura mirror).             |
 | `OURA_DEBUG`         | unset                                 | Set to `1` for verbose logs on stderr (still redacts secrets). |
 
 `.env` in the project root is loaded automatically.
@@ -202,9 +240,16 @@ src/
     schema.ts       # versioned DDL
     annotations.ts  # typed CRUD repo (mirrors EnhancedTagModel)
     tag_types.ts    # canonical tag_type_code shortlist
+    sync.ts         # v0.4 sync orchestrator
+    repos/
+      daily.ts                  # daily_sleep / daily_readiness / daily_activity / daily_spo2
+      events.ts                 # sleep_periods / workouts / sessions
+      discovered_tag_types.ts   # observed Oura tag_type_codes (self-correcting)
+      sync_runs.ts              # sync audit log
 scripts/
   oauth-login.ts    # interactive OAuth flow
   setup.ts          # writes .env interactively
+  sync.ts           # CLI: pull Oura data into the local mirror
 ```
 
 ## Troubleshooting
@@ -243,11 +288,11 @@ stderr; tokens are never logged.
 - ✅ **v0.2** — derived metrics, compact-by-default responses, 429 handling.
 - ✅ **v0.3** — local SQLite annotations (mirroring `EnhancedTagModel`),
   read-only Oura enhanced_tag tool, automatic annotation join in summary tools.
-- **v0.4** — full local sync of Oura data into the same SQLite database
-  (idempotent on `(metric, day)` with `last_synced_at`), enabling long-range
-  analysis without re-hitting the API. Adds a "refresh tag_type_codes from
-  your data" capability.
-- **v0.5** — exports, weekly/monthly reports.
+- ✅ **v0.4** — local sync of Oura data into SQLite (idempotent on
+  `(collection, day)` with `last_synced_at`), local-first reads in summary
+  tools, self-correcting `tag_type_code` list via `discovered_tag_types`.
+  Heart-rate timeseries intentionally not mirrored.
+- **v0.5** — exports, weekly/monthly reports, possibly a heartrate option.
 
 ## License
 

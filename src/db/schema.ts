@@ -87,6 +87,120 @@ const MIGRATIONS: readonly Migration[] = [
        WHERE tag_type_code = 'alcohol';
     `,
   },
+  {
+    version: 3,
+    // v0.4: local mirror of Oura data.
+    //
+    // Hybrid storage shape (see DECISIONS.md, "v0.4 plan approved"):
+    //   - Indexed key columns: day / oura_id, score (where present),
+    //     last_synced_at, first_seen_at.
+    //   - Raw `data` TEXT column carrying the entire Oura row as JSON,
+    //     verbatim. Lossless; no schema churn when Oura adds fields.
+    //
+    // Daily families key on `day` (one row per UTC day). Event families
+    // (sleep_periods, workouts, sessions) key on Oura's `oura_id` (multiple
+    // events possible per day). Both use INSERT ON CONFLICT(...) DO UPDATE
+    // to upsert idempotently — `last_synced_at` advances on every sync,
+    // `first_seen_at` is preserved.
+    //
+    // enhanced_tag is NOT mirrored here: those rows go into the existing
+    // `annotations` table with source='oura' and oura_id populated, per the
+    // v0.3 schema-mirroring decision.
+    name: 'v0.4: oura data mirror tables',
+    sql: `
+      -- Daily score families. One row per (table, day).
+      CREATE TABLE IF NOT EXISTS daily_sleep (
+        day             TEXT PRIMARY KEY,
+        score           INTEGER,
+        data            TEXT NOT NULL,
+        first_seen_at   TEXT NOT NULL,
+        last_synced_at  TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_daily_sleep_synced ON daily_sleep(last_synced_at);
+
+      CREATE TABLE IF NOT EXISTS daily_readiness (
+        day             TEXT PRIMARY KEY,
+        score           INTEGER,
+        data            TEXT NOT NULL,
+        first_seen_at   TEXT NOT NULL,
+        last_synced_at  TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_daily_readiness_synced ON daily_readiness(last_synced_at);
+
+      CREATE TABLE IF NOT EXISTS daily_activity (
+        day             TEXT PRIMARY KEY,
+        score           INTEGER,
+        data            TEXT NOT NULL,
+        first_seen_at   TEXT NOT NULL,
+        last_synced_at  TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_daily_activity_synced ON daily_activity(last_synced_at);
+
+      CREATE TABLE IF NOT EXISTS daily_spo2 (
+        day             TEXT PRIMARY KEY,
+        score           INTEGER,           -- nullable: spo2 may not have a "score" — kept for shape parity
+        data            TEXT NOT NULL,
+        first_seen_at   TEXT NOT NULL,
+        last_synced_at  TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_daily_spo2_synced ON daily_spo2(last_synced_at);
+
+      -- Per-period sleep records. Multiple per day possible (nap + main sleep).
+      CREATE TABLE IF NOT EXISTS sleep_periods (
+        oura_id         TEXT PRIMARY KEY,
+        day             TEXT NOT NULL,
+        data            TEXT NOT NULL,
+        first_seen_at   TEXT NOT NULL,
+        last_synced_at  TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_sleep_periods_day    ON sleep_periods(day);
+      CREATE INDEX IF NOT EXISTS idx_sleep_periods_synced ON sleep_periods(last_synced_at);
+
+      -- Event collections.
+      CREATE TABLE IF NOT EXISTS workouts (
+        oura_id         TEXT PRIMARY KEY,
+        day             TEXT NOT NULL,
+        data            TEXT NOT NULL,
+        first_seen_at   TEXT NOT NULL,
+        last_synced_at  TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_workouts_day    ON workouts(day);
+      CREATE INDEX IF NOT EXISTS idx_workouts_synced ON workouts(last_synced_at);
+
+      CREATE TABLE IF NOT EXISTS sessions (
+        oura_id         TEXT PRIMARY KEY,
+        day             TEXT NOT NULL,
+        data            TEXT NOT NULL,
+        first_seen_at   TEXT NOT NULL,
+        last_synced_at  TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_sessions_day    ON sessions(day);
+      CREATE INDEX IF NOT EXISTS idx_sessions_synced ON sessions(last_synced_at);
+
+      -- Codes observed in synced enhanced_tag rows. Feeds back into the
+      -- annotation validator so v0.3.1 inferences converge to reality.
+      CREATE TABLE IF NOT EXISTS discovered_tag_types (
+        code              TEXT PRIMARY KEY,
+        first_seen_at     TEXT NOT NULL,
+        last_seen_at      TEXT NOT NULL,
+        occurrence_count  INTEGER NOT NULL DEFAULT 1
+      );
+
+      -- Audit log: one row per sync run per collection.
+      CREATE TABLE IF NOT EXISTS sync_runs (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        collection      TEXT NOT NULL,
+        started_at      TEXT NOT NULL,
+        finished_at     TEXT,
+        ok              INTEGER,                  -- 1 = success, 0 = failure, NULL = in progress
+        error           TEXT,
+        rows_upserted   INTEGER,
+        from_date       TEXT,
+        to_date         TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_sync_runs_collection ON sync_runs(collection, started_at DESC);
+    `,
+  },
 ];
 
 export function currentSchemaVersion(db: Database): number {
