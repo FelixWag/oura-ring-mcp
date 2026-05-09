@@ -10,22 +10,30 @@ None by us. The software:
 - Reads your Oura Ring data through the official Oura API v2.
 - Stores OAuth access and refresh tokens locally at
   `~/.config/oura-ring-mcp/tokens.json` (file permissions `0600`).
-- Returns API responses to whichever MCP client you connected (e.g. Claude Code).
+- From v0.3 onward, stores any annotations you add (illness, alcohol, travel,
+  etc.) in a local SQLite database at
+  `~/.config/oura-ring-mcp/data.sqlite` (file permissions `0600`).
+- Returns API responses and annotations to whichever MCP client you connected
+  (e.g. Claude Code).
 
 ## What data is transmitted
 
 - Requests to `api.ouraring.com` over HTTPS, authenticated with your token.
 - No data is sent to any other server, analytics provider, or third party.
+- Annotations stored locally are **never** transmitted anywhere.
 
 ## What data is retained
 
 - Tokens are kept on your machine until you delete them or revoke the
   application from <https://cloud.ouraring.com/oauth/applications>.
+- Annotations are kept in the local SQLite database until you delete them
+  through the MCP tools or remove the database file.
 
 ## Your control
 
 - Revoke access at any time from your Oura account settings.
 - Delete `~/.config/oura-ring-mcp/tokens.json` to remove all credentials.
+- Delete `~/.config/oura-ring-mcp/data.sqlite` to remove all annotations.
 
 ## Contact
 

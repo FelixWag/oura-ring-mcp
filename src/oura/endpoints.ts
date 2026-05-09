@@ -8,6 +8,7 @@ export const ENDPOINTS = {
   session: '/usercollection/session',
   spo2: '/usercollection/daily_spo2',
   personalInfo: '/usercollection/personal_info',
+  enhancedTag: '/usercollection/enhanced_tag',
 } as const;
 
 export type EndpointPath = (typeof ENDPOINTS)[keyof typeof ENDPOINTS];

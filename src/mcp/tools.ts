@@ -1,5 +1,11 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
+import {
+  AnnotationValidationError,
+  type Annotation,
+  type AnnotationRepo,
+} from '../db/annotations.js';
+import { acceptedTagTypeCodes } from '../db/tag_types.js';
 import type { OuraClient } from '../oura/client.js';
 import {
   comparePeriods,
@@ -16,6 +22,7 @@ import {
   shapeDailySleep,
   shapeSleep,
 } from '../oura/shape.js';
+import { shapeEnhancedTag } from '../oura/tags.js';
 
 const DATE_REGEX = /^\d{4}-\d{2}-\d{2}$/;
 const MAX_RANGE_DAYS = 90;
@@ -37,6 +44,15 @@ const verboseSchema = z
       'Default false returns compact records — scores, key contributors, and counts.',
   );
 
+const includeAnnotationsSchema = z
+  .boolean()
+  .optional()
+  .describe(
+    'When true (default), each day record gains an `annotations` array of locally-stored ' +
+      'context entries (and any synced Oura enhanced_tags) overlapping that date. ' +
+      'Pass false to skip the local-DB join entirely.',
+  );
+
 function diffDays(start: string, end: string): number {
   const a = Date.parse(start + 'T00:00:00Z');
   const b = Date.parse(end + 'T00:00:00Z');
@@ -47,10 +63,6 @@ function todayUtc(): string {
   return new Date().toISOString().slice(0, 10);
 }
 
-/**
- * Subtract `days` from `from` (YYYY-MM-DD), returning a YYYY-MM-DD string.
- * Pure UTC arithmetic so we don't get bitten by DST.
- */
 function shiftDate(from: string, days: number): string {
   const t = Date.parse(from + 'T00:00:00Z');
   const shifted = new Date(t + days * 24 * 60 * 60 * 1000);
@@ -105,19 +117,11 @@ async function handle<T>(fn: () => Promise<T>) {
   }
 }
 
-/**
- * Fetch the three daily collections for a date range and merge them into a
- * single sorted list of compact day records. Used by both
- * `oura_get_daily_summary` and the new derived-metric tools.
- */
 async function fetchCompactDays(
   client: OuraClient,
   start_date: string,
   end_date: string,
-): Promise<{
-  days: ReturnType<typeof mergeDays>;
-  truncated: boolean;
-}> {
+): Promise<{ days: ReturnType<typeof mergeDays>; truncated: boolean }> {
   const q = { start_date, end_date };
   const [sleep, readiness, activity] = await Promise.all([
     client.getCollection<unknown>(ENDPOINTS.dailySleep, q),
@@ -132,11 +136,35 @@ async function fetchCompactDays(
   return { days, truncated: sleep.truncated || readiness.truncated || activity.truncated };
 }
 
-export function registerTools(server: McpServer, client: OuraClient): void {
+/**
+ * Group annotations by their `start_day`. Multi-day annotations (with end_day)
+ * are emitted under start_day only — the LLM can reason about the span from
+ * the row itself. Keeping it simple here avoids cross-day duplication.
+ */
+function annotationsByDay(rows: Annotation[]): Map<string, Annotation[]> {
+  const out = new Map<string, Annotation[]>();
+  for (const row of rows) {
+    const list = out.get(row.start_day);
+    if (list) list.push(row);
+    else out.set(row.start_day, [row]);
+  }
+  return out;
+}
+
+export interface RegisterToolsOptions {
+  client: OuraClient;
+  /** Required. v0.3+ tools that touch the local DB are skipped if absent. */
+  annotations?: AnnotationRepo;
+}
+
+export function registerTools(server: McpServer, opts: RegisterToolsOptions): void {
+  const { client, annotations: repo } = opts;
+
   const dateRangeShape = {
     start_date: dateSchema.describe('Start date, inclusive (YYYY-MM-DD).'),
     end_date: dateSchema.describe('End date, inclusive (YYYY-MM-DD).'),
     verbose: verboseSchema,
+    include_annotations: includeAnnotationsSchema,
   };
 
   // -------------------------- Existing tools (compact-by-default) --------
@@ -148,10 +176,11 @@ export function registerTools(server: McpServer, client: OuraClient): void {
       description:
         'Fetch combined daily Oura summaries (sleep, readiness, activity) for a date range. ' +
         'Returns one merged record per date. Compact by default; pass verbose:true for raw rows. ' +
+        'Joins local annotations onto each day by default (set include_annotations:false to skip). ' +
         'Max 90 days per call.',
       inputSchema: dateRangeShape,
     },
-    async ({ start_date, end_date, verbose }) => {
+    async ({ start_date, end_date, verbose, include_annotations }) => {
       const err = validateDateRange(start_date, end_date);
       if (err) return errorResult(err);
       return handle(async () => {
@@ -172,11 +201,17 @@ export function registerTools(server: McpServer, client: OuraClient): void {
           };
         }
         const { days, truncated } = await fetchCompactDays(client, start_date, end_date);
+        const wantAnnotations = include_annotations !== false;
+        const annsByDay =
+          wantAnnotations && repo ? annotationsByDay(repo.list({ start_date, end_date })) : null;
         return {
           range: { start_date, end_date },
           truncated,
           count: days.length,
-          days,
+          days: days.map((d) => ({
+            ...d,
+            ...(annsByDay ? { annotations: annsByDay.get(d.day) ?? [] } : {}),
+          })),
         };
       });
     },
@@ -189,7 +224,11 @@ export function registerTools(server: McpServer, client: OuraClient): void {
       description:
         'Fetch detailed sleep records (one per sleep period) for a date range. ' +
         'Compact by default; pass verbose:true for raw rows. Max 90 days per call.',
-      inputSchema: dateRangeShape,
+      inputSchema: {
+        start_date: dateSchema.describe('Start date, inclusive (YYYY-MM-DD).'),
+        end_date: dateSchema.describe('End date, inclusive (YYYY-MM-DD).'),
+        verbose: verboseSchema,
+      },
     },
     async ({ start_date, end_date, verbose }) => {
       const err = validateDateRange(start_date, end_date);
@@ -215,7 +254,11 @@ export function registerTools(server: McpServer, client: OuraClient): void {
       description:
         'Fetch daily activity records for a date range. ' +
         'Compact by default; pass verbose:true for raw rows. Max 90 days per call.',
-      inputSchema: dateRangeShape,
+      inputSchema: {
+        start_date: dateSchema.describe('Start date, inclusive (YYYY-MM-DD).'),
+        end_date: dateSchema.describe('End date, inclusive (YYYY-MM-DD).'),
+        verbose: verboseSchema,
+      },
     },
     async ({ start_date, end_date, verbose }) => {
       const err = validateDateRange(start_date, end_date);
@@ -288,7 +331,8 @@ export function registerTools(server: McpServer, client: OuraClient): void {
       description:
         'Convenience wrapper for "the last N days". Computes start/end dates internally so the ' +
         'caller does not have to do date arithmetic. Returns the same compact shape as ' +
-        'oura_get_daily_summary plus the resolved date range.',
+        'oura_get_daily_summary. Joins local annotations by default (set ' +
+        'include_annotations:false to skip).',
       inputSchema: {
         days: z
           .number()
@@ -296,18 +340,27 @@ export function registerTools(server: McpServer, client: OuraClient): void {
           .min(1)
           .max(MAX_RANGE_DAYS)
           .describe('How many days back from today (1–90). Today is included.'),
+        include_annotations: includeAnnotationsSchema,
       },
     },
-    async ({ days }) => {
+    async ({ days, include_annotations }) => {
       return handle(async () => {
         const end = todayUtc();
         const start = shiftDate(end, -(days - 1));
         const { days: rows, truncated } = await fetchCompactDays(client, start, end);
+        const wantAnnotations = include_annotations !== false;
+        const annsByDay =
+          wantAnnotations && repo
+            ? annotationsByDay(repo.list({ start_date: start, end_date: end }))
+            : null;
         return {
           range: { start_date: start, end_date: end, days },
           truncated,
           count: rows.length,
-          days: rows,
+          days: rows.map((d) => ({
+            ...d,
+            ...(annsByDay ? { annotations: annsByDay.get(d.day) ?? [] } : {}),
+          })),
         };
       });
     },
@@ -452,6 +505,198 @@ export function registerTools(server: McpServer, client: OuraClient): void {
           },
         };
       });
+    },
+  );
+
+  // -------------------------- v0.3: Oura tag read --------------------
+
+  server.registerTool(
+    'oura_get_enhanced_tags',
+    {
+      title: 'Oura: Enhanced tags',
+      description:
+        "Fetch tags you've logged in the Oura app (the modern enhanced_tag endpoint). " +
+        'Compact by default. Each row carries a tag_type_code, optional custom_name, ' +
+        'start/end times and days, and an optional comment. Max 90 days per call.',
+      inputSchema: {
+        start_date: dateSchema.describe('Start date, inclusive (YYYY-MM-DD).'),
+        end_date: dateSchema.describe('End date, inclusive (YYYY-MM-DD).'),
+        verbose: verboseSchema,
+      },
+    },
+    async ({ start_date, end_date, verbose }) => {
+      const err = validateDateRange(start_date, end_date);
+      if (err) return errorResult(err);
+      return handle(async () => {
+        const r = await client.getCollection<unknown>(ENDPOINTS.enhancedTag, {
+          start_date,
+          end_date,
+        });
+        const data = verbose ? r.data : r.data.map(shapeEnhancedTag);
+        return {
+          range: { start_date, end_date },
+          verbose: !!verbose,
+          truncated: r.truncated,
+          count: data.length,
+          data,
+        };
+      });
+    },
+  );
+
+  // -------------------------- v0.3: local annotations ----------------
+
+  if (!repo) return; // Annotation tools require the local DB; skip if absent.
+
+  // Reusable bits for the annotation input schema. All field shapes match
+  // Oura's EnhancedTagModel so locally-stored rows are interchangeable with
+  // (future) synced Oura rows.
+  const tagTypeCodeSchema = z
+    .string()
+    .nullable()
+    .optional()
+    .describe(
+      `Canonical Oura tag type. Accepted: ${acceptedTagTypeCodes().join(', ')}, or null. ` +
+        'Use "custom" with a custom_name for ad-hoc types.',
+    );
+  const customNameSchema = z
+    .string()
+    .optional()
+    .describe('Required iff tag_type_code="custom". 1–60 chars.');
+  const startTimeSchema = datetimeSchema.describe('ISO 8601 start datetime.');
+  const endTimeSchema = datetimeSchema
+    .nullable()
+    .optional()
+    .describe('Optional ISO 8601 end datetime for events with duration.');
+  const startDaySchema = dateSchema.describe('Start day (YYYY-MM-DD).');
+  const endDaySchema = dateSchema
+    .nullable()
+    .optional()
+    .describe('Optional end day (YYYY-MM-DD) for multi-day events like travel.');
+  const commentSchema = z
+    .string()
+    .nullable()
+    .optional()
+    .describe('Free-form note. Required when tag_type_code is null (text-only annotation).');
+
+  function annotationCallError(err: unknown): {
+    isError: boolean;
+    content: { type: 'text'; text: string }[];
+  } {
+    const e = err as Error;
+    const prefix =
+      e instanceof AnnotationValidationError ? 'Validation error' : (e.name ?? 'Error');
+    return errorResult(`${prefix}: ${e.message}`);
+  }
+
+  server.registerTool(
+    'oura_add_annotation',
+    {
+      title: 'Annotations: Add',
+      description:
+        "Store a contextual annotation in the local SQLite database. Fields mirror Oura's " +
+        'enhanced_tag schema so this data is shape-compatible with tags you log in the Oura app. ' +
+        'Use this for things Oura does not capture: illness, alcohol, travel, naps, mood, etc.',
+      inputSchema: {
+        tag_type_code: tagTypeCodeSchema,
+        custom_name: customNameSchema,
+        start_time: startTimeSchema,
+        end_time: endTimeSchema,
+        start_day: startDaySchema,
+        end_day: endDaySchema,
+        comment: commentSchema,
+      },
+    },
+    async (input) => {
+      try {
+        const row = repo.add({
+          tag_type_code: input.tag_type_code ?? null,
+          custom_name: input.custom_name ?? null,
+          start_time: input.start_time,
+          end_time: input.end_time ?? null,
+          start_day: input.start_day,
+          end_day: input.end_day ?? null,
+          comment: input.comment ?? null,
+        });
+        return textResult({ created: row });
+      } catch (err) {
+        return annotationCallError(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    'oura_list_annotations',
+    {
+      title: 'Annotations: List',
+      description:
+        'List local annotations, optionally filtered by date range, tag_type_code, or source ' +
+        '("local" for entries you added via this MCP, "oura" for synced Oura tags).',
+      inputSchema: {
+        start_date: dateSchema.optional().describe('Filter: rows with start_day >= this.'),
+        end_date: dateSchema.optional().describe('Filter: rows with start_day <= this.'),
+        tag_type_code: z.string().optional().describe('Filter to a specific tag_type_code.'),
+        source: z
+          .enum(['local', 'oura'])
+          .optional()
+          .describe('Filter by row source: "local" or "oura".'),
+      },
+    },
+    async (filter) => {
+      try {
+        const rows = repo.list(filter);
+        return textResult({ count: rows.length, annotations: rows });
+      } catch (err) {
+        return annotationCallError(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    'oura_update_annotation',
+    {
+      title: 'Annotations: Update',
+      description:
+        'Partial update of an existing annotation by id. Pass only the fields you want to change. ' +
+        'The merged row is re-validated, so you cannot leave it in an invalid state.',
+      inputSchema: {
+        id: z.number().int().positive().describe('Annotation id.'),
+        tag_type_code: tagTypeCodeSchema,
+        custom_name: customNameSchema,
+        start_time: datetimeSchema.optional().describe('ISO 8601 start datetime.'),
+        end_time: endTimeSchema,
+        start_day: dateSchema.optional().describe('Start day (YYYY-MM-DD).'),
+        end_day: endDaySchema,
+        comment: commentSchema,
+      },
+    },
+    async ({ id, ...patch }) => {
+      try {
+        const row = repo.update(id, patch);
+        if (!row) return errorResult(`No annotation with id=${id}.`);
+        return textResult({ updated: row });
+      } catch (err) {
+        return annotationCallError(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    'oura_delete_annotation',
+    {
+      title: 'Annotations: Delete',
+      description: 'Delete an annotation by id. Returns whether the row existed.',
+      inputSchema: {
+        id: z.number().int().positive().describe('Annotation id.'),
+      },
+    },
+    async ({ id }) => {
+      try {
+        const deleted = repo.delete(id);
+        return textResult({ deleted, id });
+      } catch (err) {
+        return annotationCallError(err);
+      }
     },
   );
 }
