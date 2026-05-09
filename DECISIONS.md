@@ -190,3 +190,63 @@ and ships through a PR (even when working solo). CI runs on every PR.
 **Rationale.** Forces a moment of review (the PR diff view catches things
 the editor doesn't), keeps `main` always shippable, and creates a
 searchable history. ~30 s of overhead per change is worth it.
+
+---
+
+## 2026-05-09 — 🐛 Known issue: custom Oura tags don't appear in the API
+
+**Context.** A user-named "custom" tag created in the Oura mobile app does
+not appear in either the `enhanced_tag` or legacy `tag` API endpoints,
+even after waiting. Verified by:
+
+1. `curl` straight to `/v2/usercollection/enhanced_tag` (bypassing our MCP
+   stack entirely) — 37 rows returned, **zero with `tag_type_code='custom'`,
+   zero with `custom_name` set**.
+2. Our compact and verbose paths return identical row counts and identical
+   shapes — so the bug is not in our parsing/filtering.
+3. `cache-control: no-cache` on the response rules out a stale-cache theory.
+
+**Status.** Open. Flagged for later investigation; the v0.3.1 patch unblocks
+the canonical tag-code list separately.
+
+**Hypotheses (untested):**
+
+1. **Sync delay** — Oura's cloud sync may take longer than expected for new
+   tags, especially custom ones.
+2. **Custom tags are stored as comments on canonical tags** — the 7 rows in
+   the user's data with non-empty comments (e.g. "Chilli cici" on a
+   `tag_generic_spicy_meal`) suggest the dominant pattern is "canonical type
+   - free-form comment," not a true custom row.
+3. **The Oura API simply doesn't expose user-named custom tags** — would be
+   unusual given the schema explicitly defines `tag_type_code='custom'`,
+   but possible.
+
+**Next test (no code changes required):** log a known canonical tag (e.g.
+`tag_generic_tea`) in the app, wait 30+ minutes, re-query. If the canonical
+tag appears but the custom one still doesn't, hypothesis 1 is ruled out and
+we focus on 2/3.
+
+---
+
+## 2026-05-09 — v0.3.1: real Oura `tag_type_code` shortlist + v2 migration
+
+**Context.** v0.3 seeded `KNOWN_TAG_TYPE_CODES` with bare guesses (`alcohol`,
+`caffeine`, `traveled`, …). Once we queried the user's real
+`enhanced_tag` history, the actual codes turned out to follow a two-prefix
+scheme (`tag_sleep_*` and `tag_generic_*`) and use slightly normalized names
+(e.g. `late_screen_time` → `tag_sleep_late_screentime`,
+`sleeping_aids` → `tag_sleep_aid`). None of the v0.3 guesses matched.
+
+**Decision.** Replace the seed list with ~170 codes derived from the user's
+in-app tag picker, classified into `TAG_SLEEP_CODES` and `TAG_GENERIC_CODES`
+in `src/db/tag_types.ts`. Mark observed codes with `// ✓` and treat the rest
+as inferred. Add schema migration v2 that renames the existing v0.3 row
+(`tag_type_code='alcohol'`) to `tag_sleep_alcohol` so it validates against
+the new list.
+
+**Rationale.** Empirical data > guesses. The list is 10× larger now so the
+LLM can use precise codes proactively (instead of falling back to `custom`
+for everything). Inferred codes are flagged so v0.4's planned "refresh
+canonical list from synced enhanced_tags" can correct them automatically;
+any local rows using a wrong inferred code can be migrated with the same
+pattern as v2 (a one-line UPDATE inside a versioned migration).

@@ -135,8 +135,18 @@ sources are interchangeable:
 | `source`        | string  | `'local'` for entries you add; `'oura'` for synced Oura tags (v0.4+).             |
 | `oura_id`       | string? | The Oura tag's id when `source='oura'`.                                           |
 
-The current canonical `tag_type_code` shortlist (extend in `src/db/tag_types.ts`):
-`alcohol, caffeine, nicotine, sick, stressed, mood_good, mood_bad, traveled, ate_late, napped, meditated, workout, period, intercourse`. Anything else uses
+The canonical `tag_type_code` list lives in `src/db/tag_types.ts`. As of v0.3.1
+it follows the two-prefix scheme observed in real Oura API responses:
+
+- `tag_sleep_*` for events framed as sleep impact (alcohol, late_meal, sauna,
+  stress, sleep environment items, …).
+- `tag_generic_*` for everything else (drinks, activities, social events,
+  illness, mood, medical, reproductive, …).
+
+The seed list in v0.3.1 is ~170 entries derived from the Oura mobile app's
+predefined types. Codes marked `// ✓` were observed in real API data; the
+rest are inferred from naming patterns and will be auto-corrected in v0.4
+when we sync your actual tag history. Anything not in the list uses
 `tag_type_code='custom'` with a `custom_name`.
 
 ### Notes
