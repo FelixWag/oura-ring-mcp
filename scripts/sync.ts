@@ -15,6 +15,7 @@
 import { ConfigError, loadConfig } from '../src/config.js';
 import { openDatabase } from '../src/db/index.js';
 import { MAX_LOOKBACK_DAYS, runSync, type SyncOptions } from '../src/db/sync.js';
+import { isKnownTagTypeCode } from '../src/db/tag_types.js';
 import { OuraClient } from '../src/oura/client.js';
 
 interface CliArgs {
@@ -157,20 +158,36 @@ async function main(): Promise<void> {
   }
 
   // Show newly-discovered tag codes (from the enhanced_tag sync).
+  // We only count codes as "new" against the static seed list. The
+  // `newly_discovered_tag_codes` field reports codes inserted into the
+  // `discovered_tag_types` table for the first time, which on a fresh DB
+  // is every code seen — most of which are already in the seed list. The
+  // user wants to know what's actually unanticipated.
   const tagsCol = result.collections.find((c) => c.collection === 'enhanced_tag');
   if (tagsCol?.newly_discovered_tag_codes && tagsCol.newly_discovered_tag_codes.length > 0) {
-    process.stdout.write(
-      `\n  Discovered ${tagsCol.newly_discovered_tag_codes.length} new tag_type_code(s) ` +
-        'not in the static seed list:\n',
-    );
-    for (const code of tagsCol.newly_discovered_tag_codes) {
-      process.stdout.write(`    - ${code}\n`);
+    const trulyNew = tagsCol.newly_discovered_tag_codes.filter((c) => !isKnownTagTypeCode(c));
+    const confirmed = tagsCol.newly_discovered_tag_codes.length - trulyNew.length;
+
+    if (trulyNew.length > 0) {
+      process.stdout.write(
+        `\n  Discovered ${trulyNew.length} tag_type_code(s) NOT in the static seed list:\n`,
+      );
+      for (const code of trulyNew) {
+        process.stdout.write(`    - ${code}\n`);
+      }
+      process.stdout.write(
+        '\n  These are already accepted by the annotation validator (via the dynamic ' +
+          '`discovered_tag_types` table). Optionally promote frequently-seen codes to ' +
+          'src/db/tag_types.ts so they ship as part of the seed list.\n',
+      );
     }
-    process.stdout.write(
-      '\n  These are accepted by the annotation validator already (via the dynamic ' +
-        '`discovered_tag_types` table). Optionally promote frequently-seen codes to ' +
-        'src/db/tag_types.ts so they ship as part of the seed list.\n',
-    );
+
+    if (confirmed > 0) {
+      process.stdout.write(
+        `\n  Also confirmed ${confirmed} seed code(s) against your real Oura data — ` +
+          'previously inferred, now verified.\n',
+      );
+    }
   }
 
   db.close();

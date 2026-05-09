@@ -122,6 +122,8 @@ export const TAG_GENERIC_CODES = [
   'tag_generic_airplane', // ✓
   'tag_generic_anxiety', // ✓
   'tag_generic_beer', // ✓
+  'tag_generic_caffeine', // ✓ (added v0.4.1: discovered during the first 240-day backfill)
+  'tag_generic_cold', // ✓ (added v0.4.1: discovered during the first 240-day backfill)
   'tag_generic_diarrhea', // ✓
   'tag_generic_flu_shot', // ✓
   'tag_generic_reading_before_bed', // ✓
