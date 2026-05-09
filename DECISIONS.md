@@ -311,3 +311,28 @@ observed. Local-first is the actual user value of v0.4 (instant queries,
 no rate limits, no payload caps); modifying the existing tools in place
 keeps the LLM's tool surface unchanged. `discovered_tag_types` resolves
 the v0.3.1 inference risk cleanly without forcing manual list curation.
+
+---
+
+## 2026-05-09 — v0.4.1: chunked historical sync
+
+**Context.** v0.4 capped `--since N` at 90 days because the Oura API
+practically enforces a per-request range limit. A real user wanting to
+backfill 6–8 months of history (the natural "I just got my data, give me
+everything" case) had to run multiple syncs manually with no clean way to
+extend the window. New stargazers would hit the same friction immediately.
+
+**Decision.** Ship v0.4.1: lift the orchestration cap to 730 days
+(`MAX_LOOKBACK_DAYS`, ≈2 years) while keeping the per-request cap at 90
+days (`MAX_RANGE_DAYS_PER_REQUEST`). A new `chunkRange` helper splits
+larger windows into contiguous ≤90-day chunks; each per-collection sync
+loops through them sequentially, recording one `sync_runs` row per chunk
+for audit. The `--since` CLI flag and `oura_sync` MCP tool's `since_days`
+parameter both accept up to 730. No new flag — chunking is transparent.
+
+**Rationale.** Historical backfill is the obvious cold-start scenario for
+any user with existing Oura data. Manual multi-run workarounds are
+fragile and the wrong shape for "stargazer-friendly" UX. Per-chunk
+audit rows keep the failure model precise (a partial backfill failure
+shows exactly which window threw, not a mystery aggregate). Sequential
+chunks within a collection let the existing 429-handling stay simple.

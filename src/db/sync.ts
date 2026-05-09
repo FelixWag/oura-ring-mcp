@@ -26,7 +26,17 @@ import { SyncRunsRepo, type SyncCollection } from './repos/sync_runs.js';
 
 export const RECENT_REFETCH_DAYS_DEFAULT = 7;
 export const FIRST_RUN_LOOKBACK_DAYS_DEFAULT = 30;
-const MAX_RANGE_DAYS = 90; // Oura caps a single request at 90 days; we page if needed.
+/**
+ * Per-request cap. Oura's tools enforce a 90-day max per call; we chunk
+ * larger requested windows transparently (see `chunkRange`).
+ */
+export const MAX_RANGE_DAYS_PER_REQUEST = 90;
+/**
+ * Sanity ceiling on user-requested lookback. Two years is comfortably more
+ * than any realistic personal-history backfill. Larger requests are clamped
+ * by the CLI / MCP tool input schemas, not here.
+ */
+export const MAX_LOOKBACK_DAYS = 730;
 
 export interface SyncOptions {
   /** Force-refetch the last N days (regardless of stored state). Mutually exclusive with `full`. */
@@ -81,15 +91,15 @@ interface FromTo {
  * Compute the date window for a collection sync.
  *
  *   - `full`: from `today - firstRunLookbackDays` to today.
- *   - `since_days`: from `today - since_days` to today.
+ *   - `since_days`: from `today - since_days` to today (clamped at
+ *     `MAX_LOOKBACK_DAYS`).
  *   - default (incremental):
  *       from = max(maxLocalDay - recentRefetchDays + 1, today - firstRunLookbackDays)
  *       to   = today
  *     If the table is empty: from = today - firstRunLookbackDays.
  *
- * Caps `to - from <= MAX_RANGE_DAYS`. If the user wants more history, the
- * underlying client paginates; for sync orchestration we keep things simple
- * and rely on the next run to extend the window further if needed.
+ * The returned window may be larger than `MAX_RANGE_DAYS_PER_REQUEST` (90).
+ * Callers issue API requests in chunks via `chunkRange`.
  */
 export function computeWindow(
   options: Pick<
@@ -106,7 +116,8 @@ export function computeWindow(
   if (options.full) {
     from_date = shiftDate(today, -firstRun);
   } else if (typeof options.since_days === 'number') {
-    from_date = shiftDate(today, -options.since_days);
+    const clamped = Math.min(options.since_days, MAX_LOOKBACK_DAYS);
+    from_date = shiftDate(today, -clamped);
   } else if (!maxLocalDay) {
     from_date = shiftDate(today, -firstRun);
   } else {
@@ -115,16 +126,37 @@ export function computeWindow(
     from_date = incremental > fallback ? incremental : fallback;
   }
 
-  // Cap window to MAX_RANGE_DAYS — if larger is needed, run sync repeatedly
-  // (in v0.5 we'll add chunked syncing).
-  const tStart = Date.parse(from_date + 'T00:00:00Z');
-  const tEnd = Date.parse(today + 'T00:00:00Z');
-  const days = (tEnd - tStart) / (1000 * 60 * 60 * 24);
-  if (days > MAX_RANGE_DAYS) {
-    from_date = shiftDate(today, -MAX_RANGE_DAYS);
-  }
-
   return { from_date, to_date: today };
+}
+
+/**
+ * Split [from_date, to_date] into ≤ maxDays-day windows ending at `to_date`,
+ * walking backwards. The first chunk in the returned list is the OLDEST
+ * (farthest from today); the last chunk includes `to_date`. Single requests
+ * fitting in one window return a single-element array.
+ */
+export function chunkRange(
+  from_date: string,
+  to_date: string,
+  maxDays = MAX_RANGE_DAYS_PER_REQUEST,
+): FromTo[] {
+  const out: FromTo[] = [];
+  let cursorEnd = to_date;
+  while (cursorEnd >= from_date) {
+    const tEnd = Date.parse(cursorEnd + 'T00:00:00Z');
+    const tStart = Date.parse(from_date + 'T00:00:00Z');
+    const spanDays = (tEnd - tStart) / (1000 * 60 * 60 * 24);
+    let chunkStart: string;
+    if (spanDays <= maxDays - 1) {
+      chunkStart = from_date;
+    } else {
+      chunkStart = shiftDate(cursorEnd, -(maxDays - 1));
+    }
+    out.unshift({ from_date: chunkStart, to_date: cursorEnd });
+    if (chunkStart === from_date) break;
+    cursorEnd = shiftDate(chunkStart, -1);
+  }
+  return out;
 }
 
 const DAILY_PLAN: Array<{ collection: SyncCollection; table: DailyTable; path: string }> = [
@@ -150,21 +182,27 @@ async function syncDaily(
   const repo = new DailyCollectionRepo(deps.db, table);
   const runs = new SyncRunsRepo(deps.db);
   const window = computeWindow(options, repo.maxDay());
-  const runId = runs.start(collection, window.from_date, window.to_date);
-  try {
-    const r = await deps.client.getCollection<unknown>(path, {
-      start_date: window.from_date,
-      end_date: window.to_date,
-    });
-    const result = repo.upsertMany(r.data);
-    const total = result.inserted + result.updated;
-    runs.finishOk(runId, total);
-    return { collection, ok: true, rows_upserted: total, ...window };
-  } catch (err) {
-    const msg = (err as Error).message;
-    runs.finishError(runId, msg);
-    return { collection, ok: false, rows_upserted: 0, error: msg, ...window };
+  const chunks = chunkRange(window.from_date, window.to_date);
+  let total = 0;
+  // One sync_runs row per chunk so the audit trail records each API call.
+  for (const chunk of chunks) {
+    const runId = runs.start(collection, chunk.from_date, chunk.to_date);
+    try {
+      const r = await deps.client.getCollection<unknown>(path, {
+        start_date: chunk.from_date,
+        end_date: chunk.to_date,
+      });
+      const result = repo.upsertMany(r.data);
+      const chunkTotal = result.inserted + result.updated;
+      total += chunkTotal;
+      runs.finishOk(runId, chunkTotal);
+    } catch (err) {
+      const msg = (err as Error).message;
+      runs.finishError(runId, msg);
+      return { collection, ok: false, rows_upserted: total, error: msg, ...window };
+    }
   }
+  return { collection, ok: true, rows_upserted: total, ...window };
 }
 
 async function syncEvents(
@@ -177,21 +215,26 @@ async function syncEvents(
   const repo = new EventCollectionRepo(deps.db, table);
   const runs = new SyncRunsRepo(deps.db);
   const window = computeWindow(options, repo.maxDay());
-  const runId = runs.start(collection, window.from_date, window.to_date);
-  try {
-    const r = await deps.client.getCollection<unknown>(path, {
-      start_date: window.from_date,
-      end_date: window.to_date,
-    });
-    const result = repo.upsertMany(r.data);
-    const total = result.inserted + result.updated;
-    runs.finishOk(runId, total);
-    return { collection, ok: true, rows_upserted: total, ...window };
-  } catch (err) {
-    const msg = (err as Error).message;
-    runs.finishError(runId, msg);
-    return { collection, ok: false, rows_upserted: 0, error: msg, ...window };
+  const chunks = chunkRange(window.from_date, window.to_date);
+  let total = 0;
+  for (const chunk of chunks) {
+    const runId = runs.start(collection, chunk.from_date, chunk.to_date);
+    try {
+      const r = await deps.client.getCollection<unknown>(path, {
+        start_date: chunk.from_date,
+        end_date: chunk.to_date,
+      });
+      const result = repo.upsertMany(r.data);
+      const chunkTotal = result.inserted + result.updated;
+      total += chunkTotal;
+      runs.finishOk(runId, chunkTotal);
+    } catch (err) {
+      const msg = (err as Error).message;
+      runs.finishError(runId, msg);
+      return { collection, ok: false, rows_upserted: total, error: msg, ...window };
+    }
   }
+  return { collection, ok: true, rows_upserted: total, ...window };
 }
 
 interface OuraEnhancedTagRow {
@@ -206,7 +249,8 @@ interface OuraEnhancedTagRow {
 }
 
 async function syncEnhancedTags(deps: SyncDeps, options: SyncOptions): Promise<CollectionResult> {
-  const annotations = new AnnotationRepo(deps.db);
+  // annotations write happens inline below — kept as an unused import-avoidance.
+  void AnnotationRepo;
   const runs = new SyncRunsRepo(deps.db);
   const discovered = new DiscoveredTagTypesRepo(deps.db);
 
@@ -218,85 +262,90 @@ async function syncEnhancedTags(deps: SyncDeps, options: SyncOptions): Promise<C
     >("SELECT MAX(start_day) AS day FROM annotations WHERE source = 'oura'")
     .get();
   const window = computeWindow(options, maxRow?.day ?? null);
-  const runId = runs.start('enhanced_tag', window.from_date, window.to_date);
+  const chunks = chunkRange(window.from_date, window.to_date);
 
-  try {
-    const r = await deps.client.getCollection<OuraEnhancedTagRow>(ENDPOINTS.enhancedTag, {
-      start_date: window.from_date,
-      end_date: window.to_date,
-    });
+  const upd = deps.db.prepare(
+    `UPDATE annotations
+        SET tag_type_code = @tag_type_code,
+            custom_name   = @custom_name,
+            start_time    = @start_time,
+            end_time      = @end_time,
+            start_day     = @start_day,
+            end_day       = @end_day,
+            comment       = @comment,
+            updated_at    = @now
+      WHERE oura_id = @oura_id`,
+  );
+  const ins = deps.db.prepare(
+    `INSERT INTO annotations
+       (tag_type_code, custom_name, start_time, end_time, start_day, end_day,
+        comment, source, oura_id, created_at, updated_at)
+     VALUES
+       (@tag_type_code, @custom_name, @start_time, @end_time, @start_day, @end_day,
+        @comment, 'oura', @oura_id, @now, @now)`,
+  );
 
-    // Track every tag_type_code we see (including null/'custom') so the
-    // discovered_tag_types table reflects reality. Skip null because it's not
-    // a code; skip 'custom' because it's already a special-case literal.
-    const codes = r.data
-      .map((row) => row.tag_type_code)
-      .filter((c): c is string => typeof c === 'string' && c !== 'custom');
-    const newly = discovered.observeMany(codes);
+  let totalUpserted = 0;
+  const allNewCodes = new Set<string>();
 
-    // Upsert each Oura tag into the annotations table with source='oura'.
-    let upserted = 0;
-    const tx = deps.db.transaction((rows: OuraEnhancedTagRow[]) => {
-      const upd = deps.db.prepare(
-        `UPDATE annotations
-            SET tag_type_code = @tag_type_code,
-                custom_name   = @custom_name,
-                start_time    = @start_time,
-                end_time      = @end_time,
-                start_day     = @start_day,
-                end_day       = @end_day,
-                comment       = @comment,
-                updated_at    = @now
-          WHERE oura_id = @oura_id`,
-      );
-      const ins = deps.db.prepare(
-        `INSERT INTO annotations
-           (tag_type_code, custom_name, start_time, end_time, start_day, end_day,
-            comment, source, oura_id, created_at, updated_at)
-         VALUES
-           (@tag_type_code, @custom_name, @start_time, @end_time, @start_day, @end_day,
-            @comment, 'oura', @oura_id, @now, @now)`,
-      );
-      const now = new Date().toISOString();
-      for (const row of rows) {
-        if (!row.id || !row.start_time || !row.start_day) continue;
-        const params = {
-          tag_type_code: row.tag_type_code ?? null,
-          custom_name: row.custom_name ?? null,
-          start_time: row.start_time,
-          end_time: row.end_time ?? null,
-          start_day: row.start_day,
-          end_day: row.end_day ?? null,
-          comment: row.comment ?? null,
-          oura_id: row.id,
-          now,
-        };
-        const info = upd.run(params);
-        if (info.changes === 0) ins.run(params);
-        upserted += 1;
-      }
-    });
-    tx(r.data);
+  for (const chunk of chunks) {
+    const runId = runs.start('enhanced_tag', chunk.from_date, chunk.to_date);
+    try {
+      const r = await deps.client.getCollection<OuraEnhancedTagRow>(ENDPOINTS.enhancedTag, {
+        start_date: chunk.from_date,
+        end_date: chunk.to_date,
+      });
 
-    runs.finishOk(runId, upserted);
-    return {
-      collection: 'enhanced_tag',
-      ok: true,
-      rows_upserted: upserted,
-      newly_discovered_tag_codes: newly,
-      ...window,
-    };
-  } catch (err) {
-    const msg = (err as Error).message;
-    runs.finishError(runId, msg);
-    return {
-      collection: 'enhanced_tag',
-      ok: false,
-      rows_upserted: 0,
-      error: msg,
-      ...window,
-    };
+      const codes = r.data
+        .map((row) => row.tag_type_code)
+        .filter((c): c is string => typeof c === 'string' && c !== 'custom');
+      const newly = discovered.observeMany(codes);
+      for (const c of newly) allNewCodes.add(c);
+
+      let chunkUpserted = 0;
+      const tx = deps.db.transaction((rows: OuraEnhancedTagRow[]) => {
+        const now = new Date().toISOString();
+        for (const row of rows) {
+          if (!row.id || !row.start_time || !row.start_day) continue;
+          const params = {
+            tag_type_code: row.tag_type_code ?? null,
+            custom_name: row.custom_name ?? null,
+            start_time: row.start_time,
+            end_time: row.end_time ?? null,
+            start_day: row.start_day,
+            end_day: row.end_day ?? null,
+            comment: row.comment ?? null,
+            oura_id: row.id,
+            now,
+          };
+          const info = upd.run(params);
+          if (info.changes === 0) ins.run(params);
+          chunkUpserted += 1;
+        }
+      });
+      tx(r.data);
+      totalUpserted += chunkUpserted;
+      runs.finishOk(runId, chunkUpserted);
+    } catch (err) {
+      const msg = (err as Error).message;
+      runs.finishError(runId, msg);
+      return {
+        collection: 'enhanced_tag',
+        ok: false,
+        rows_upserted: totalUpserted,
+        error: msg,
+        ...window,
+      };
+    }
   }
+
+  return {
+    collection: 'enhanced_tag',
+    ok: true,
+    rows_upserted: totalUpserted,
+    newly_discovered_tag_codes: [...allNewCodes],
+    ...window,
+  };
 }
 
 export async function runSync(deps: SyncDeps, options: SyncOptions = {}): Promise<SyncResult> {

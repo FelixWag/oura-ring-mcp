@@ -14,7 +14,7 @@
 
 import { ConfigError, loadConfig } from '../src/config.js';
 import { openDatabase } from '../src/db/index.js';
-import { runSync, type SyncOptions } from '../src/db/sync.js';
+import { MAX_LOOKBACK_DAYS, runSync, type SyncOptions } from '../src/db/sync.js';
 import { OuraClient } from '../src/oura/client.js';
 
 interface CliArgs {
@@ -22,6 +22,17 @@ interface CliArgs {
   full: boolean;
   tags_only: boolean;
   help: boolean;
+}
+
+function validateSince(n: number): void {
+  if (!Number.isFinite(n) || n < 1) {
+    throw new Error('--since requires a positive number of days, e.g. --since 14');
+  }
+  if (n > MAX_LOOKBACK_DAYS) {
+    throw new Error(
+      `--since must be ≤ ${MAX_LOOKBACK_DAYS} days. Larger backfills aren't supported.`,
+    );
+  }
 }
 
 function parseArgs(argv: string[]): CliArgs {
@@ -33,16 +44,12 @@ function parseArgs(argv: string[]): CliArgs {
     else if (a === '-h' || a === '--help') out.help = true;
     else if (a === '--since') {
       const n = Number(argv[i + 1]);
-      if (!Number.isFinite(n) || n < 1) {
-        throw new Error('--since requires a positive number of days, e.g. --since 14');
-      }
+      validateSince(n);
       out.since = n;
       i += 1;
     } else if (a && a.startsWith('--since=')) {
       const n = Number(a.slice('--since='.length));
-      if (!Number.isFinite(n) || n < 1) {
-        throw new Error('--since requires a positive number of days, e.g. --since=14');
-      }
+      validateSince(n);
       out.since = n;
     } else {
       throw new Error(`Unknown argument: ${a}`);
@@ -57,13 +64,16 @@ oura-ring-mcp sync
 Pulls Oura data into the local SQLite mirror so MCP queries answer locally.
 
 Usage:
-  npm run sync                  # incremental, default (recommended)
-  npm run sync -- --full        # re-fetch the full lookback window
-  npm run sync -- --since 14    # re-fetch the last 14 days
-  npm run sync -- --tags-only   # only enhanced_tag (and discovered codes)
+  npm run sync                   # incremental, default (recommended)
+  npm run sync -- --full         # re-fetch the full lookback window
+  npm run sync -- --since 14     # re-fetch the last 14 days
+  npm run sync -- --since 240    # backfill 8 months (chunked transparently)
+  npm run sync -- --tags-only    # only enhanced_tag (and discovered codes)
 
 Notes:
   - First run pulls ~30 days back. Subsequent runs incremental + 7-day overlap.
+  - --since accepts up to 730 days (~2 years). Requests > 90 days are split into
+    chunked API calls automatically — no special flag required.
   - Heart-rate timeseries is NOT mirrored (use the oura_get_heartrate tool).
 `;
 

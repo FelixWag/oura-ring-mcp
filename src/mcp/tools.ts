@@ -689,9 +689,12 @@ export function registerTools(server: McpServer, opts: RegisterToolsOptions): vo
             .number()
             .int()
             .min(1)
-            .max(90)
+            .max(730)
             .optional()
-            .describe('Force-refetch the last N days regardless of stored state.'),
+            .describe(
+              'Force-refetch the last N days regardless of stored state. ' +
+                'Accepts up to 730 (≈2 years). Requests > 90 days are chunked transparently.',
+            ),
           full: z
             .boolean()
             .optional()

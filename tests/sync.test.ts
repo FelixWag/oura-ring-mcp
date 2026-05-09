@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { openDatabase } from '../src/db/index.js';
 import { DailyCollectionRepo } from '../src/db/repos/daily.js';
-import { computeWindow, runSync } from '../src/db/sync.js';
+import { chunkRange, computeWindow, runSync } from '../src/db/sync.js';
 
 describe('computeWindow', () => {
   const today = '2026-05-09';
@@ -29,12 +29,58 @@ describe('computeWindow', () => {
     expect(w.from_date).toBe('2026-04-09');
   });
 
-  it('caps the window to MAX_RANGE_DAYS (90)', () => {
-    const w = computeWindow({ todayUtc: today, since_days: 365, firstRunLookbackDays: 365 }, null);
+  it('returns a window larger than 90 days when since_days is large (chunking is the caller’s job)', () => {
+    const w = computeWindow({ todayUtc: today, since_days: 240 }, null);
     const days =
       (Date.parse(w.to_date + 'T00:00:00Z') - Date.parse(w.from_date + 'T00:00:00Z')) /
       (24 * 60 * 60 * 1000);
-    expect(days).toBeLessThanOrEqual(90);
+    expect(days).toBe(240);
+  });
+
+  it('clamps since_days at the MAX_LOOKBACK_DAYS sanity ceiling', () => {
+    const w = computeWindow({ todayUtc: today, since_days: 99_999 }, null);
+    const days =
+      (Date.parse(w.to_date + 'T00:00:00Z') - Date.parse(w.from_date + 'T00:00:00Z')) /
+      (24 * 60 * 60 * 1000);
+    expect(days).toBeLessThanOrEqual(730);
+  });
+});
+
+describe('chunkRange', () => {
+  it('returns a single chunk for windows ≤ 90 days', () => {
+    const chunks = chunkRange('2026-04-01', '2026-05-09');
+    expect(chunks).toEqual([{ from_date: '2026-04-01', to_date: '2026-05-09' }]);
+  });
+
+  it('walks backwards in 90-day chunks for larger windows', () => {
+    const chunks = chunkRange('2026-01-01', '2026-05-09');
+    // 129-day span → 90-day chunk + 39-day chunk
+    expect(chunks).toHaveLength(2);
+    // Chunks are returned oldest-first.
+    expect(chunks[0]!.from_date).toBe('2026-01-01');
+    expect(chunks[1]!.to_date).toBe('2026-05-09');
+    // Chunks are contiguous (next chunk's start = previous chunk's end + 1 day).
+    const lastEnd = chunks[0]!.to_date;
+    const nextStart = chunks[1]!.from_date;
+    const tEnd = Date.parse(lastEnd + 'T00:00:00Z');
+    const tNext = Date.parse(nextStart + 'T00:00:00Z');
+    expect((tNext - tEnd) / (24 * 60 * 60 * 1000)).toBe(1);
+  });
+
+  it('every chunk is at most 90 days', () => {
+    const chunks = chunkRange('2024-01-01', '2026-05-09');
+    for (const c of chunks) {
+      const tStart = Date.parse(c.from_date + 'T00:00:00Z');
+      const tEnd = Date.parse(c.to_date + 'T00:00:00Z');
+      const days = (tEnd - tStart) / (24 * 60 * 60 * 1000);
+      expect(days).toBeLessThanOrEqual(89); // inclusive 90 days = end - start = 89 days
+    }
+  });
+
+  it('chunks together cover the full requested range', () => {
+    const chunks = chunkRange('2025-01-01', '2026-05-09');
+    expect(chunks[0]!.from_date).toBe('2025-01-01');
+    expect(chunks[chunks.length - 1]!.to_date).toBe('2026-05-09');
   });
 });
 
@@ -163,5 +209,45 @@ describe('runSync orchestrator', () => {
     expect(result.collections).toHaveLength(1);
     expect(result.collections[0]!.collection).toBe('enhanced_tag');
     expect(calls.map((c) => c.path)).toEqual(['/usercollection/enhanced_tag']);
+  });
+
+  it('chunks long since_days requests into multiple ≤90-day API calls per collection', async () => {
+    const db = await openDatabase(':memory:');
+    const fakeData = {
+      '/usercollection/daily_sleep': [],
+      '/usercollection/daily_readiness': [],
+      '/usercollection/daily_activity': [],
+      '/usercollection/daily_spo2': [],
+      '/usercollection/sleep': [],
+      '/usercollection/workout': [],
+      '/usercollection/session': [],
+      '/usercollection/enhanced_tag': [],
+    };
+    const { client, calls } = makeFakeClient(fakeData);
+
+    // 240 days back → expect 3 chunks per collection (90 + 90 + 60).
+    await runSync(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      { client: client as any, db },
+      { since_days: 240, todayUtc: '2026-05-09' },
+    );
+
+    // 8 collections × 3 chunks = 24 API calls.
+    expect(calls).toHaveLength(24);
+
+    // Each collection saw exactly 3 chunks, contiguous, covering the full window.
+    const byPath = new Map<string, typeof calls>();
+    for (const c of calls) {
+      const list = byPath.get(c.path) ?? [];
+      list.push(c);
+      byPath.set(c.path, list);
+    }
+    for (const [, list] of byPath) {
+      expect(list).toHaveLength(3);
+      // Last chunk must end at today.
+      expect((list[list.length - 1]!.query as { end_date: string }).end_date).toBe('2026-05-09');
+      // First chunk must start at today - 240.
+      expect((list[0]!.query as { start_date: string }).start_date).toBe('2025-09-11');
+    }
   });
 });

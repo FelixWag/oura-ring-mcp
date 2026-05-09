@@ -134,9 +134,20 @@ Pass `include_annotations: false` to skip the join.
 
 ### Local mirror (v0.4)
 
-| Tool        | Inputs                                      | Notes                                                                                   |
-| ----------- | ------------------------------------------- | --------------------------------------------------------------------------------------- |
-| `oura_sync` | `since_days?` (1–90), `full?`, `tags_only?` | Pull recent Oura data into local SQLite. Default: incremental + 7-day re-fetch overlap. |
+| Tool        | Inputs                                       | Notes                                                                                                           |
+| ----------- | -------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `oura_sync` | `since_days?` (1–730), `full?`, `tags_only?` | Pull recent Oura data into local SQLite. Default: incremental + 7-day re-fetch overlap. Chunked > 90-day spans. |
+
+For a one-time historical backfill (e.g. you've had the ring for 6 months
+and want everything local), pass a larger `since_days` and the sync will
+split it into ≤90-day API requests transparently:
+
+```bash
+npm run sync -- --since 240   # ~8 months
+```
+
+The cap is 730 days (≈2 years). Future incremental runs fall back to the
+default 7-day overlap on top of what's already mirrored.
 
 `oura_get_daily_summary` and `oura_get_recent_summary` gained a new `prefer`
 parameter:
