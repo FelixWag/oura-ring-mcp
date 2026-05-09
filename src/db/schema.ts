@@ -201,6 +201,91 @@ const MIGRATIONS: readonly Migration[] = [
       CREATE INDEX IF NOT EXISTS idx_sync_runs_collection ON sync_runs(collection, started_at DESC);
     `,
   },
+  {
+    version: 4,
+    // v0.4.2: cover the remaining daily collections + rest_mode_period.
+    //
+    // Schema-design note (see DECISIONS.md, "JSON-first storage for daily
+    // collections without a numeric score"):
+    //   - daily_sleep / daily_readiness / daily_activity / daily_spo2 each
+    //     surface a numeric `score` field. We mirror that into the indexed
+    //     `score INTEGER` column for fast WHERE / ORDER BY.
+    //   - daily_stress has no `score` field (returns recovery_high /
+    //     stress_high separately).
+    //   - daily_resilience has a `level` STRING (ok / good / great / …),
+    //     not an integer score.
+    //   - daily_cardiovascular_age, vo2_max have numeric values under
+    //     different field names (`vascular_age`, `vo2_max`) that we copy
+    //     into the indexed `score` column.
+    //   - sleep_time has no score at all — it's bedtime recommendations.
+    //
+    //   Convention: the `data` JSON column is the lossless source of
+    //   truth. The `score` column is a fast-lookup convenience that's
+    //   NULL for tables without a single canonical scalar score. Code
+    //   that needs the resilience level or stress sub-fields uses
+    //   `extractField()` / `extractFieldRange()` on the repo, which
+    //   wrap SQLite's `json_extract`. See DailyCollectionRepo.
+    name: 'v0.4.2: daily_stress / daily_resilience / daily_cardiovascular_age / vo2_max / sleep_time + rest_mode_periods',
+    sql: `
+      CREATE TABLE IF NOT EXISTS daily_stress (
+        day             TEXT PRIMARY KEY,
+        score           INTEGER,           -- NULL: stress has no aggregate score; see data.day_summary etc.
+        data            TEXT NOT NULL,
+        first_seen_at   TEXT NOT NULL,
+        last_synced_at  TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_daily_stress_synced ON daily_stress(last_synced_at);
+
+      CREATE TABLE IF NOT EXISTS daily_resilience (
+        day             TEXT PRIMARY KEY,
+        score           INTEGER,           -- NULL: resilience uses a STRING level (ok / good / great / exceptional); see data.level
+        data            TEXT NOT NULL,
+        first_seen_at   TEXT NOT NULL,
+        last_synced_at  TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_daily_resilience_synced ON daily_resilience(last_synced_at);
+
+      CREATE TABLE IF NOT EXISTS daily_cardiovascular_age (
+        day             TEXT PRIMARY KEY,
+        score           INTEGER,           -- vascular_age (years), copied from data
+        data            TEXT NOT NULL,
+        first_seen_at   TEXT NOT NULL,
+        last_synced_at  TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_daily_cv_age_synced ON daily_cardiovascular_age(last_synced_at);
+
+      CREATE TABLE IF NOT EXISTS vo2_max (
+        day             TEXT PRIMARY KEY,
+        score           INTEGER,           -- vo2_max value (rounded to int for the index; full float in data)
+        data            TEXT NOT NULL,
+        first_seen_at   TEXT NOT NULL,
+        last_synced_at  TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_vo2_max_synced ON vo2_max(last_synced_at);
+
+      CREATE TABLE IF NOT EXISTS sleep_time (
+        day             TEXT PRIMARY KEY,
+        score           INTEGER,           -- NULL: sleep_time is bedtime recommendations, no score
+        data            TEXT NOT NULL,
+        first_seen_at   TEXT NOT NULL,
+        last_synced_at  TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_sleep_time_synced ON sleep_time(last_synced_at);
+
+      -- rest_mode_period: time spans where the ring was in "rest mode"
+      -- (typically logged manually around illness/recovery). Multiple
+      -- episodes may be nested inside the data column.
+      CREATE TABLE IF NOT EXISTS rest_mode_periods (
+        oura_id         TEXT PRIMARY KEY,
+        day             TEXT NOT NULL,    -- start_day, indexed for date-range queries
+        data            TEXT NOT NULL,
+        first_seen_at   TEXT NOT NULL,
+        last_synced_at  TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_rest_mode_day    ON rest_mode_periods(day);
+      CREATE INDEX IF NOT EXISTS idx_rest_mode_synced ON rest_mode_periods(last_synced_at);
+    `,
+  },
 ];
 
 export function currentSchemaVersion(db: Database): number {

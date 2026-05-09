@@ -11,9 +11,15 @@ export type SyncCollection =
   | 'daily_readiness'
   | 'daily_activity'
   | 'daily_spo2'
+  | 'daily_stress'
+  | 'daily_resilience'
+  | 'daily_cardiovascular_age'
+  | 'vo2_max'
+  | 'sleep_time'
   | 'sleep_periods'
   | 'workouts'
   | 'sessions'
+  | 'rest_mode_periods'
   | 'enhanced_tag';
 
 export interface SyncRun {

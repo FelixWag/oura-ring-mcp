@@ -134,9 +134,9 @@ Pass `include_annotations: false` to skip the join.
 
 ### Local mirror (v0.4)
 
-| Tool        | Inputs                                       | Notes                                                                                                           |
-| ----------- | -------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
-| `oura_sync` | `since_days?` (1–730), `full?`, `tags_only?` | Pull recent Oura data into local SQLite. Default: incremental + 7-day re-fetch overlap. Chunked > 90-day spans. |
+| Tool        | Inputs                                       | Notes                                                                                                                                                                                                                                                                                                            |
+| ----------- | -------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `oura_sync` | `since_days?` (1–730), `full?`, `tags_only?` | Pull recent Oura data into local SQLite. Mirrors **14 collections** (sleep, readiness, activity, spo2, stress, resilience, cardiovascular_age, vo2_max, sleep_time, sleep_periods, workouts, sessions, rest_mode_periods, enhanced_tags). Default: incremental + 7-day re-fetch overlap. Chunked > 90-day spans. |
 
 For a one-time historical backfill (e.g. you've had the ring for 6 months
 and want everything local), pass a larger `since_days` and the sync will
@@ -148,6 +148,39 @@ npm run sync -- --since 240   # ~8 months
 
 The cap is 730 days (≈2 years). Future incremental runs fall back to the
 default 7-day overlap on top of what's already mirrored.
+
+#### Querying mirrored data directly
+
+Most consumers should use the MCP tools, but if you want to pull data
+straight from the SQLite file (e.g. for ad-hoc analysis in a notebook),
+the schema is documented in `src/db/schema.ts` and uses a hybrid shape:
+
+- Each daily/event table has indexed key columns (`day` / `oura_id`,
+  `score`, `last_synced_at`, `first_seen_at`) plus a raw `data` JSON
+  column holding the entire Oura payload verbatim.
+- For tables without a single numeric score (`daily_stress`,
+  `daily_resilience`, `sleep_time`), `score` is NULL — the relevant
+  fields live inside `data`. Use SQLite's `json_extract` or the
+  `DailyCollectionRepo.extractField()` / `extractFieldRange()` helpers:
+
+```ts
+import { openDatabase } from 'oura-ring-mcp/db';
+import { DailyCollectionRepo } from 'oura-ring-mcp/db/repos/daily';
+
+const db = await openDatabase('~/.config/oura-ring-mcp/data.sqlite');
+const resilience = new DailyCollectionRepo(db, 'daily_resilience');
+
+// Single day:
+resilience.extractField<string>('2026-05-09', '$.level');
+// → 'good'
+
+// Range:
+resilience.extractFieldRange<string>('2026-05-01', '2026-05-09', '$.level');
+// → [{ day: '2026-05-01', value: 'great' }, { day: '2026-05-02', value: 'good' }, …]
+```
+
+The same helpers work for any nested JSON path — e.g. `daily_stress` →
+`'$.recovery_high'`, or contributors with `'$.contributors.sleep_balance'`.
 
 `oura_get_daily_summary` and `oura_get_recent_summary` gained a new `prefer`
 parameter:
@@ -302,8 +335,15 @@ stderr; tokens are never logged.
 - ✅ **v0.4** — local sync of Oura data into SQLite (idempotent on
   `(collection, day)` with `last_synced_at`), local-first reads in summary
   tools, self-correcting `tag_type_code` list via `discovered_tag_types`.
-  Heart-rate timeseries intentionally not mirrored.
-- **v0.5** — exports, weekly/monthly reports, possibly a heartrate option.
+- ✅ **v0.4.1** — chunked historical backfill up to 730 days; transparent
+  90-day-window pagination.
+- ✅ **v0.4.2** — covers the remaining daily collections (`daily_stress`,
+  `daily_resilience`, `daily_cardiovascular_age`, `vo2_max`, `sleep_time`)
+  and `rest_mode_periods`. Adds `extractField` / `extractFieldRange`
+  helpers for JSON-stored fields (resilience level, stress sub-scores).
+- **v0.4.3** — heart-rate timeseries mirror (with optional
+  `interbeat_interval`); local-first `oura_get_heartrate`.
+- **v0.5** — exports, weekly/monthly reports.
 
 ## License
 
