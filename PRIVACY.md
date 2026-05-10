@@ -45,4 +45,4 @@ None by us. The software:
 ## Contact
 
 This is a personal hobby project. Report issues at
-<https://github.com/<your-username>/oura-ring-mcp/issues>.
+<https://github.com/FelixWag/oura-ring-mcp/issues>.
