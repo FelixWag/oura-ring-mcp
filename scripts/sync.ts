@@ -22,6 +22,7 @@ interface CliArgs {
   since?: number;
   full: boolean;
   tags_only: boolean;
+  no_heartrate: boolean;
   help: boolean;
 }
 
@@ -37,11 +38,12 @@ function validateSince(n: number): void {
 }
 
 function parseArgs(argv: string[]): CliArgs {
-  const out: CliArgs = { full: false, tags_only: false, help: false };
+  const out: CliArgs = { full: false, tags_only: false, no_heartrate: false, help: false };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
     if (a === '--full') out.full = true;
     else if (a === '--tags-only') out.tags_only = true;
+    else if (a === '--no-heartrate') out.no_heartrate = true;
     else if (a === '-h' || a === '--help') out.help = true;
     else if (a === '--since') {
       const n = Number(argv[i + 1]);
@@ -65,17 +67,19 @@ oura-ring-mcp sync
 Pulls Oura data into the local SQLite mirror so MCP queries answer locally.
 
 Usage:
-  npm run sync                   # incremental, default (recommended)
-  npm run sync -- --full         # re-fetch the full lookback window
-  npm run sync -- --since 14     # re-fetch the last 14 days
-  npm run sync -- --since 240    # backfill 8 months (chunked transparently)
-  npm run sync -- --tags-only    # only enhanced_tag (and discovered codes)
+  npm run sync                    # incremental, default (recommended)
+  npm run sync -- --full          # re-fetch the full lookback window
+  npm run sync -- --since 14      # re-fetch the last 14 days
+  npm run sync -- --since 240     # backfill 8 months (chunked transparently)
+  npm run sync -- --tags-only     # only enhanced_tag (and discovered codes)
+  npm run sync -- --no-heartrate  # skip heartrate timeseries (faster, smaller)
 
 Notes:
   - First run pulls ~30 days back. Subsequent runs incremental + 7-day overlap.
   - --since accepts up to 730 days (~2 years). Requests > 90 days are split into
     chunked API calls automatically — no special flag required.
-  - Heart-rate timeseries is NOT mirrored (use the oura_get_heartrate tool).
+  - Heart-rate timeseries IS mirrored by default (v0.4.4+). Pass --no-heartrate
+    to skip; useful for fast incremental syncs that only refresh daily scores.
 `;
 
 function fmtDuration(ms: number): string {
@@ -118,6 +122,7 @@ async function main(): Promise<void> {
 
   const options: SyncOptions = {
     since_days: cli.since,
+    no_heartrate: cli.no_heartrate,
     full: cli.full,
     tags_only: cli.tags_only,
   };

@@ -2,6 +2,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import type { AnnotationRepo } from '../db/annotations.js';
 import type { DailyCollectionRepo } from '../db/repos/daily.js';
+import type { HeartrateRepo } from '../db/repos/heartrate.js';
 import type { SyncOptions, SyncResult } from '../db/sync.js';
 import type { OuraClient } from '../oura/client.js';
 import { registerTools } from './tools.js';
@@ -14,13 +15,14 @@ export interface CreateServerOptions {
     readiness: DailyCollectionRepo;
     activity: DailyCollectionRepo;
   };
+  heartrate?: HeartrateRepo;
   sync?: (options: SyncOptions) => Promise<SyncResult>;
 }
 
 export function createServer(opts: CreateServerOptions): McpServer {
   const server = new McpServer({
     name: 'oura-ring-mcp',
-    version: '0.4.3',
+    version: '0.4.4',
   });
   registerTools(server, opts);
   return server;

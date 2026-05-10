@@ -286,6 +286,35 @@ const MIGRATIONS: readonly Migration[] = [
       CREATE INDEX IF NOT EXISTS idx_rest_mode_synced ON rest_mode_periods(last_synced_at);
     `,
   },
+  {
+    version: 5,
+    // v0.4.4: high-resolution heart-rate timeseries.
+    //
+    // Unlike daily collections, heartrate is keyed on (timestamp, source)
+    // because Oura occasionally emits the same instant under two sources
+    // during state transitions (sleep onset bridges 'rest' and 'sleep').
+    // Without the composite key we'd lose rows on upsert.
+    //
+    // Volume: tens of thousands of rows per ~6 months of ring data, but
+    // SQLite handles this trivially. The `data` JSON column is preserved
+    // for losslessness even though every Oura field today is captured by
+    // (timestamp, bpm, source); future fields land there automatically
+    // without a schema change.
+    name: 'v0.4.4: heartrate timeseries',
+    sql: `
+      CREATE TABLE IF NOT EXISTS heartrate (
+        timestamp       TEXT NOT NULL,
+        source          TEXT NOT NULL,
+        bpm             INTEGER NOT NULL,
+        data            TEXT NOT NULL,
+        first_seen_at   TEXT NOT NULL,
+        last_synced_at  TEXT NOT NULL,
+        PRIMARY KEY (timestamp, source)
+      );
+      CREATE INDEX IF NOT EXISTS idx_heartrate_timestamp ON heartrate(timestamp);
+      CREATE INDEX IF NOT EXISTS idx_heartrate_synced    ON heartrate(last_synced_at);
+    `,
+  },
 ];
 
 export function currentSchemaVersion(db: Database): number {

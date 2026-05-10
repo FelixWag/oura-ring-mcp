@@ -123,6 +123,9 @@ describe('runSync orchestrator', () => {
       '/usercollection/workout': [],
       '/usercollection/session': [],
       '/usercollection/rest_mode_period': [],
+      '/usercollection/heartrate': [
+        { timestamp: '2026-05-08T08:00:00+00:00', source: 'awake', bpm: 72 },
+      ],
       '/usercollection/enhanced_tag': [
         {
           id: 'oura_xyz',
@@ -141,8 +144,8 @@ describe('runSync orchestrator', () => {
       { todayUtc: '2026-05-09' },
     );
 
-    // 14 collections — 9 daily, 4 events, 1 enhanced_tag.
-    expect(result.collections).toHaveLength(14);
+    // 15 collections — 9 daily, 4 events, 1 enhanced_tag, 1 heartrate.
+    expect(result.collections).toHaveLength(15);
     expect(result.collections.every((c) => c.ok)).toBe(true);
 
     // Daily sleep got upserted.
@@ -166,7 +169,7 @@ describe('runSync orchestrator', () => {
 
     // sync_runs has rows for every collection.
     const runs = db.prepare('SELECT collection, ok FROM sync_runs').all();
-    expect(runs).toHaveLength(14);
+    expect(runs).toHaveLength(15);
   });
 
   it('re-syncing the same day is idempotent: row count unchanged, last_synced_at advances', async () => {
@@ -237,6 +240,7 @@ describe('runSync orchestrator', () => {
       '/usercollection/workout': [],
       '/usercollection/session': [],
       '/usercollection/rest_mode_period': [],
+      '/usercollection/heartrate': [],
       '/usercollection/enhanced_tag': [],
     };
     const { client, calls } = makeFakeClient(fakeData);
@@ -248,8 +252,8 @@ describe('runSync orchestrator', () => {
       { since_days: 240, todayUtc: '2026-05-09' },
     );
 
-    // 14 collections × 3 chunks = 42 API calls.
-    expect(calls).toHaveLength(42);
+    // 15 collections × 3 chunks = 45 API calls.
+    expect(calls).toHaveLength(45);
 
     // Each collection saw exactly 3 chunks, contiguous, covering the full window.
     const byPath = new Map<string, typeof calls>();
@@ -258,12 +262,17 @@ describe('runSync orchestrator', () => {
       list.push(c);
       byPath.set(c.path, list);
     }
-    for (const [, list] of byPath) {
+    for (const [path, list] of byPath) {
       expect(list).toHaveLength(3);
-      // Last chunk must end at today.
-      expect((list[list.length - 1]!.query as { end_date: string }).end_date).toBe('2026-05-09');
-      // First chunk must start at today - 240.
-      expect((list[0]!.query as { start_date: string }).start_date).toBe('2025-09-11');
+      // heartrate uses datetime params; everything else uses date params.
+      const isHeartrate = path === '/usercollection/heartrate';
+      const startKey = isHeartrate ? 'start_datetime' : 'start_date';
+      const endKey = isHeartrate ? 'end_datetime' : 'end_date';
+      const expectedStart = isHeartrate ? '2025-09-11T00:00:00Z' : '2025-09-11';
+      const expectedEnd = isHeartrate ? '2026-05-09T23:59:59Z' : '2026-05-09';
+
+      expect((list[list.length - 1]!.query as Record<string, string>)[endKey]).toBe(expectedEnd);
+      expect((list[0]!.query as Record<string, string>)[startKey]).toBe(expectedStart);
     }
   });
 });

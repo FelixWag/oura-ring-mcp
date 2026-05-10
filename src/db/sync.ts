@@ -22,6 +22,7 @@ import type { Db } from './index.js';
 import { DailyCollectionRepo, type DailyTable } from './repos/daily.js';
 import { DiscoveredTagTypesRepo } from './repos/discovered_tag_types.js';
 import { EventCollectionRepo, type EventTable } from './repos/events.js';
+import { HeartrateRepo } from './repos/heartrate.js';
 import { SyncRunsRepo, type SyncCollection } from './repos/sync_runs.js';
 
 export const RECENT_REFETCH_DAYS_DEFAULT = 7;
@@ -45,6 +46,12 @@ export interface SyncOptions {
   full?: boolean;
   /** Only sync the `enhanced_tag` collection and refresh discovered tag codes. */
   tags_only?: boolean;
+  /**
+   * Skip the heartrate timeseries sync. Heartrate is included by default
+   * (a few extra seconds and ~5–10 MB of storage on a 6-month backfill);
+   * set this to true to skip it for a faster sync.
+   */
+  no_heartrate?: boolean;
   /** Override the default 7-day window applied to incremental syncs. */
   recentRefetchDays?: number;
   /** Override the default 30-day lookback used on a first run with no local data. */
@@ -52,6 +59,14 @@ export interface SyncOptions {
   /** Override `today` for testability. */
   todayUtc?: string;
 }
+
+/**
+ * Pages-per-API-call cap for high-volume timeseries (heartrate, future IBI).
+ * The per-call default of 5 is fine for daily/event collections (which fit
+ * trivially) but heartrate's 90-day window can return thousands of samples
+ * across many pages. 100 is generous; realistic max is ~20.
+ */
+const TIMESERIES_PAGE_LIMIT = 100;
 
 export interface CollectionResult {
   collection: SyncCollection;
@@ -366,6 +381,53 @@ async function syncEnhancedTags(deps: SyncDeps, options: SyncOptions): Promise<C
   };
 }
 
+/**
+ * Sync the heartrate timeseries.
+ *
+ * Differences from the daily/event syncs:
+ *   - Uses `start_datetime` / `end_datetime` query params (not date).
+ *     Each chunk's date window is expanded to its datetime equivalent
+ *     (T00:00:00Z → T23:59:59Z).
+ *   - Passes a much higher pageLimit (TIMESERIES_PAGE_LIMIT = 100) since
+ *     a single 90-day window can span many pages.
+ *   - Repos.maxTimestamp() is a datetime, not a date — we still use
+ *     computeWindow() to get a daily window, then convert.
+ */
+async function syncHeartrate(deps: SyncDeps, options: SyncOptions): Promise<CollectionResult> {
+  const repo = new HeartrateRepo(deps.db);
+  const runs = new SyncRunsRepo(deps.db);
+
+  // Convert maxTimestamp (datetime) to its day component for window calculation.
+  const maxTs = repo.maxTimestamp();
+  const maxDay = maxTs ? maxTs.slice(0, 10) : null;
+  const window = computeWindow(options, maxDay);
+  const chunks = chunkRange(window.from_date, window.to_date);
+
+  let total = 0;
+  for (const chunk of chunks) {
+    const runId = runs.start('heartrate', chunk.from_date, chunk.to_date);
+    try {
+      const r = await deps.client.getCollection<unknown>(
+        ENDPOINTS.heartrate,
+        {
+          start_datetime: `${chunk.from_date}T00:00:00Z`,
+          end_datetime: `${chunk.to_date}T23:59:59Z`,
+        },
+        TIMESERIES_PAGE_LIMIT,
+      );
+      const result = repo.upsertMany(r.data);
+      const chunkTotal = result.inserted + result.updated;
+      total += chunkTotal;
+      runs.finishOk(runId, chunkTotal);
+    } catch (err) {
+      const msg = (err as Error).message;
+      runs.finishError(runId, msg);
+      return { collection: 'heartrate', ok: false, rows_upserted: total, error: msg, ...window };
+    }
+  }
+  return { collection: 'heartrate', ok: true, rows_upserted: total, ...window };
+}
+
 export async function runSync(deps: SyncDeps, options: SyncOptions = {}): Promise<SyncResult> {
   const ran_at = new Date().toISOString();
 
@@ -382,7 +444,17 @@ export async function runSync(deps: SyncDeps, options: SyncOptions = {}): Promis
     syncEvents(deps, options, p.collection, p.table, p.path),
   );
   const tagPromise = syncEnhancedTags(deps, options);
+  const heartratePromise = options.no_heartrate
+    ? Promise.resolve(null)
+    : syncHeartrate(deps, options);
 
-  const collections = await Promise.all([...dailyPromises, ...eventPromises, tagPromise]);
+  const results = await Promise.all([
+    ...dailyPromises,
+    ...eventPromises,
+    tagPromise,
+    heartratePromise,
+  ]);
+  // Drop the placeholder if heartrate was skipped.
+  const collections = results.filter((r): r is CollectionResult => r !== null);
   return { ran_at, collections };
 }

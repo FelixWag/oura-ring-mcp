@@ -429,3 +429,57 @@ Re-authorizing once is a tolerable upgrade cost given how rarely it
 happens. The improved error hint costs ~10 lines but turns a confusing
 error into a self-explanatory one — exactly the kind of UX polish that
 matters for a public repo.
+
+---
+
+## 2026-05-10 — v0.4.4: heart-rate mirror with hourly aggregation
+
+**Context.** Heart-rate was the last meaningful data gap. v0.4 deliberately
+deferred it because of volume concerns; with v0.4.1's chunking and
+better-sqlite3's actual performance, those concerns turned out to be
+overstated — ~50–100k rows per ~6 months of data is trivial for SQLite.
+Adding heartrate completes the local-mirror story before publishing the
+project on GitHub.
+
+**Decision.** Ship v0.4.4 with the following choices:
+
+1. **Schema (migration v5)** — single `heartrate` table with composite
+   primary key `(timestamp, source)`. The composite key is required:
+   Oura emits the same instant under two sources during state
+   transitions (e.g. sleep onset bridges 'rest' and 'sleep'); a single
+   `timestamp` PK would silently drop one row.
+
+2. **Default-on sync** with a `--no-heartrate` (`with_heartrate: false`)
+   opt-out. Volume is not the issue; UX is. "Run sync, get everything"
+   beats "remember the flag." The opt-out exists for fast incremental
+   refreshes that only touch daily scores.
+
+3. **Datetime chunking** — heartrate uses `start_datetime` /
+   `end_datetime` rather than date params. The orchestrator reuses the
+   existing `chunkRange` helper and converts each daily 90-day chunk
+   into its datetime equivalent (`T00:00:00Z` → `T23:59:59Z`).
+
+4. **Higher page limit** — `getCollection` already accepts a per-call
+   `pageLimit`; heartrate sync passes `100` (vs the daily-collection
+   default of 5). A 90-day heartrate window can span many pages of
+   per-sample data; 5 would silently truncate.
+
+5. **`oura_get_heartrate` becomes local-first + compact-by-default.**
+   Per-hour-by-source aggregation as the default response (one row per
+   `(hour, source)` bucket: avg / min / max / count). Computed at read
+   time via SQLite's `strftime` + `GROUP BY` — storage stays per-sample
+   for future flexibility. `verbose: true` returns raw samples.
+   `prefer: 'auto' | 'local' | 'api'` matches the summary tools.
+
+6. **Aggregation deferred to v0.5+:** per-source-period (option C from
+   the v0.4.4 plan), `interbeat_interval` mirror, daily HR roll-ups.
+
+**Rationale.** Storage stays lossless (raw samples in `data` JSON column
+plus indexed `bpm`/`source`/`timestamp`); aggregations live as SQL
+projections. Future tools layering on top — different aggregations,
+event correlation, exports — don't require re-syncing. Default-on
+heartrate is a defensible UX choice given that the marginal cost is a
+few seconds and a few MB; the opt-out is there for power-users who
+care about that. Per-call `pageLimit` keeps daily collections defensive
+against accidental over-fetch while letting timeseries explicitly
+opt into broader pagination.
