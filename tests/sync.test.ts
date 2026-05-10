@@ -167,9 +167,12 @@ describe('runSync orchestrator', () => {
     expect(ann).toHaveLength(1);
     expect(ann[0]!.oura_id).toBe('oura_xyz');
 
-    // sync_runs has rows for every collection.
+    // sync_runs has rows for every chunk of every collection.
+    // 14 collections each issue 1 chunk for a 30-day first-run window, but
+    // heartrate uses 30-day-max chunks so a 30-day window yields 2 chunks.
+    // Total: 14 + 2 = 16.
     const runs = db.prepare('SELECT collection, ok FROM sync_runs').all();
-    expect(runs).toHaveLength(15);
+    expect(runs).toHaveLength(16);
   });
 
   it('re-syncing the same day is idempotent: row count unchanged, last_synced_at advances', async () => {
@@ -245,17 +248,20 @@ describe('runSync orchestrator', () => {
     };
     const { client, calls } = makeFakeClient(fakeData);
 
-    // 240 days back → expect 3 chunks per collection (90 + 90 + 60).
+    // 240 days back:
+    //   - 14 non-heartrate collections × 3 chunks each (90 + 90 + 60) = 42
+    //   - heartrate uses 30-day-max chunks → 9 chunks
+    //     (240 days produces 8 full 30-day chunks + 1 boundary 1-day chunk
+    //     because chunkRange's invariant is span ≤ maxDays-1 days)
+    // Total: 51.
     await runSync(
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       { client: client as any, db },
       { since_days: 240, todayUtc: '2026-05-09' },
     );
+    expect(calls).toHaveLength(51);
 
-    // 15 collections × 3 chunks = 45 API calls.
-    expect(calls).toHaveLength(45);
-
-    // Each collection saw exactly 3 chunks, contiguous, covering the full window.
+    // Per-collection chunk-count and window-coverage assertions.
     const byPath = new Map<string, typeof calls>();
     for (const c of calls) {
       const list = byPath.get(c.path) ?? [];
@@ -263,9 +269,10 @@ describe('runSync orchestrator', () => {
       byPath.set(c.path, list);
     }
     for (const [path, list] of byPath) {
-      expect(list).toHaveLength(3);
-      // heartrate uses datetime params; everything else uses date params.
       const isHeartrate = path === '/usercollection/heartrate';
+      const expectedChunks = isHeartrate ? 9 : 3;
+      expect(list).toHaveLength(expectedChunks);
+
       const startKey = isHeartrate ? 'start_datetime' : 'start_date';
       const endKey = isHeartrate ? 'end_datetime' : 'end_date';
       const expectedStart = isHeartrate ? '2025-09-11T00:00:00Z' : '2025-09-11';

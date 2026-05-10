@@ -63,10 +63,18 @@ export interface SyncOptions {
 /**
  * Pages-per-API-call cap for high-volume timeseries (heartrate, future IBI).
  * The per-call default of 5 is fine for daily/event collections (which fit
- * trivially) but heartrate's 90-day window can return thousands of samples
+ * trivially) but heartrate's 30-day window can return thousands of samples
  * across many pages. 100 is generous; realistic max is ~20.
  */
 const TIMESERIES_PAGE_LIMIT = 100;
+
+/**
+ * Oura's `/usercollection/heartrate` endpoint enforces a 30-day max per
+ * request — distinct from the 90-day cap on daily collections. Discovered
+ * empirically via a 400 response: "Timerange between start and endtime has
+ * to be less than or equal to 30 days." Chunked accordingly.
+ */
+const HEARTRATE_MAX_RANGE_DAYS = 30;
 
 export interface CollectionResult {
   collection: SyncCollection;
@@ -401,7 +409,8 @@ async function syncHeartrate(deps: SyncDeps, options: SyncOptions): Promise<Coll
   const maxTs = repo.maxTimestamp();
   const maxDay = maxTs ? maxTs.slice(0, 10) : null;
   const window = computeWindow(options, maxDay);
-  const chunks = chunkRange(window.from_date, window.to_date);
+  // Heartrate has a stricter 30-day-per-request cap than daily collections.
+  const chunks = chunkRange(window.from_date, window.to_date, HEARTRATE_MAX_RANGE_DAYS);
 
   let total = 0;
   for (const chunk of chunks) {

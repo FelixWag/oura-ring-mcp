@@ -352,6 +352,9 @@ stderr; tokens are never logged.
   `--no-heartrate`). `oura_get_heartrate` is now local-first and
   compact-by-default (per-hour-by-source summary; `verbose:true` for
   raw samples). 15 collections total.
+- ✅ **v0.4.5** — heartrate sync chunked at 30 days (Oura's per-request
+  cap on this endpoint, distinct from the 90-day cap on daily collections).
+  `oura_get_heartrate` input range capped at 30 days to match.
 - **v0.5** — exports, weekly/monthly reports, optional
   `interbeat_interval` mirror, per-source-period heartrate aggregation.
 

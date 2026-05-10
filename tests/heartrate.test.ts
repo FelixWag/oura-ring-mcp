@@ -143,7 +143,7 @@ describe('runSync — heartrate handling', () => {
     expect(repo.maxTimestamp()).toBeNull();
   });
 
-  it('heartrate sync uses datetime params and a higher pageLimit', async () => {
+  it('heartrate sync uses datetime params, smaller 30-day chunks, and a higher pageLimit', async () => {
     const fakeData: Record<string, unknown[]> = {
       '/usercollection/daily_sleep': [],
       '/usercollection/daily_readiness': [],
@@ -172,9 +172,47 @@ describe('runSync — heartrate handling', () => {
     );
 
     const heartrateCalls = calls.filter((c) => c.path === '/usercollection/heartrate');
-    expect(heartrateCalls).toHaveLength(1); // 30-day default first-run window = 1 chunk.
-    const q = heartrateCalls[0]!.query as { start_datetime: string; end_datetime: string };
-    expect(q.start_datetime).toMatch(/T00:00:00Z$/);
-    expect(q.end_datetime).toMatch(/T23:59:59Z$/);
+    // 30-day default first-run window splits into 2 chunks under the
+    // 30-day-max-per-request cap (30-day inclusive span > 29-day chunk
+    // window). All datetimes use the T00/T23:59 day-boundary form.
+    expect(heartrateCalls).toHaveLength(2);
+    for (const c of heartrateCalls) {
+      const q = c.query as { start_datetime: string; end_datetime: string };
+      expect(q.start_datetime).toMatch(/T00:00:00Z$/);
+      expect(q.end_datetime).toMatch(/T23:59:59Z$/);
+    }
+  });
+
+  it('a 60-day heartrate sync produces 3 chunks of ≤30 days each', async () => {
+    const fakeData: Record<string, unknown[]> = {
+      '/usercollection/daily_sleep': [],
+      '/usercollection/daily_readiness': [],
+      '/usercollection/daily_activity': [],
+      '/usercollection/daily_spo2': [],
+      '/usercollection/daily_stress': [],
+      '/usercollection/daily_resilience': [],
+      '/usercollection/daily_cardiovascular_age': [],
+      '/usercollection/vO2_max': [],
+      '/usercollection/sleep_time': [],
+      '/usercollection/sleep': [],
+      '/usercollection/workout': [],
+      '/usercollection/session': [],
+      '/usercollection/rest_mode_period': [],
+      '/usercollection/enhanced_tag': [],
+      '/usercollection/heartrate': [],
+    };
+    const { client, calls } = makeFakeClient(fakeData);
+    await runSync(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      { client: client as any, db },
+      { since_days: 60, todayUtc: '2026-05-09' },
+    );
+    const heartrateCalls = calls.filter((c) => c.path === '/usercollection/heartrate');
+    // 60-day span at 30-day chunk size → 2 full 30-day chunks + 1 boundary
+    // 1-day chunk = 3 chunks total. Each chunk's window is ≤30 days, well
+    // under Oura's "≤30 days" cap.
+    expect(heartrateCalls).toHaveLength(3);
+    // For comparison, daily_sleep (90-day max) handles 60 days in 1 chunk.
+    expect(calls.filter((c) => c.path === '/usercollection/daily_sleep')).toHaveLength(1);
   });
 });

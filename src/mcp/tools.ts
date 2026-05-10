@@ -30,6 +30,13 @@ import { shapeEnhancedTag } from '../oura/tags.js';
 
 const DATE_REGEX = /^\d{4}-\d{2}-\d{2}$/;
 const MAX_RANGE_DAYS = 90;
+/**
+ * Oura's heartrate endpoint enforces a stricter 30-day-per-request cap
+ * than daily collections. The local mirror (synced in 30-day chunks)
+ * smooths over this for 'auto' / 'local' reads, but force-fresh
+ * (`prefer: 'api'`) calls hit the API directly and must obey the cap.
+ */
+const MAX_HEARTRATE_RANGE_DAYS = 30;
 
 const dateSchema = z.string().regex(DATE_REGEX, 'Date must be in YYYY-MM-DD format');
 
@@ -86,14 +93,18 @@ function validateDateRange(start: string, end: string): string | null {
   return null;
 }
 
-function validateDatetimeRange(start: string, end: string): string | null {
+function validateDatetimeRange(
+  start: string,
+  end: string,
+  maxDays = MAX_RANGE_DAYS,
+): string | null {
   const a = Date.parse(start);
   const b = Date.parse(end);
   if (Number.isNaN(a) || Number.isNaN(b)) return 'Invalid datetimes.';
   if (b < a) return 'end_datetime must be on or after start_datetime.';
   const days = (b - a) / (1000 * 60 * 60 * 24);
-  if (days > MAX_RANGE_DAYS) {
-    return `Datetime range too large (${days.toFixed(1)} days). Maximum is ${MAX_RANGE_DAYS} days.`;
+  if (days > maxDays) {
+    return `Datetime range too large (${days.toFixed(1)} days). Maximum is ${maxDays} days.`;
   }
   if (a > Date.now()) return 'start_datetime cannot be in the future.';
   return null;
@@ -440,7 +451,8 @@ export function registerTools(server: McpServer, opts: RegisterToolsOptions): vo
     {
       title: 'Oura: Heart rate',
       description:
-        'Fetch heart-rate samples between two ISO 8601 datetimes. Max 90 days per call. ' +
+        'Fetch heart-rate samples between two ISO 8601 datetimes. Max 30 days per call ' +
+        '(the Oura API enforces this for heartrate; daily collections allow 90). ' +
         'Returns an hourly summary by default (one row per hour per source: avg/min/max/count) ' +
         'so wide windows fit in one response. Pass verbose:true for raw per-sample data ' +
         '(suitable only for narrow windows). Local-first by default — reads from the synced ' +
@@ -461,7 +473,7 @@ export function registerTools(server: McpServer, opts: RegisterToolsOptions): vo
       },
     },
     async ({ start_datetime, end_datetime, verbose, prefer }) => {
-      const err = validateDatetimeRange(start_datetime, end_datetime);
+      const err = validateDatetimeRange(start_datetime, end_datetime, MAX_HEARTRATE_RANGE_DAYS);
       if (err) return errorResult(err);
       return handle(async () => {
         const wantApi = !hrRepo || prefer === 'api';
