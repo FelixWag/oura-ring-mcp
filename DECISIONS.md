@@ -483,3 +483,37 @@ few seconds and a few MB; the opt-out is there for power-users who
 care about that. Per-call `pageLimit` keeps daily collections defensive
 against accidental over-fetch while letting timeseries explicitly
 opt into broader pagination.
+
+---
+
+## 2026-05-10 — v0.4.5: heartrate chunked at 30 days, not 90
+
+**Context.** v0.4.4 shipped heartrate sync using the same 90-day chunk
+size as daily collections. The first real `npm run sync -- --since 240`
+returned a 400: _"Timerange between start and endtime has to be less
+than or equal to 30 days."_ Heartrate has a stricter per-request cap
+than the daily endpoints — discovered empirically because the OpenAPI
+spec doesn't document per-endpoint range limits.
+
+**Decision.** Introduce `HEARTRATE_MAX_RANGE_DAYS = 30` in
+`src/db/sync.ts` and pass it as the third argument to `chunkRange` from
+`syncHeartrate`. Mirror the constraint in `src/mcp/tools.ts` with a
+`MAX_HEARTRATE_RANGE_DAYS = 30` used by `oura_get_heartrate`'s input
+validation (the tool's API force-fresh path can't exceed what the API
+itself accepts). Daily collections keep their 90-day cap.
+
+Empirical per-endpoint range mapping (so far):
+
+| Endpoint family                                                      | Per-request cap                                   |
+| -------------------------------------------------------------------- | ------------------------------------------------- |
+| Daily collections (sleep, readiness, activity, …)                    | 90 days                                           |
+| Event collections (sleep, workout, session, enhanced_tag, rest_mode) | 90 days                                           |
+| **heartrate**                                                        | **30 days**                                       |
+| (future) interbeat_interval                                          | unknown — likely 30, given the timeseries pattern |
+
+**Rationale.** The fix is a one-line orchestration change because
+`chunkRange` already supports a per-call cap. Tool-side validation
+mirrors the API constraint so users don't hit confusing 400s on
+force-fresh queries. The empirical mapping table belongs in this log
+because future timeseries additions (IBI, ring_battery_level) will
+likely need their own caps too — and the OpenAPI spec won't tell us.
