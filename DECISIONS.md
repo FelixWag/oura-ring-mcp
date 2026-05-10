@@ -393,3 +393,39 @@ spreading raw SQL across the codebase.
 `ring_battery_level`, `ring_configuration`. Heart rate is the next
 meaningful addition; the others are ring-telemetry rather than
 health data and may never be added.
+
+---
+
+## 2026-05-09 — v0.4.3: missing OAuth scopes (`stress`, `heart_health`)
+
+**Context.** The first real `npm run sync` after v0.4.2 surfaced 401
+errors on three of the new collections — `daily_resilience` (needs the
+`stress` scope), `daily_cardiovascular_age` and `vO2_max` (both need
+`heart_health`). The OpenAPI spec doesn't formally declare per-endpoint
+scope requirements, so the only way to discover them empirically was to
+ship and observe.
+
+Curiously, `daily_stress` itself works under the existing `daily` scope
+despite the name — so scope mappings are not predictable from endpoint
+names. Empirical mapping (current as of 2026-05-09):
+
+| Collection                   | Required scope        |
+| ---------------------------- | --------------------- |
+| `daily_resilience`           | `stress`              |
+| `daily_cardiovascular_age`   | `heart_health`        |
+| `vO2_max`                    | `heart_health`        |
+| `heartrate` (planned v0.4.4) | likely `heart_health` |
+
+**Decision.** Add `stress` and `heart_health` to `OURA_SCOPES`. Existing
+users re-run `npm run oauth-login` once to grant them; new users get
+them automatically on first auth. Also: the API client now detects 401
+responses whose body mentions "scope" and surfaces a clear
+`run \`npm run oauth-login\` to re-authorize` hint, instead of the raw
+"Token is not authorized" message. Refresh-on-401 is skipped for
+scope-related errors (refresh wouldn't help) — saves a wasted API call.
+
+**Rationale.** Scopes are additive; granting more never breaks anything.
+Re-authorizing once is a tolerable upgrade cost given how rarely it
+happens. The improved error hint costs ~10 lines but turns a confusing
+error into a self-explanatory one — exactly the kind of UX polish that
+matters for a public repo.

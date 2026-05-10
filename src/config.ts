@@ -15,9 +15,29 @@ export const OURA_AUTH_URL = 'https://cloud.ouraring.com/oauth/authorize';
 export const OURA_TOKEN_URL = 'https://api.ouraring.com/oauth/token';
 export const OURA_API_BASE = 'https://api.ouraring.com/v2';
 
-// `tag` added in v0.3 so we can call /v2/usercollection/enhanced_tag.
-// Re-run `npm run oauth-login` after upgrading to pick up the new scope.
-export const OURA_SCOPES = ['daily', 'heartrate', 'workout', 'session', 'spo2', 'tag', 'personal'];
+// Scopes by version:
+//   v0.1: daily, heartrate, workout, session, spo2, personal
+//   v0.3: + tag           (for /v2/usercollection/enhanced_tag)
+//   v0.4.2.1: + stress, heart_health
+//     stress       → /v2/usercollection/daily_resilience
+//     heart_health → /v2/usercollection/daily_cardiovascular_age,
+//                    /v2/usercollection/vO2_max,
+//                    and likely /v2/usercollection/heartrate (relevant for v0.4.3+)
+// Note: /v2/usercollection/daily_stress works under the `daily` scope despite
+// its name — Oura's scoping is empirical, not predictable from endpoint names.
+//
+// Re-run `npm run oauth-login` after upgrading to pick up new scopes.
+export const OURA_SCOPES = [
+  'daily',
+  'heartrate',
+  'workout',
+  'session',
+  'spo2',
+  'tag',
+  'stress',
+  'heart_health',
+  'personal',
+];
 
 function configBaseDir(): string {
   const xdg = process.env.XDG_CONFIG_HOME;
