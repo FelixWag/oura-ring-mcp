@@ -20,7 +20,8 @@ export type SyncCollection =
   | 'workouts'
   | 'sessions'
   | 'rest_mode_periods'
-  | 'enhanced_tag';
+  | 'enhanced_tag'
+  | 'heartrate';
 
 export interface SyncRun {
   id: number;

@@ -14,10 +14,10 @@ Read-only, OAuth2, runs locally over stdio. Personal project — but clean and e
 
 - OAuth2 authorization-code flow with automatic token refresh.
 - Fourteen MCP tools across four categories:
-  - **Raw access**: `oura_get_daily_summary` / `oura_get_sleep` / `oura_get_activity` / `oura_get_heartrate` / `oura_get_personal_info`
+  - **Raw access**: `oura_get_daily_summary` / `oura_get_sleep` / `oura_get_activity` / `oura_get_heartrate` (per-hour summary by default) / `oura_get_personal_info`
   - **Derived metrics**: `oura_get_recent_summary` / `oura_compare_periods` / `oura_get_trends`
   - **Tags & annotations** (v0.3): `oura_get_enhanced_tags` (read Oura tags), plus local SQLite annotations (`oura_add_annotation` / `oura_list_annotations` / `oura_update_annotation` / `oura_delete_annotation`).
-  - **Local mirror** (v0.4): `oura_sync` mirrors Oura data into local SQLite so summary tools answer instantly without hitting the API.
+  - **Local mirror** (v0.4): `oura_sync` mirrors **15 collections** of Oura data into local SQLite so summary tools answer instantly without hitting the API. Includes heart-rate timeseries (v0.4.4).
 - Local annotations mirror Oura's enhanced_tag schema, so the LLM can
   reason about both Oura-logged tags and your own context (illness, alcohol,
   travel, etc.) in one uniform shape.
@@ -79,7 +79,7 @@ Or edit `~/.claude.json` manually:
 }
 ```
 
-Restart Claude Code, then run `/mcp` — you should see `oura` listed with all fourteen tools.
+Restart Claude Code, then run `/mcp` — you should see `oura` listed with all fourteen tools (`oura_get_daily_summary`, `oura_get_sleep`, …, `oura_sync`).
 Try asking: _"Show my Oura daily summary for the last 7 days."_
 
 > **Upgrading scopes**: re-run `npm run oauth-login` once after upgrading
@@ -105,13 +105,13 @@ Claude Code with the `oura_sync` tool.
 
 ### Raw access
 
-| Tool                     | Inputs                                      | Notes                                             |
-| ------------------------ | ------------------------------------------- | ------------------------------------------------- |
-| `oura_get_daily_summary` | `start_date`, `end_date`, `verbose?`        | Merges daily sleep, readiness, activity per date. |
-| `oura_get_sleep`         | `start_date`, `end_date`, `verbose?`        | Detailed per-sleep-period records.                |
-| `oura_get_activity`      | `start_date`, `end_date`, `verbose?`        | Daily activity rows.                              |
-| `oura_get_heartrate`     | `start_datetime`, `end_datetime` (ISO 8601) | Time-series; prefer narrow windows.               |
-| `oura_get_personal_info` | none                                        | Profile metadata.                                 |
+| Tool                     | Inputs                                                  | Notes                                                                               |
+| ------------------------ | ------------------------------------------------------- | ----------------------------------------------------------------------------------- |
+| `oura_get_daily_summary` | `start_date`, `end_date`, `verbose?`                    | Merges daily sleep, readiness, activity per date.                                   |
+| `oura_get_sleep`         | `start_date`, `end_date`, `verbose?`                    | Detailed per-sleep-period records.                                                  |
+| `oura_get_activity`      | `start_date`, `end_date`, `verbose?`                    | Daily activity rows.                                                                |
+| `oura_get_heartrate`     | `start_datetime`, `end_datetime`, `verbose?`, `prefer?` | Per-hour summary by source by default; `verbose:true` for raw samples. Local-first. |
+| `oura_get_personal_info` | none                                                    | Profile metadata.                                                                   |
 
 ### Derived metrics (v0.2)
 
@@ -138,9 +138,9 @@ Pass `include_annotations: false` to skip the join.
 
 ### Local mirror (v0.4)
 
-| Tool        | Inputs                                       | Notes                                                                                                                                                                                                                                                                                                            |
-| ----------- | -------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `oura_sync` | `since_days?` (1–730), `full?`, `tags_only?` | Pull recent Oura data into local SQLite. Mirrors **14 collections** (sleep, readiness, activity, spo2, stress, resilience, cardiovascular_age, vo2_max, sleep_time, sleep_periods, workouts, sessions, rest_mode_periods, enhanced_tags). Default: incremental + 7-day re-fetch overlap. Chunked > 90-day spans. |
+| Tool        | Inputs                                                          | Notes                                                                                                                                                                                                                                                                                                                       |
+| ----------- | --------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `oura_sync` | `since_days?` (1–730), `full?`, `tags_only?`, `with_heartrate?` | Pull recent Oura data into local SQLite. Mirrors **15 collections** (sleep, readiness, activity, spo2, stress, resilience, cardiovascular_age, vo2_max, sleep_time, sleep_periods, workouts, sessions, rest_mode_periods, enhanced_tags, heartrate). Default: incremental + 7-day re-fetch overlap. Chunked > 90-day spans. |
 
 For a one-time historical backfill (e.g. you've had the ring for 6 months
 and want everything local), pass a larger `since_days` and the sync will
@@ -348,9 +348,12 @@ stderr; tokens are never logged.
 - ✅ **v0.4.3** — adds `stress` and `heart_health` OAuth scopes (unblocks
   `daily_resilience`, `daily_cardiovascular_age`, `vO2_max`); the API
   client surfaces a clear "re-run `oauth-login`" hint on scope-related 401s.
-- **v0.4.4** — heart-rate timeseries mirror (with optional
-  `interbeat_interval`); local-first `oura_get_heartrate`.
-- **v0.5** — exports, weekly/monthly reports.
+- ✅ **v0.4.4** — heart-rate timeseries mirror (default-on, opt-out via
+  `--no-heartrate`). `oura_get_heartrate` is now local-first and
+  compact-by-default (per-hour-by-source summary; `verbose:true` for
+  raw samples). 15 collections total.
+- **v0.5** — exports, weekly/monthly reports, optional
+  `interbeat_interval` mirror, per-source-period heartrate aggregation.
 
 ## License
 

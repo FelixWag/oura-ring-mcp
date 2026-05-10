@@ -3,6 +3,7 @@ import { ConfigError, loadConfig } from './config.js';
 import { AnnotationRepo } from './db/annotations.js';
 import { openDatabase } from './db/index.js';
 import { DailyCollectionRepo } from './db/repos/daily.js';
+import { HeartrateRepo } from './db/repos/heartrate.js';
 import { runSync, type SyncOptions } from './db/sync.js';
 import { runStdioServer } from './mcp/server.js';
 import { OuraClient } from './oura/client.js';
@@ -33,6 +34,7 @@ async function main(): Promise<void> {
     readiness: new DailyCollectionRepo(db, 'daily_readiness'),
     activity: new DailyCollectionRepo(db, 'daily_activity'),
   };
+  const heartrate = new HeartrateRepo(db);
 
   const sync = (options: SyncOptions) => runSync({ client, db }, options);
 
@@ -52,7 +54,7 @@ async function main(): Promise<void> {
     process.exit(0);
   });
 
-  await runStdioServer({ client, annotations, daily, sync });
+  await runStdioServer({ client, annotations, daily, heartrate, sync });
 }
 
 main().catch((err) => {

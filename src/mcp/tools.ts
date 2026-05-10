@@ -6,6 +6,7 @@ import {
   type AnnotationRepo,
 } from '../db/annotations.js';
 import type { DailyCollectionRepo } from '../db/repos/daily.js';
+import type { HeartrateRepo } from '../db/repos/heartrate.js';
 import type { SyncOptions, SyncResult } from '../db/sync.js';
 import { acceptedTagTypeCodes } from '../db/tag_types.js';
 import type { OuraClient } from '../oura/client.js';
@@ -294,12 +295,14 @@ export interface RegisterToolsOptions {
   annotations?: AnnotationRepo;
   /** v0.4: daily score repos. When absent, summary tools fall back to API-only. */
   daily?: DailyRepos;
+  /** v0.4.4: heartrate repo. When absent, oura_get_heartrate stays API-only. */
+  heartrate?: HeartrateRepo;
   /** v0.4: sync runner. When absent, the `oura_sync` tool is not registered. */
   sync?: (options: SyncOptions) => Promise<SyncResult>;
 }
 
 export function registerTools(server: McpServer, opts: RegisterToolsOptions): void {
-  const { client, annotations: repo, daily, sync } = opts;
+  const { client, annotations: repo, daily, heartrate: hrRepo, sync } = opts;
 
   const dateRangeShape = {
     start_date: dateSchema.describe('Start date, inclusive (YYYY-MM-DD).'),
@@ -437,27 +440,109 @@ export function registerTools(server: McpServer, opts: RegisterToolsOptions): vo
     {
       title: 'Oura: Heart rate',
       description:
-        'Fetch heart-rate time-series samples between two ISO 8601 datetimes. Max 90 days per call. ' +
-        'Responses can be large; prefer narrow windows.',
+        'Fetch heart-rate samples between two ISO 8601 datetimes. Max 90 days per call. ' +
+        'Returns an hourly summary by default (one row per hour per source: avg/min/max/count) ' +
+        'so wide windows fit in one response. Pass verbose:true for raw per-sample data ' +
+        '(suitable only for narrow windows). Local-first by default — reads from the synced ' +
+        'SQLite mirror when present.',
       inputSchema: {
         start_datetime: datetimeSchema.describe(
           'ISO 8601 start datetime, e.g. 2026-01-15T00:00:00Z.',
         ),
         end_datetime: datetimeSchema.describe('ISO 8601 end datetime, e.g. 2026-01-15T23:59:59Z.'),
+        verbose: z
+          .boolean()
+          .optional()
+          .describe(
+            'When true, returns raw per-sample data (potentially thousands of rows). ' +
+              'Default false returns the per-hour-by-source summary.',
+          ),
+        prefer: preferSchema,
       },
     },
-    async ({ start_datetime, end_datetime }) => {
+    async ({ start_datetime, end_datetime, verbose, prefer }) => {
       const err = validateDatetimeRange(start_datetime, end_datetime);
       if (err) return errorResult(err);
       return handle(async () => {
-        const r = await client.getCollection(ENDPOINTS.heartrate, {
-          start_datetime,
-          end_datetime,
-        });
+        const wantApi = !hrRepo || prefer === 'api';
+        const wantLocal =
+          hrRepo && (prefer === 'local' || prefer === 'auto' || prefer === undefined);
+
+        // Local-first read path. We reuse the local mirror when available and
+        // the requested window is fully synced. Otherwise we fetch from API
+        // (and upsert into local for next time).
+        if (wantLocal && !wantApi) {
+          const maxLocal = hrRepo.maxTimestamp();
+          // If local data covers the requested end (within ~1 hour), we can
+          // serve from cache. Otherwise fall back to API in 'auto'.
+          const localCovers = maxLocal !== null && maxLocal >= end_datetime.slice(0, 19);
+          if (prefer === 'local' || localCovers) {
+            if (verbose) {
+              const samples = hrRepo.listRange(start_datetime, end_datetime);
+              return {
+                range: { start_datetime, end_datetime },
+                source: 'local',
+                verbose: true,
+                count: samples.length,
+                data: samples,
+              };
+            }
+            const summary = hrRepo.summarizeByHour(start_datetime, end_datetime);
+            return {
+              range: { start_datetime, end_datetime },
+              source: 'local',
+              verbose: false,
+              count: summary.length,
+              data: summary,
+            };
+          }
+        }
+
+        // API path — for 'api' prefer, or 'auto' when local is incomplete.
+        const r = await client.getCollection<unknown>(
+          ENDPOINTS.heartrate,
+          { start_datetime, end_datetime },
+          /* pageLimit */ 100,
+        );
+        if (hrRepo) {
+          // Upsert into local for next time.
+          hrRepo.upsertMany(r.data);
+        }
+        if (verbose) {
+          return {
+            range: { start_datetime, end_datetime },
+            source: 'api',
+            verbose: true,
+            truncated: r.truncated,
+            count: r.data.length,
+            data: r.data,
+          };
+        }
+        // For the compact path on the API result, the simplest correct thing
+        // is to read from local now that we just upserted there. Avoids
+        // duplicating the SQL aggregation in JS.
+        if (hrRepo) {
+          const summary = hrRepo.summarizeByHour(start_datetime, end_datetime);
+          return {
+            range: { start_datetime, end_datetime },
+            source: 'api',
+            verbose: false,
+            truncated: r.truncated,
+            count: summary.length,
+            data: summary,
+          };
+        }
+        // No local repo at all — return API data raw with a note about size.
         return {
           range: { start_datetime, end_datetime },
-          ...r,
+          source: 'api',
+          verbose: false,
+          truncated: r.truncated,
           count: r.data.length,
+          data: r.data,
+          note:
+            'No local heartrate mirror is configured; returning raw samples. Wide windows ' +
+            'may exceed response size limits.',
         };
       });
     },
@@ -703,14 +788,23 @@ export function registerTools(server: McpServer, opts: RegisterToolsOptions): vo
             .boolean()
             .optional()
             .describe('Sync only enhanced_tag (and refresh discovered_tag_types).'),
+          with_heartrate: z
+            .boolean()
+            .optional()
+            .describe(
+              'Include heartrate timeseries in the sync. Default true. ' +
+                'Pass false for a faster, smaller incremental sync that only refreshes ' +
+                'daily / event collections.',
+            ),
         },
       },
-      async ({ since_days, full, tags_only }) => {
+      async ({ since_days, full, tags_only, with_heartrate }) => {
         return handle(() =>
           sync({
             since_days,
             full,
             tags_only,
+            no_heartrate: with_heartrate === false,
           }),
         );
       },
