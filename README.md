@@ -1,72 +1,103 @@
 # oura-ring-mcp
 
-A small [Model Context Protocol](https://modelcontextprotocol.io) server that lets
-[Claude Code](https://claude.com/claude-code) (and any MCP client) read your
-[Oura Ring](https://ouraring.com) data through the official Oura API v2.
+> **Talk to your Oura Ring data through Claude.** Local SQLite mirror, 14 MCP tools, OAuth2, ~5-minute setup.
 
-Read-only, OAuth2, runs locally over stdio. Personal project — but clean and easy to set up.
+[![CI](https://github.com/FelixWag/oura-ring-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/FelixWag/oura-ring-mcp/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![MCP](https://img.shields.io/badge/MCP-compatible-blue.svg)](https://modelcontextprotocol.io)
+[![Tests](https://img.shields.io/badge/tests-103%20passing-brightgreen.svg)](https://github.com/FelixWag/oura-ring-mcp/actions)
+[![Node](https://img.shields.io/badge/Node-20%2B-339933.svg?logo=node.js&logoColor=white)](https://nodejs.org)
 
-> **Sensitive data warning**: this tool reads personal health data. Tokens are stored
-> locally with `0600` permissions and are never logged. Don't commit `.env` or your
-> token file. Don't share them.
+![demo](docs/demo.gif)
+
+A [Model Context Protocol](https://modelcontextprotocol.io) server that lets
+[Claude Code](https://claude.com/claude-code) (and any MCP client) read and reason
+over your [Oura Ring](https://ouraring.com) data — sleep, readiness, activity,
+heart rate, stress, resilience, tags, and more — through one fast local SQLite
+mirror.
+
+**Ask Claude things like:**
+
+- _"Did my readiness drop after the alcohol days last week?"_
+- _"Compare my sleep this week to last week and tell me what changed."_
+- _"What was my heart rate during yesterday's workout?"_
+- _"Show me my resilience trend over the past month."_
+- _"My energy has been low lately — anything in the data that explains it?"_
+
+Everything answers locally from your synced mirror — no rate limits, no
+re-fetching, no privacy concerns. Multi-month analysis is one prompt away.
+
+> **Sensitive data warning**: this tool reads personal health data. Tokens and
+> data are stored locally at `~/.config/oura-ring-mcp/` with `0600` permissions
+> and are never logged or transmitted anywhere except `api.ouraring.com`. Don't
+> commit `.env` or your token / database files.
 
 ## Features
 
-- OAuth2 authorization-code flow with automatic token refresh.
-- Fourteen MCP tools across four categories:
-  - **Raw access**: `oura_get_daily_summary` / `oura_get_sleep` / `oura_get_activity` / `oura_get_heartrate` (per-hour summary by default) / `oura_get_personal_info`
-  - **Derived metrics**: `oura_get_recent_summary` / `oura_compare_periods` / `oura_get_trends`
-  - **Tags & annotations** (v0.3): `oura_get_enhanced_tags` (read Oura tags), plus local SQLite annotations (`oura_add_annotation` / `oura_list_annotations` / `oura_update_annotation` / `oura_delete_annotation`).
-  - **Local mirror** (v0.4): `oura_sync` mirrors **15 collections** of Oura data into local SQLite so summary tools answer instantly without hitting the API. Includes heart-rate timeseries (v0.4.4).
-- Local annotations mirror Oura's enhanced_tag schema, so the LLM can
-  reason about both Oura-logged tags and your own context (illness, alcohol,
-  travel, etc.) in one uniform shape.
-- **Local-first reads** (v0.4): `oura_get_daily_summary` and `oura_get_recent_summary` use the local SQLite mirror by default. Stable past days come instantly from cache; today/yesterday and missing days fall back to the API.
-- **Self-correcting tag-code list**: every sync of `enhanced_tag` records the codes Oura actually returns; the annotation validator accepts both the static seed list and your discovered codes.
-- Compact-by-default responses keep payloads small enough for LLMs to reason over.
-- Automatic token refresh + 429 / Retry-After-aware rate-limit handling.
-- Local data at `~/.config/oura-ring-mcp/` (tokens + SQLite, both `0600`).
-- TypeScript, MIT licensed.
+- 🩺 **14 MCP tools** spanning raw Oura access, derived metrics (rolling
+  averages, period comparisons, trends), tags + local annotations, and a
+  local-mirror sync.
+- 💾 **Local SQLite mirror** of 15 Oura collections (sleep, readiness, activity,
+  spo2, stress, resilience, cardiovascular age, vO2 max, sleep time, sleep
+  periods, workouts, sessions, rest mode periods, enhanced tags, heartrate).
+  Up to 730 days of historical backfill, chunked transparently.
+- ⚡ **Local-first by default** — summary tools serve instantly from cache,
+  fall back to the API only for today / yesterday / missing days.
+- 🏷️ **Tags + annotations** — read Oura's tags, log your own (illness,
+  alcohol, travel, etc.) in a schema that mirrors Oura's `EnhancedTagModel`
+  so both data sources query uniformly.
+- 🔐 **OAuth2 with auto-refresh**, 429 / Retry-After handling, scope-aware
+  401 hints. Tokens stored with `0600` perms.
+- 🧪 **Tested** — 103 unit + integration tests on Node 20 / 22 / 24.
+- 📜 **TypeScript**, MIT licensed.
 
-## Quick start
+## Quick start (~5 minutes)
 
 You need [Node.js 20+](https://nodejs.org) and an Oura account.
 
+### 1. Register an Oura OAuth app
+
+Go to <https://cloud.ouraring.com/oauth/applications> → **New application**.
+
+- **Redirect URI** (exactly): `http://127.0.0.1:8765/callback`
+- **Privacy Policy URL**: `https://github.com/FelixWag/oura-ring-mcp/blob/main/PRIVACY.md`
+- **Terms of Service URL**: `https://github.com/FelixWag/oura-ring-mcp/blob/main/TERMS.md`
+
+Save. Copy the **Client ID** and **Client Secret** — you'll paste them in step 3.
+
+### 2. Clone, install, build
+
 ```bash
-git clone https://github.com/<you>/oura-ring-mcp.git
+git clone https://github.com/FelixWag/oura-ring-mcp.git
 cd oura-ring-mcp
 npm install
 npm run build
 ```
 
-### 1. Create an Oura OAuth application
-
-1. Go to <https://cloud.ouraring.com/oauth/applications> and click **New application**.
-2. Set **Redirect URI** to exactly:
-   ```
-   http://127.0.0.1:8765/callback
-   ```
-3. Save the application. Copy the **Client ID** and **Client Secret**.
-
-### 2. Configure and authorize
+### 3. Configure, authorize, sync — one command
 
 ```bash
-npm run setup        # interactive: writes .env with your client id/secret
-npm run oauth-login  # opens your browser, captures the callback, stores tokens
+npm run init
 ```
 
-After `oauth-login` succeeds, your access and refresh tokens are saved to
-`~/.config/oura-ring-mcp/tokens.json` (override with `OURA_TOKEN_PATH`).
+This chains three steps:
 
-### 3. Connect to Claude Code
+1. **`setup`** — interactively writes `.env` (asks for client id/secret).
+2. **`oauth-login`** — opens your browser to authorize, then stores the
+   refresh token at `~/.config/oura-ring-mcp/tokens.json`.
+3. **`sync`** — pulls your last ~30 days of Oura data into a local SQLite
+   mirror at `~/.config/oura-ring-mcp/data.sqlite`.
 
-Add the server to Claude Code:
+Want a longer history backfill? After `init`, run e.g.
+`npm run sync -- --since 240` to pull 8 months. Up to 730 days supported.
+
+### 4. Connect to Claude Code
 
 ```bash
 claude mcp add oura node "$(pwd)/dist/index.js"
 ```
 
-Or edit `~/.claude.json` manually:
+Or paste this into `~/.claude.json` manually:
 
 ```json
 {
@@ -79,8 +110,8 @@ Or edit `~/.claude.json` manually:
 }
 ```
 
-Restart Claude Code, then run `/mcp` — you should see `oura` listed with all fourteen tools (`oura_get_daily_summary`, `oura_get_sleep`, …, `oura_sync`).
-Try asking: _"Show my Oura daily summary for the last 7 days."_
+Restart Claude Code, run `/mcp` — `oura` should be listed with all 14 tools.
+Now ask: _"Show me my last 7 days of Oura data."_
 
 > **Upgrading scopes**: re-run `npm run oauth-login` once after upgrading
 > from any earlier version. v0.3 added the `tag` scope (for enhanced_tag);
@@ -92,14 +123,59 @@ Try asking: _"Show my Oura daily summary for the last 7 days."_
 ### Optional: prime the local cache
 
 ```bash
-npm run sync
+npm run sync                  # pulls last ~30 days
+npm run sync -- --since 240   # backfill 8 months of history
 ```
 
-This is optional but recommended. It pulls your last ~30 days of Oura data
-into the local SQLite mirror so every subsequent summary / trend query
-answers instantly from cache. Future runs are incremental — see
-`npm run sync -- --help` for flags. You can also trigger this from inside
-Claude Code with the `oura_sync` tool.
+`npm run init` runs this automatically. Future runs are incremental + a
+7-day re-fetch overlap (handles Oura's same-day re-scoring). Up to 730
+days; chunked transparently. See `npm run sync -- --help`. You can also
+trigger from inside Claude Code with the `oura_sync` tool.
+
+## What you can ask Claude
+
+A starter prompt gallery. Copy-paste any of these into Claude Code after
+connecting the server.
+
+### Sleep & recovery
+
+- _"Show me my last 14 days of summaries with annotations."_
+- _"Which night this month had the worst sleep, and why? Look at the contributors."_
+- _"How long did it take me to recover (resting HR back to baseline) after my last alcohol day?"_
+- _"Walk me through last night's sleep — when did I fall asleep, REM cycles, anything unusual?"_
+
+### Trends & comparisons
+
+- _"Compare my sleep this week to the previous week. What changed?"_
+- _"Show me my readiness rolling average over the last 60 days. Improving or declining?"_
+- _"Compare weekday vs weekend sleep over the past month."_
+- _"What's my resilience level distribution since I got the ring?"_
+
+### Workouts & activity
+
+- _"What was my heart rate during yesterday's workout? Hour-by-hour."_
+- _"Compare my workout days to my rest days — sleep score, recovery, RHR."_
+- _"Find days where I had >10,000 steps and tell me how I slept those nights."_
+- _"What's my VO2 Max trajectory?"_
+
+### Logging context
+
+- _"I had 4 beers Thursday from 6pm to midnight. Log it."_
+- _"I was sick from Monday to Wednesday — log a cold annotation across those days."_
+- _"List all my alcohol annotations from the past 3 months and group them by day of the week."_
+
+### Causal-ish reasoning (the killer feature)
+
+- _"Did my readiness drop after the alcohol days?"_
+- _"Is there a relationship between my caffeine days and my deep sleep?"_
+- _"My energy has been low lately — anything in the data that explains it?"_
+- _"On which annotated context days do I sleep worst?"_
+
+### Refresh / housekeeping
+
+- _"Sync the latest Oura data."_ (calls `oura_sync`)
+- _"Pull just the tags from the last week."_
+- _"Show me what new Oura tag types you've discovered."_
 
 ## Tools
 
