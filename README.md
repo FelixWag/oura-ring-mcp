@@ -82,8 +82,12 @@ Or edit `~/.claude.json` manually:
 Restart Claude Code, then run `/mcp` — you should see `oura` listed with all fourteen tools.
 Try asking: _"Show my Oura daily summary for the last 7 days."_
 
-> Upgrading from v0.2 → v0.3? Re-run `npm run oauth-login` once. v0.3 requests
-> the additional `tag` scope so it can read Oura's enhanced_tag endpoint.
+> **Upgrading scopes**: re-run `npm run oauth-login` once after upgrading
+> from any earlier version. v0.3 added the `tag` scope (for enhanced_tag);
+> v0.4.3 adds `stress` (for daily_resilience) and `heart_health` (for
+> daily_cardiovascular_age, vO2_max, and the future heartrate sync). If you
+> see a `Token is not authorized access … scope` error from `npm run sync`,
+> that's the symptom — `npm run oauth-login` is the fix.
 
 ### Optional: prime the local cache
 
@@ -341,7 +345,10 @@ stderr; tokens are never logged.
   `daily_resilience`, `daily_cardiovascular_age`, `vo2_max`, `sleep_time`)
   and `rest_mode_periods`. Adds `extractField` / `extractFieldRange`
   helpers for JSON-stored fields (resilience level, stress sub-scores).
-- **v0.4.3** — heart-rate timeseries mirror (with optional
+- ✅ **v0.4.3** — adds `stress` and `heart_health` OAuth scopes (unblocks
+  `daily_resilience`, `daily_cardiovascular_age`, `vO2_max`); the API
+  client surfaces a clear "re-run `oauth-login`" hint on scope-related 401s.
+- **v0.4.4** — heart-rate timeseries mirror (with optional
   `interbeat_interval`); local-first `oura_get_heartrate`.
 - **v0.5** — exports, weekly/monthly reports.
 

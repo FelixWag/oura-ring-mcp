@@ -140,6 +140,39 @@ describe('OuraClient', () => {
     );
   });
 
+  it('surfaces a re-authorize hint on 401 with a "scope" error body, without retrying', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oura-cli-'));
+    const path = join(dir, 'tokens.json');
+    await saveTokens(path, tokens());
+
+    let apiCalls = 0;
+    const fetchImpl = vi.fn(async (url: URL | RequestInfo) => {
+      const u = url instanceof URL ? url : new URL(String(url));
+      if (u.pathname.endsWith('/oauth/token')) {
+        // Should NOT be called — refresh wouldn't help for scope errors.
+        throw new Error('refresh attempted on a scope-401, but should not have been');
+      }
+      apiCalls += 1;
+      return new Response('{"detail":"Token is not authorized access stress scope."}', {
+        status: 401,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    });
+
+    const client = new OuraClient({
+      clientId: 'cid',
+      clientSecret: 'csec',
+      tokenPath: path,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+
+    await expect(
+      client.getCollection('/usercollection/daily_resilience', { start_date: '2026-05-01' }),
+    ).rejects.toThrow(/oauth-login/);
+    // No retry: exactly one API call.
+    expect(apiCalls).toBe(1);
+  });
+
   it('retries once on 429 honoring Retry-After', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'oura-cli-'));
     const path = join(dir, 'tokens.json');

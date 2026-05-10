@@ -136,9 +136,24 @@ export class OuraClient {
     });
 
     if (res.status === 401 && attempt === 0) {
-      this.debug('401 received — refreshing tokens and retrying once');
-      await this.refresh();
-      return this.request(path, query, attempt + 1, rateLimitRetries);
+      // Peek at the body to distinguish "expired token" (refresh helps) from
+      // "missing scope" (refresh doesn't help — user must re-authorize).
+      // We clone first so we can still read the body in the error path below.
+      const probe = res.clone();
+      let probeBody = '';
+      try {
+        probeBody = await probe.text();
+      } catch {
+        // ignore
+      }
+      if (/scope/i.test(probeBody)) {
+        this.debug('401 missing-scope — refresh would not help, surfacing error directly');
+        // Fall through to the error block below using the original `res`.
+      } else {
+        this.debug('401 received — refreshing tokens and retrying once');
+        await this.refresh();
+        return this.request(path, query, attempt + 1, rateLimitRetries);
+      }
     }
 
     if (res.status === 429 && rateLimitRetries < RATE_LIMIT_MAX_RETRIES) {
@@ -163,9 +178,17 @@ export class OuraClient {
       } catch {
         // ignore
       }
+      // 401 with "scope" in the body almost always means the user upgraded
+      // the project (which added new scopes to OURA_SCOPES) but didn't
+      // re-run `npm run oauth-login`, so the stored token still has the
+      // older scope set. Surface the fix instead of a raw API error.
+      const scopeHint =
+        res.status === 401 && /scope/i.test(detail)
+          ? ' — your saved token is missing a required scope; run `npm run oauth-login` to re-authorize.'
+          : '';
       throw new OuraApiError(
         res.status,
-        `Oura API ${res.status} for ${path}${detail ? ` — ${detail}` : ''}`,
+        `Oura API ${res.status} for ${path}${detail ? ` — ${detail}` : ''}${scopeHint}`,
       );
     }
 
