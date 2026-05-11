@@ -85,6 +85,14 @@ describe('HeartrateRepo', () => {
     repo.upsert({ timestamp: '2026-05-09T07:00:00+00:00', source: 'awake', bpm: 70 });
     expect(repo.maxTimestamp()).toBe('2026-05-09T07:00:00+00:00');
   });
+
+  it('minTimestamp returns the earliest timestamp or null', () => {
+    const repo = new HeartrateRepo(db);
+    expect(repo.minTimestamp()).toBeNull();
+    repo.upsert({ timestamp: '2026-05-09T07:00:00+00:00', source: 'awake', bpm: 70 });
+    repo.upsert({ timestamp: '2026-05-08T07:00:00+00:00', source: 'awake', bpm: 70 });
+    expect(repo.minTimestamp()).toBe('2026-05-08T07:00:00+00:00');
+  });
 });
 
 describe('runSync — heartrate handling', () => {

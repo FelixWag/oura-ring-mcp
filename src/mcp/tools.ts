@@ -80,6 +80,10 @@ function shiftDate(from: string, days: number): string {
   return shifted.toISOString().slice(0, 10);
 }
 
+function canonicalDatetime(v: string): string {
+  return new Date(Date.parse(v)).toISOString().replace('.000Z', 'Z');
+}
+
 function validateDateRange(start: string, end: string): string | null {
   const days = diffDays(start, end);
   if (Number.isNaN(days)) return 'Invalid dates.';
@@ -286,16 +290,26 @@ async function fetchCompactDays(
 }
 
 /**
- * Group annotations by their `start_day`. Multi-day annotations (with end_day)
- * are emitted under start_day only — the LLM can reason about the span from
- * the row itself. Keeping it simple here avoids cross-day duplication.
+ * Group annotations by every day their span overlaps. Multi-day rows are
+ * intentionally repeated across the matching days so summary tools can answer
+ * "what context affected this day?" without the model having to recover spans
+ * from a separate list.
  */
-function annotationsByDay(rows: Annotation[]): Map<string, Annotation[]> {
+function annotationsByDay(
+  rows: Annotation[],
+  start_date: string,
+  end_date: string,
+): Map<string, Annotation[]> {
   const out = new Map<string, Annotation[]>();
   for (const row of rows) {
-    const list = out.get(row.start_day);
-    if (list) list.push(row);
-    else out.set(row.start_day, [row]);
+    const first = row.start_day > start_date ? row.start_day : start_date;
+    const last =
+      (row.end_day ?? row.start_day) < end_date ? (row.end_day ?? row.start_day) : end_date;
+    for (const day of enumerateDays(first, last)) {
+      const list = out.get(day);
+      if (list) list.push(row);
+      else out.set(day, [row]);
+    }
   }
   return out;
 }
@@ -368,7 +382,9 @@ export function registerTools(server: McpServer, opts: RegisterToolsOptions): vo
         );
         const wantAnnotations = include_annotations !== false;
         const annsByDay =
-          wantAnnotations && repo ? annotationsByDay(repo.list({ start_date, end_date })) : null;
+          wantAnnotations && repo
+            ? annotationsByDay(repo.list({ start_date, end_date }), start_date, end_date)
+            : null;
         return {
           range: { start_date, end_date },
           source,
@@ -479,18 +495,26 @@ export function registerTools(server: McpServer, opts: RegisterToolsOptions): vo
         const wantApi = !hrRepo || prefer === 'api';
         const wantLocal =
           hrRepo && (prefer === 'local' || prefer === 'auto' || prefer === undefined);
+        const localStart = canonicalDatetime(start_datetime);
+        const localEnd = canonicalDatetime(end_datetime);
 
         // Local-first read path. We reuse the local mirror when available and
         // the requested window is fully synced. Otherwise we fetch from API
         // (and upsert into local for next time).
         if (wantLocal && !wantApi) {
+          const minLocal = hrRepo.minTimestamp();
           const maxLocal = hrRepo.maxTimestamp();
-          // If local data covers the requested end (within ~1 hour), we can
-          // serve from cache. Otherwise fall back to API in 'auto'.
-          const localCovers = maxLocal !== null && maxLocal >= end_datetime.slice(0, 19);
+          // If local data covers both boundaries, we can serve from cache.
+          // Otherwise fall back to API in 'auto'. This avoids returning empty
+          // local results for old windows when only recent HR data has been synced.
+          const localCovers =
+            minLocal !== null &&
+            maxLocal !== null &&
+            Date.parse(minLocal) <= Date.parse(localStart) &&
+            Date.parse(maxLocal) >= Date.parse(localEnd);
           if (prefer === 'local' || localCovers) {
             if (verbose) {
-              const samples = hrRepo.listRange(start_datetime, end_datetime);
+              const samples = hrRepo.listRange(localStart, localEnd);
               return {
                 range: { start_datetime, end_datetime },
                 source: 'local',
@@ -499,7 +523,7 @@ export function registerTools(server: McpServer, opts: RegisterToolsOptions): vo
                 data: samples,
               };
             }
-            const summary = hrRepo.summarizeByHour(start_datetime, end_datetime);
+            const summary = hrRepo.summarizeByHour(localStart, localEnd);
             return {
               range: { start_datetime, end_datetime },
               source: 'local',
@@ -534,7 +558,7 @@ export function registerTools(server: McpServer, opts: RegisterToolsOptions): vo
         // is to read from local now that we just upserted there. Avoids
         // duplicating the SQL aggregation in JS.
         if (hrRepo) {
-          const summary = hrRepo.summarizeByHour(start_datetime, end_datetime);
+          const summary = hrRepo.summarizeByHour(localStart, localEnd);
           return {
             range: { start_datetime, end_datetime },
             source: 'api',
@@ -605,7 +629,7 @@ export function registerTools(server: McpServer, opts: RegisterToolsOptions): vo
         const wantAnnotations = include_annotations !== false;
         const annsByDay =
           wantAnnotations && repo
-            ? annotationsByDay(repo.list({ start_date: start, end_date: end }))
+            ? annotationsByDay(repo.list({ start_date: start, end_date: end }), start, end)
             : null;
         return {
           range: { start_date: start, end_date: end, days },
@@ -691,8 +715,8 @@ export function registerTools(server: McpServer, opts: RegisterToolsOptions): vo
 
       return handle(async () => {
         const [a, b] = await Promise.all([
-          fetchCompactDays(client, aStart, aEnd),
-          fetchCompactDays(client, bStart, bEnd),
+          fetchCompactDays(client, aStart, aEnd, daily),
+          fetchCompactDays(client, bStart, bEnd, daily),
         ]);
         const aAvg = periodAverages(a.days);
         const bAvg = periodAverages(b.days);

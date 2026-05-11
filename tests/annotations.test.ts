@@ -158,6 +158,20 @@ describe('AnnotationRepo.list', () => {
     expect(rows.map((r) => r.start_day)).toEqual(['2026-05-03', '2026-05-05']);
   });
 
+  it('includes rows whose multi-day span overlaps the requested range', () => {
+    repo.add({
+      tag_type_code: 'tag_generic_sick',
+      start_time: '2026-04-30T09:00:00Z',
+      end_time: '2026-05-04T18:00:00Z',
+      start_day: '2026-04-30',
+      end_day: '2026-05-04',
+      comment: 'cold',
+    });
+
+    const rows = repo.list({ start_date: '2026-05-02', end_date: '2026-05-02' });
+    expect(rows.map((r) => r.comment)).toEqual(['cold']);
+  });
+
   it('filters by tag_type_code', () => {
     const rows = repo.list({ tag_type_code: 'tag_sleep_alcohol' });
     expect(rows).toHaveLength(2);

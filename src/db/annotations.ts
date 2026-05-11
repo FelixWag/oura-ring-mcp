@@ -51,9 +51,9 @@ export interface UpdateAnnotationInput {
 }
 
 export interface ListAnnotationsFilter {
-  /** YYYY-MM-DD; matches rows whose start_day >= this value. */
+  /** YYYY-MM-DD; matches rows whose annotation span overlaps this date or later. */
   start_date?: string;
-  /** YYYY-MM-DD; matches rows whose start_day <= this value. */
+  /** YYYY-MM-DD; matches rows whose annotation span overlaps this date or earlier. */
   end_date?: string;
   tag_type_code?: string;
   source?: AnnotationSource;
@@ -208,7 +208,7 @@ export class AnnotationRepo {
       if (!DATE_RE.test(filter.start_date)) {
         throw new AnnotationValidationError('start_date must be YYYY-MM-DD.');
       }
-      where.push('start_day >= @start_date');
+      where.push('COALESCE(end_day, start_day) >= @start_date');
       params.start_date = filter.start_date;
     }
     if (filter.end_date !== undefined) {
