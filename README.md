@@ -1,6 +1,6 @@
 # oura-ring-mcp
 
-> Talk to your Oura Ring data through Claude. Local SQLite mirror, natural-language annotations, and MCP tools for actually asking questions about your health data.
+> Natural-language access to your Oura data through Claude. Local SQLite mirror, natural-language annotations, and MCP tools for actually asking questions about your health data.
 
 [![CI](https://github.com/FelixWag/oura-ring-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/FelixWag/oura-ring-mcp/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -10,45 +10,102 @@
 
 ![Demo: logging beers and asking Claude about next-day readiness recovery](docs/demo.gif)
 
-I built this because I wanted something more useful than another dashboard.
-Oura already captures sleep, readiness, activity, heart rate, stress, and tags.
-The missing piece is context: coffee, alcohol, illness, travel, late meals,
-hard training, bad sleep hygiene, or whatever else actually happened in life.
+Oura already tracks sleep, readiness, activity, heart rate, stress, and tags.
 
-`oura-ring-mcp` connects those worlds. It syncs your Oura data into a local
-SQLite database, lets an MCP client like Claude Code read it, and lets you log
-your own annotations in natural language:
+But the interesting questions are usually more personal:
+
+- "Does alcohol actually affect my readiness?"
+- "Do late coffees hurt my deep sleep?"
+- "Why has my energy been low lately?"
+- "How long do I take to recover after travel or hard workouts?"
+- "What changed on the nights where I slept really well?"
+
+`oura-ring-mcp` lets Claude analyze your Oura data locally through MCP, with your own annotations and context stored in SQLite.
+
+You can log things naturally:
 
 - "I had 2 beers Thursday from 7pm to midnight. Log it."
-- "Did my readiness drop after alcohol days?"
-- "Compare this week's sleep to last week."
-- "What was my heart rate during yesterday's workout?"
-- "My energy has been low lately. Anything in the data that explains it?"
+- "I was sick from Monday to Wednesday."
+- "Late coffee today at 4pm."
 
-Everything is local-first. After sync, most questions answer from your SQLite
-mirror instead of repeatedly hitting the Oura API.
+And then actually ask questions about the patterns behind your health data.
 
-> Sensitive data warning: this project works with personal health data. Tokens
-> and synced data are stored locally at `~/.config/oura-ring-mcp/` with `0600`
-> permissions and are never sent anywhere by this software except to
-> `api.ouraring.com` for Oura API requests. Your MCP client may see whatever
-> data you ask it to analyze.
+Everything is local-first. After sync, most queries run against your local SQLite mirror instead of repeatedly hitting the Oura API.
 
-## Why It Is Interesting
+> Sensitive data warning: this project works with personal health data. Tokens and synced data are stored locally at `~/.config/oura-ring-mcp/` with `0600` permissions and are never sent anywhere by this software except to `api.ouraring.com` for Oura API requests. Your MCP client may see whatever data you ask it to analyze.
 
-- **Local mirror of 15 Oura collections**: sleep, readiness, activity, SpO2,
-  stress, resilience, cardiovascular age, VO2 max, sleep time, sleep periods,
-  workouts, sessions, rest mode periods, enhanced tags, and heart rate.
-- **14 MCP tools** for raw reads, recent summaries, comparisons, trends,
-  heart-rate windows, annotation CRUD, tag reads, and sync.
-- **Natural-language context logging**: store your own local annotations for
-  things Oura cannot know.
-- **Correlation-friendly shape**: daily summaries can include overlapping
-  annotations by default, so an LLM sees metrics and context together.
-- **Privacy-first by design**: OAuth tokens and health data stay on your
-  machine; the Oura API remains read-only.
-- **Built to be hackable**: TypeScript, SQLite, zod validation, Vitest tests,
-  and a small codebase.
+---
+
+## Why I Built This
+
+I wanted something more useful than another dashboard.
+
+The raw metrics from Oura are already good. The missing piece is context:
+coffee, alcohol, illness, travel, late meals, stressful weeks, bad sleep hygiene, or whatever else was actually happening in life.
+
+This project gives an LLM memory for the things Oura does not capture. The result feels much closer to talking to a health journal than scrolling through charts.
+
+---
+
+## What It Does
+
+- Syncs your Oura data into a local SQLite database.
+- Exposes your data through MCP tools for Claude Code and other MCP clients.
+- Lets you store natural-language annotations locally.
+- Makes it easy to analyze trends, recovery, sleep, stress, workouts, and habits over time.
+- Keeps everything local-first and your MCP client may see whatever data you ask it to analyze..
+
+Currently supports:
+
+- sleep
+- readiness
+- activity
+- heart rate
+- stress
+- resilience
+- SpO2
+- VO2 max
+- cardiovascular age
+- sleep periods
+- workouts
+- sessions
+- rest mode periods
+- enhanced tags
+- local annotations
+
+---
+
+## Example Prompts
+
+### Sleep and recovery
+
+- "Show me my last 14 days of sleep, readiness, and activity."
+- "Which night this month had the worst sleep, and what changed?"
+- "How long did it take my resting heart rate to recover after my last alcohol day?"
+- "Walk me through last night's sleep periods and heart-rate pattern."
+
+### Trends and comparisons
+
+- "Compare this week's sleep to the previous week."
+- "Show my readiness rolling average over the last 60 days."
+- "Compare weekdays vs weekends for sleep score and bedtime."
+- "What is my VO2 max trajectory?"
+
+### Logging context
+
+- "I had 2 beers Thursday from 7pm to midnight. Log it."
+- "I was sick from Monday to Wednesday. Log a cold annotation."
+- "I had a late coffee today at 4pm. Log it."
+- "List all my alcohol annotations from the last 3 months."
+
+### The fun part
+
+- "Across my alcohol annotations, what usually happens to next-day readiness?"
+- "Is there a relationship between caffeine days and deep sleep?"
+- "Do hard workout days change my sleep or recovery?"
+- "My energy has been low lately. What patterns should I look at?"
+
+---
 
 ## Quick Start
 
@@ -83,8 +140,8 @@ That one command:
 
 1. writes your local `.env`,
 2. opens the Oura OAuth login,
-3. stores tokens at `~/.config/oura-ring-mcp/tokens.json`,
-4. syncs roughly the last 30 days into `~/.config/oura-ring-mcp/data.sqlite`.
+3. stores tokens locally,
+4. syncs your recent Oura history into SQLite.
 
 Want more history?
 
@@ -92,56 +149,72 @@ Want more history?
 npm run sync -- --since 240
 ```
 
-Backfills up to 730 days are supported. Larger windows are chunked internally
-to respect Oura's API limits.
+---
 
-### 4. Connect Claude Code
+## Connect Claude Code
 
 ```bash
 claude mcp add oura node "$(pwd)/dist/index.js"
 ```
 
-Restart Claude Code, run `/mcp`, and check that `oura` is listed. Then try:
+Restart Claude Code, run `/mcp`, and check that `oura` is listed.
+
+Then try:
 
 ```text
 Show me my last 7 days of Oura summaries with annotations.
 ```
 
-If a sync fails with a scope-related authorization error after upgrading,
-run `npm run oauth-login` again. Oura tokens only get new scopes after
-re-authorization.
+---
 
-## Example Prompts
+## Why Local-First Matters
 
-**Sleep and recovery**
+Health data is sensitive.
 
-- "Show me my last 14 days of sleep, readiness, and activity."
-- "Which night this month had the worst sleep, and what changed?"
-- "How long did it take my resting heart rate to recover after my last alcohol day?"
-- "Walk me through last night's sleep periods and heart-rate pattern."
+This project stores your synced data and annotations locally in SQLite instead of forwarding everything through another cloud service.
 
-**Trends and comparisons**
+After sync, most reads happen locally:
 
-- "Compare this week's sleep to the previous week."
-- "Show my readiness rolling average over the last 60 days."
-- "Compare weekdays vs weekends for sleep score and bedtime."
-- "What is my VO2 max trajectory?"
+- faster queries,
+- less API usage,
+- offline-friendly access,
+- easier experimentation,
+- and more privacy.
 
-**Logging context**
+The Oura API is read-only for user data. Local annotations intentionally stay local.
 
-- "I had 2 beers Thursday from 7pm to midnight. Log it."
-- "I was sick from Monday to Wednesday. Log a cold annotation."
-- "I had a late coffee today at 4pm. Log it."
-- "List all my alcohol annotations from the last 3 months."
+---
 
-**The fun part**
+## Development
 
-- "Across my alcohol annotations, what usually happens to next-day readiness?"
-- "Is there a relationship between caffeine days and deep sleep?"
-- "Do hard workout days change my sleep or recovery?"
-- "My energy has been low lately. What patterns should I look at?"
+```bash
+npm run dev
+npm test
+npm run typecheck
+npm run build
+```
 
-## Tools
+The stack is intentionally simple:
+
+- TypeScript
+- Node.js
+- SQLite
+- MCP SDK
+- zod
+- Vitest
+
+---
+
+## Security
+
+- Tokens and SQLite files use `0600` permissions.
+- `.env` and local databases are ignored by git.
+- SQL uses prepared statements.
+- No shell execution or arbitrary filesystem access.
+- The Oura API remains read-only.
+- This is not medical advice or a medical device.
+
+---
 
 ### Raw Access
 
@@ -206,30 +279,7 @@ Read preference for local-first tools:
 `.env` is loaded from the project root, even when an MCP host starts the
 binary from another working directory.
 
-## Development
-
-```bash
-npm run dev
-npm test
-npm run typecheck
-npm run format:check
-npm run build
-```
-
-The project intentionally uses a boring stack: TypeScript, Node.js, the
-official MCP SDK, `better-sqlite3`, zod, and Vitest.
-
-## Security
-
-- `.env`, token files, SQLite databases, and SQLite sidecar files are ignored.
-- Token and database files are written with `0600` permissions.
-- SQL uses prepared statements and parameter binding.
-- The MCP server exposes only the documented tools: no shell execution and no
-  arbitrary filesystem access.
-- The Oura API is read-only for user data. Local annotations write only to
-  your local SQLite database.
-- This is not a medical device and is not medical advice. It is a personal
-  analysis tool for your own data.
+---
 
 ## Troubleshooting
 
@@ -247,13 +297,7 @@ application settings, then run `npm run oauth-login` again.
 **Scope-related 401 during sync**  
 Run `npm run oauth-login` again so Oura grants the latest scope set.
 
-## Project Notes
-
-The detailed architectural history lives in [DECISIONS.md](DECISIONS.md), and
-release notes live in [CHANGELOG.md](CHANGELOG.md). The short version: this is
-local-first because health data is sensitive, SQLite because it is simple and
-fast, and annotations because context is what turns raw metrics into something
-an LLM can actually reason about.
+---
 
 ## License
 
