@@ -13,10 +13,11 @@ None by us. The software:
 - Stores annotations you add (illness, alcohol, travel, etc.) in a local
   SQLite database at `~/.config/oura-ring-mcp/data.sqlite` (file
   permissions `0600`).
-- From v0.4 onward, when you run `npm run sync` (or call the `oura_sync`
-  MCP tool), mirrors your daily Oura data (sleep, readiness, activity, spo2,
-  sleep periods, workouts, sessions, enhanced tags) into the same local
-  SQLite database. This data lives only on your machine.
+- When you run `npm run sync` (or call the `oura_sync` MCP tool), mirrors
+  Oura data into the same local SQLite database: sleep, readiness, activity,
+  SpO2, stress, resilience, cardiovascular age, VO2 max, sleep time, sleep
+  periods, workouts, sessions, rest mode periods, enhanced tags, and heart
+  rate. This data lives only on your machine.
 - Returns API responses, annotations, and locally-mirrored data to whichever
   MCP client you connected (e.g. Claude Code).
 

@@ -128,14 +128,15 @@ export class HeartrateRepo {
 
   /**
    * Raw samples in [start_datetime, end_datetime] inclusive. Sorted ascending.
-   * Datetimes compared as ISO 8601 strings — works because the format sorts
-   * lexicographically.
+   * Datetimes are compared via SQLite's unixepoch() so equivalent UTC forms
+   * (`Z` vs `+00:00`, optional milliseconds) match correctly.
    */
   listRange(start_datetime: string, end_datetime: string): HeartrateRow[] {
     const rows = this.db
       .prepare<unknown[], RawHeartrateRow>(
-        `SELECT * FROM heartrate WHERE timestamp BETWEEN ? AND ?
-            ORDER BY timestamp ASC, source ASC`,
+        `SELECT * FROM heartrate
+          WHERE unixepoch(timestamp) BETWEEN unixepoch(?) AND unixepoch(?)
+          ORDER BY unixepoch(timestamp) ASC, source ASC`,
       )
       .all(start_datetime, end_datetime);
     return rows.map(parse);
@@ -154,14 +155,14 @@ export class HeartrateRepo {
     return this.db
       .prepare<unknown[], HeartrateHourSummary>(
         `SELECT
-           substr(timestamp, 1, 13) || ':00:00Z' AS hour_start,
+           strftime('%Y-%m-%dT%H:00:00Z', timestamp) AS hour_start,
            source,
            ROUND(AVG(bpm), 1) AS bpm_avg,
            MIN(bpm)           AS bpm_min,
            MAX(bpm)           AS bpm_max,
            COUNT(*)           AS sample_count
          FROM heartrate
-         WHERE timestamp BETWEEN ? AND ?
+         WHERE unixepoch(timestamp) BETWEEN unixepoch(?) AND unixepoch(?)
          GROUP BY hour_start, source
          ORDER BY hour_start ASC, source ASC`,
       )
@@ -174,7 +175,21 @@ export class HeartrateRepo {
    */
   maxTimestamp(): string | null {
     const row = this.db
-      .prepare<unknown[], { ts: string | null }>('SELECT MAX(timestamp) AS ts FROM heartrate')
+      .prepare<
+        unknown[],
+        { ts: string | null }
+      >('SELECT timestamp AS ts FROM heartrate ORDER BY unixepoch(timestamp) DESC LIMIT 1')
+      .get();
+    return row?.ts ?? null;
+  }
+
+  /** Earliest timestamp stored, or null when empty. */
+  minTimestamp(): string | null {
+    const row = this.db
+      .prepare<
+        unknown[],
+        { ts: string | null }
+      >('SELECT timestamp AS ts FROM heartrate ORDER BY unixepoch(timestamp) ASC LIMIT 1')
       .get();
     return row?.ts ?? null;
   }

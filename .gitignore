@@ -77,6 +77,9 @@ tokens.json
 # Local SQLite databases (future v0.4)
 *.sqlite
 *.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite-*
 
 # Editor / OS
 .DS_Store
@@ -158,3 +161,8 @@ vite.config.ts.timestamp-*
 # Claude Code working dirs (not for public repo)
 .claude/
 CLAUDE.md
+
+# These files are for Codex
+AGENTS.md
+
+docs/README.md

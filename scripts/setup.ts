@@ -1,6 +1,6 @@
 #!/usr/bin/env tsx
 import { existsSync } from 'node:fs';
-import { copyFile, readFile, writeFile } from 'node:fs/promises';
+import { chmod, copyFile, readFile, writeFile } from 'node:fs/promises';
 import { createInterface } from 'node:readline/promises';
 import { stdin as input, stdout as output } from 'node:process';
 import { join } from 'node:path';
@@ -61,6 +61,7 @@ async function main(): Promise<void> {
     env.OURA_CLIENT_SECRET = clientSecret;
     env.OURA_REDIRECT_URI = redirectUri;
     await writeFile(ENV_PATH, serializeEnv(env), { mode: 0o600 });
+    await chmod(ENV_PATH, 0o600).catch(() => {});
     console.log(`\n  Wrote ${ENV_PATH}`);
   } finally {
     rl.close();

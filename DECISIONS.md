@@ -517,3 +517,30 @@ mirrors the API constraint so users don't hit confusing 400s on
 force-fresh queries. The empirical mapping table belongs in this log
 because future timeseries additions (IBI, ring_battery_level) will
 likely need their own caps too — and the OpenAPI spec won't tell us.
+
+---
+
+## 2026-05-11 — Public-launch polish and local-first correctness fixes
+
+**Context.** Pre-publication review found a few issues that would undermine the
+project's GitHub launch story: `.env` permissions could remain too broad after
+copying from `.env.example`; multi-day annotations only appeared on their start
+day in summary joins; `oura_compare_periods` bypassed the local mirror; and
+heart-rate auto reads could return empty local results for older unsynced
+windows if recent heart-rate data existed. The README also carried stale
+version-era details and referenced a not-yet-captured demo GIF.
+
+**Decision.** Tighten `.env` permissions with an explicit chmod, make annotation
+date filters and summary joins use span overlap, route period comparisons
+through the daily repos, require heart-rate local reads to cover both requested
+boundaries before serving from cache, and update README / docs / privacy copy
+for public launch. Keep `DECISIONS.md` public because it contains no sensitive
+data and helps explain why the project is designed around local-first storage,
+read-only Oura API access, and local annotations.
+
+**Rationale.** These changes make the public promise match the actual behavior:
+health data stays local, annotations are useful for correlation prompts, and
+the README sells the current product instead of narrating every past version.
+The demo guidance stays focused on the strongest story — natural-language
+context logging followed by recovery analysis — while avoiding accidental
+exposure of raw personal data.
