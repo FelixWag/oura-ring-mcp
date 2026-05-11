@@ -169,8 +169,6 @@ Show me my last 7 days of Oura summaries with annotations.
 
 ## Why Local-First Matters
 
-Health data is sensitive.
-
 This project stores your synced data and annotations locally in SQLite instead of forwarding everything through another cloud service.
 
 After sync, most reads happen locally:
