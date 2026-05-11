@@ -22,10 +22,10 @@ mirror.
 - _"Compare my sleep this week to last week and tell me what changed."_
 - _"What was my heart rate during yesterday's workout?"_
 - _"Show me my resilience trend over the past month."_
-- _"My energy has been low lately — anything in the data that explains it?"_
+- _"My energy has been low lately - anything in the data that explains it?"_
 
 Everything answers locally from your synced mirror — no rate limits, no
-re-fetching, no privacy concerns. Multi-month analysis is one prompt away.
+re-fetching. Multi-month analysis is one prompt away.
 
 > **Sensitive data warning**: this tool reads personal health data. Tokens and
 > data are stored locally at `~/.config/oura-ring-mcp/` with `0600` permissions
@@ -46,9 +46,6 @@ re-fetching, no privacy concerns. Multi-month analysis is one prompt away.
 - 🏷️ **Tags + annotations** — read Oura's tags, log your own (illness,
   alcohol, travel, etc.) in a schema that mirrors Oura's `EnhancedTagModel`
   so both data sources query uniformly.
-- 🔐 **OAuth2 with auto-refresh**, 429 / Retry-After handling, scope-aware
-  401 hints. Tokens stored with `0600` perms.
-- 🧪 **Tested** — 103 unit + integration tests on Node 20 / 22 / 24.
 - 📜 **TypeScript**, MIT licensed.
 
 ## Quick start (~5 minutes)
@@ -160,8 +157,8 @@ connecting the server.
 
 ### Logging context
 
-- _"I had 4 beers Thursday from 6pm to midnight. Log it."_
-- _"I was sick from Monday to Wednesday — log a cold annotation across those days."_
+- _"I had 2 beers Thursday from 6pm to midnight. Log it."_
+- _"I was sick from Monday to Wednesday - log a cold annotation across those days."_
 - _"List all my alcohol annotations from the past 3 months and group them by day of the week."_
 
 ### Causal-ish reasoning (the killer feature)
