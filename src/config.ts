@@ -1,6 +1,21 @@
 import { homedir } from 'node:os';
-import { join } from 'node:path';
-import 'dotenv/config';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { config as loadDotenv } from 'dotenv';
+
+// Load .env relative to the compiled binary, not process.cwd(). This matters
+// because Claude Code (and any other MCP host) spawns the server with its
+// own working directory, which is almost never the project directory — so
+// `import 'dotenv/config'` would silently load nothing and the user would
+// see "Missing OURA_CLIENT_ID" even though their .env file exists.
+//
+// Layout: this file compiles to dist/config.js, so `..` from there is the
+// project root. Source-mode (`tsx src/...`) hits src/, so we also try the
+// parent of src/. Either way: walk up one directory from where we are.
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+const projectRoot = join(__dirname, '..');
+loadDotenv({ path: join(projectRoot, '.env'), quiet: true });
 
 export interface Config {
   clientId: string;

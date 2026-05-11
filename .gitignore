@@ -154,3 +154,7 @@ dist
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 .vite/
+
+# Claude Code working dirs (not for public repo)
+.claude/
+CLAUDE.md

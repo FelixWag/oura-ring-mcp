@@ -6,6 +6,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 For the architectural rationale behind each change, see [DECISIONS.md](DECISIONS.md).
 
+## [0.5.1] — 2026-05-11
+
+### Fixed
+
+- **Critical: `.env` is now loaded relative to the binary's location, not
+  `process.cwd()`.** Previously, when Claude Code (or any MCP host) spawned
+  the server with a cwd outside the project directory, dotenv silently
+  loaded nothing and the server died with "Missing OURA_CLIENT_ID" — even
+  though `.env` existed. Every fresh user was blocked by this; thanks to
+  the early adopters who flagged it.
+- dotenv loads with `quiet: true` so its boot banner doesn't pollute stderr.
+
+### Added
+
+- `package.json` metadata fields (`author`, `repository`, `bugs`, `homepage`)
+  for proper GitHub-side rendering and discoverability.
+- Expanded demo-capture instructions in `docs/README.md` with a basic →
+  impressive prompt progression.
+
+### Removed
+
+- `CLAUDE.md` (internal AI-assistant instructions; not useful for end
+  users). Added to `.gitignore` along with `.claude/`.
+
 ## [0.5.0] — 2026-05-10
 
 ### Added
