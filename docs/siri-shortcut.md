@@ -99,14 +99,14 @@ Note the address (e.g. `100.x.y.z`).
 Open the **Shortcuts** app on your iPhone → tap **+** to create a new
 Shortcut. Add the following actions in order:
 
-| #   | Action                           | Configuration                                                                                                                                                                                                                                                                                                                                                                                                             |
-| --- | -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 1   | **Dictate Text**                 | Language: English (or yours). Stop Listening: After Pause.                                                                                                                                                                                                                                                                                                                                                                |
-| 2   | **Current Date**                 | (no config) — this becomes `captured_at`                                                                                                                                                                                                                                                                                                                                                                                  |
-| 3   | **Get Current Time Zone**        | Return: Name — this becomes `timezone` (e.g. `Europe/Berlin`)                                                                                                                                                                                                                                                                                                                                                             |
-| 4   | **Get Contents of URL**          | URL: `http://100.x.y.z:8770/v1/log` (your Tailscale IP) <br/> Method: **POST** <br/> Headers: <br/> `Authorization: Bearer <your-VOICE_LOG_TOKEN>` <br/> `Content-Type: application/json` <br/> Request Body: **JSON** with fields: <br/> `text` → Dictated Text (from step 1) <br/> `captured_at` → Current Date (from step 2), formatted as ISO 8601 <br/> `timezone` → Time Zone (from step 3) <br/> `source` → `siri` |
-| 5   | **Get Dictionary Value**         | Get value for key `claude_summary` from previous step                                                                                                                                                                                                                                                                                                                                                                     |
-| 6   | **Show Notification** (optional) | Title: `Oura voice log` <br/> Body: Dictionary Value from step 5                                                                                                                                                                                                                                                                                                                                                          |
+| #   | Action                           | Configuration                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| --- | -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | **Dictate Text**                 | Language: English (or yours). Stop Listening: After Pause.                                                                                                                                                                                                                                                                                                                                                                                  |
+| 2   | **Current Date**                 | (no config) — this becomes `captured_at`                                                                                                                                                                                                                                                                                                                                                                                                    |
+| 3   | **Format Date**                  | Date: **Current Date** (variable from step 2). Date Format: **Custom**. Format String: `VV` → outputs the IANA timezone identifier, e.g. `Europe/Berlin` or `America/New_York`. Rename the output variable to **Timezone** for clarity. _(There is no standalone "Get Current Time Zone" action in iOS Shortcuts; the ICU pattern `VV` is the cleanest way to get the IANA name from the iPhone's current locale.)_                         |
+| 4   | **Get Contents of URL**          | URL: `http://100.x.y.z:8770/v1/log` (your Tailscale IP) <br/> Method: **POST** <br/> Headers: <br/> `Authorization: Bearer <your-VOICE_LOG_TOKEN>` <br/> `Content-Type: application/json` <br/> Request Body: **JSON** with fields: <br/> `text` → Dictated Text (from step 1) <br/> `captured_at` → Current Date (from step 2), formatted as ISO 8601 <br/> `timezone` → Timezone (the Formatted Date from step 3) <br/> `source` → `siri` |
+| 5   | **Get Dictionary Value**         | Get value for key `claude_summary` from previous step                                                                                                                                                                                                                                                                                                                                                                                       |
+| 6   | **Show Notification** (optional) | Title: `Oura voice log` <br/> Body: Dictionary Value from step 5                                                                                                                                                                                                                                                                                                                                                                            |
 
 Save the shortcut as something like **"Log to Oura"**.
 
@@ -114,6 +114,22 @@ Save the shortcut as something like **"Log to Oura"**.
 > action, when you reference the date, tap the variable → choose
 > **Format Date** → set to **ISO 8601** (with milliseconds). This
 > ensures the server's parser accepts it.
+
+> **Why `VV` for the timezone**: iOS Shortcuts doesn't have a "Get Current
+> Time Zone" action, but the **Format Date** action speaks
+> [Unicode ICU date patterns](https://www.unicode.org/reports/tr35/tr35-dates.html#dfst-zone).
+> `VV` is the "time zone ID" pattern — it returns the iPhone's current
+> IANA name (`Europe/Berlin`, `America/New_York`, `Asia/Tokyo`, …),
+> exactly what the server expects. The format string is case-sensitive:
+> `VV` works, `vv` does not.
+>
+> **Fallbacks if `VV` ever misbehaves** (e.g. on a very old iOS):
+>
+> - Replace step 3 with a **Text** action containing the literal
+>   `Europe/Berlin` (or your home tz). Works fine until you travel.
+> - Omit the `timezone` field from the JSON body entirely; the server
+>   falls back to the Mac mini's system TZ — also fine until you travel,
+>   because the mini stays on home time while you're in another country.
 
 ## 5. Wire up Siri
 
