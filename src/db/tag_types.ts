@@ -59,6 +59,7 @@ export const TAG_SLEEP_CODES = [
   'tag_sleep_alcohol', // ✓
   'tag_sleep_latemeal', // ✓ ("late_meal" — collapsed)
   'tag_sleep_late_screentime', // ✓ ("late_screen_time" — partial collapse)
+  'tag_sleep_latework', // ✓ ("late_work" — collapsed)
   'tag_sleep_sauna', // ✓
   'tag_sleep_stress', // ✓
 

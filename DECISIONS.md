@@ -547,6 +547,24 @@ exposure of raw personal data.
 
 ---
 
+## 2026-05-19 — Promote observed `tag_sleep_latework` code
+
+**Context.** A real 240-day Oura sync discovered `tag_sleep_latework` as an
+enhanced-tag `tag_type_code` that was not in the static seed list. The dynamic
+`discovered_tag_types` table already accepted it locally, but fresh installs
+would not know the code until after syncing a matching historical tag.
+
+**Decision.** Add `tag_sleep_latework` to `TAG_SLEEP_CODES` and mark it as
+observed. Keep the previously inferred `tag_sleep_late_work` entry for now so
+any local annotations created with the inferred spelling still validate.
+
+**Rationale.** Observed Oura API data is higher confidence than inferred naming
+patterns. Promoting the code improves fresh-install behavior and keeps the
+static seed list aligned with real enhanced-tag values while preserving
+backward compatibility.
+
+---
+
 ## 2026-05-19 — v0.6: voice ingestion via headless Claude Agent
 
 **Context.** v0.6 needed a way to log annotations by voice without
