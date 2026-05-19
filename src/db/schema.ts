@@ -315,6 +315,45 @@ const MIGRATIONS: readonly Migration[] = [
       CREATE INDEX IF NOT EXISTS idx_heartrate_synced    ON heartrate(last_synced_at);
     `,
   },
+  {
+    version: 6,
+    // v0.6: voice ingestion.
+    //
+    // The voice server accepts dictated text from an iPhone Siri Shortcut,
+    // forwards it to a headless Claude Agent SDK session, and Claude calls
+    // oura_add_annotation N times to extract structured annotations.
+    //
+    // Each request creates ONE row in `voice_logs` capturing the raw text +
+    // metadata. Each extracted annotation gets a FK back to that voice_log
+    // (NULL when source != voice). This gives us a clean audit trail
+    // ("which voice note produced this annotation?") without duplicating
+    // the dictation across N annotations' comment fields.
+    //
+    // No CHECK constraint changes on `annotations.source`: voice-extracted
+    // annotations are still `source='local'` — the FK + raw text in
+    // voice_logs is what distinguishes them.
+    name: 'v0.6: voice_logs + annotations.voice_log_id FK',
+    sql: `
+      CREATE TABLE IF NOT EXISTS voice_logs (
+        id                INTEGER PRIMARY KEY AUTOINCREMENT,
+        raw_text          TEXT NOT NULL,
+        source            TEXT NOT NULL,       -- e.g. 'siri'
+        captured_at       TEXT NOT NULL,       -- ISO 8601 from the iPhone
+        timezone          TEXT,                -- IANA name from the iPhone, e.g. 'Europe/Berlin'
+        received_at       TEXT NOT NULL,       -- ISO 8601 when the server received it
+        finished_at       TEXT,                -- ISO 8601 when the agent finished
+        ok                INTEGER,             -- 1 = success, 0 = agent error, NULL = in progress
+        error             TEXT,                -- truncated error string if ok=0
+        annotation_count  INTEGER,             -- number of annotations the agent created
+        claude_summary    TEXT,                -- short human-readable summary for the Siri banner
+        duration_ms       INTEGER
+      );
+      CREATE INDEX IF NOT EXISTS idx_voice_logs_received_at ON voice_logs(received_at);
+
+      ALTER TABLE annotations ADD COLUMN voice_log_id INTEGER REFERENCES voice_logs(id);
+      CREATE INDEX IF NOT EXISTS idx_annotations_voice_log_id ON annotations(voice_log_id);
+    `,
+  },
 ];
 
 export function currentSchemaVersion(db: Database): number {

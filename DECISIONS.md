@@ -544,3 +544,67 @@ the README sells the current product instead of narrating every past version.
 The demo guidance stays focused on the strongest story — natural-language
 context logging followed by recovery analysis — while avoiding accidental
 exposure of raw personal data.
+
+---
+
+## 2026-05-19 — v0.6: voice ingestion via headless Claude Agent
+
+**Context.** v0.6 needed a way to log annotations by voice without
+re-implementing extraction logic on-device. The natural fit was to let
+Claude do the extraction — same model, same MCP server, same tools as a
+normal Claude Code session.
+
+**Decision.** A small Express server on a Mac mini accepts a POSTed
+transcript from an iOS Siri Shortcut and spawns a headless Claude Agent
+via `@anthropic-ai/claude-agent-sdk`. The agent reuses the project's MCP
+server (`dist/index.js`) over stdio and is restricted to a fixed
+allowlist of `mcp__oura__*` tools via the SDK's `canUseTool` hook.
+
+**Rationale.** Three things had to be cheap and safe: (1) reusing the
+existing annotation tool (no duplicate write path), (2) running without
+an Anthropic API key by letting the SDK read the user's Claude Code
+subscription credentials from `~/.claude/`, and (3) hard-capping the
+agent's blast radius. `canUseTool` gives a clean allowlist without
+disabling permissions wholesale (`--dangerously-skip-permissions` was
+explicitly avoided). The Shortcut sends both `captured_at` and the
+iPhone's current `timezone`, which the system prompt resolves to a local
+date/time so phrases like "this morning" still work when traveling.
+
+---
+
+## 2026-05-19 — `voice_logs` table + time-window FK linkage
+
+**Context.** Each voice request can produce zero or many annotations, and
+we wanted provenance ("which voice note created this row?") without
+parsing every tool result the agent emits.
+
+**Decision.** Added a `voice_logs` table (raw transcript, capture
+metadata, agent outcome, duration) and a nullable `annotations.voice_log_id`
+FK. After the agent finishes, the server runs a single
+`UPDATE annotations SET voice_log_id = ? WHERE voice_log_id IS NULL AND
+source = 'local' AND created_at BETWEEN started_at AND finished_at` to
+link any rows the agent created during its run.
+
+**Rationale.** Voice runs are sequential per voice_log (the dedupe
+window prevents overlap in normal use), so a time-window UPDATE is both
+sufficient and order-independent — and far simpler than threading
+context through every tool call. `source` stays `'local'` (no new value
+to migrate); the FK is what distinguishes voice-extracted rows.
+
+---
+
+## 2026-05-19 — Tailscale + bearer token as the only network boundary
+
+**Context.** The voice server has to be reachable from the iPhone over
+the cellular network, but exposing an LLM-backed write endpoint to the
+public internet would be reckless.
+
+**Decision.** The server binds `0.0.0.0:8770` but the deployment story
+requires Tailscale on both ends and a bearer token (`VOICE_LOG_TOKEN`)
+in `Authorization`. No reverse-proxy, no port-forward, no public DNS.
+README and `docs/siri-shortcut.md` are explicit about this.
+
+**Rationale.** Tailscale gives identity-bound encrypted transport for
+free; the bearer token is defense-in-depth in case another tailnet
+device is compromised. Anything fancier (mTLS, OIDC) is overkill for a
+single-user setup and would block adoption.
