@@ -167,6 +167,44 @@ Show me my last 7 days of Oura summaries with annotations.
 
 ---
 
+## Voice Logging via Siri (v0.6)
+
+Talk to Siri, describe your day, and have a headless Claude agent extract
+structured annotations into your local SQLite database.
+
+```text
+👤 "Hey Siri, log my day."
+👤 "Two coffees this morning, cycled 11k, felt tired in the afternoon."
+📱 Banner: "Logged 3: tag_generic_coffee, tag_generic_workout, tag_generic_tired"
+```
+
+How it works:
+
+1. iOS Shortcut dictates text and POSTs it (with `captured_at` + `timezone`)
+   to a tiny Express server running on a Mac mini.
+2. The server spawns a headless Claude Agent (using your Claude Code
+   subscription credentials from `~/.claude/`) with a tool allowlist that
+   permits only `oura_add_annotation` and read-only `oura_get_*` tools.
+3. The agent extracts one tool call per distinct event and writes them into
+   the same local SQLite as your manual annotations, linked back to a
+   `voice_logs` row for provenance.
+
+Run it:
+
+```bash
+echo "VOICE_LOG_TOKEN=$(openssl rand -hex 32)" >> .env
+npm run build
+npm run voice-server
+```
+
+The server binds to `0.0.0.0:8770`. Bearer token + Tailscale is the
+security boundary — **do not expose this port to the public internet.**
+
+Full setup (iOS Shortcut steps, Tailscale, troubleshooting):
+[`docs/siri-shortcut.md`](docs/siri-shortcut.md).
+
+---
+
 ## Why Local-First Matters
 
 This project stores your synced data and annotations locally in SQLite instead of forwarding everything through another cloud service.
@@ -265,14 +303,19 @@ Read preference for local-first tools:
 
 ## Configuration
 
-| Variable             | Default                               | Purpose                                      |
-| -------------------- | ------------------------------------- | -------------------------------------------- |
-| `OURA_CLIENT_ID`     | -                                     | Required. From your Oura OAuth app.          |
-| `OURA_CLIENT_SECRET` | -                                     | Required. From your Oura OAuth app.          |
-| `OURA_REDIRECT_URI`  | `http://127.0.0.1:8765/callback`      | Must match your Oura app exactly.            |
-| `OURA_TOKEN_PATH`    | `~/.config/oura-ring-mcp/tokens.json` | OAuth token file.                            |
-| `OURA_DB_PATH`       | `~/.config/oura-ring-mcp/data.sqlite` | SQLite database for synced data/annotations. |
-| `OURA_DEBUG`         | unset                                 | Set to `1` for verbose stderr logs.          |
+| Variable              | Default                               | Purpose                                                                        |
+| --------------------- | ------------------------------------- | ------------------------------------------------------------------------------ |
+| `OURA_CLIENT_ID`      | -                                     | Required. From your Oura OAuth app.                                            |
+| `OURA_CLIENT_SECRET`  | -                                     | Required. From your Oura OAuth app.                                            |
+| `OURA_REDIRECT_URI`   | `http://127.0.0.1:8765/callback`      | Must match your Oura app exactly.                                              |
+| `OURA_TOKEN_PATH`     | `~/.config/oura-ring-mcp/tokens.json` | OAuth token file.                                                              |
+| `OURA_DB_PATH`        | `~/.config/oura-ring-mcp/data.sqlite` | SQLite database for synced data/annotations.                                   |
+| `OURA_DEBUG`          | unset                                 | Set to `1` for verbose stderr logs.                                            |
+| `VOICE_LOG_TOKEN`     | -                                     | Required for `npm run voice-server`. Bearer token the Siri Shortcut must send. |
+| `OURA_VOICE_PORT`     | `8770`                                | Port the voice server listens on.                                              |
+| `OURA_VOICE_LOG_PATH` | `<repo>/logs/voice.log`               | Append-only activity log for voice ingestion.                                  |
+| `OURA_MCP_ENTRY_PATH` | `<repo>/dist/index.js`                | MCP server entry the voice agent spawns.                                       |
+| `OURA_VOICE_MODEL`    | unset (SDK default)                   | Optional model override for the voice agent.                                   |
 
 `.env` is loaded from the project root, even when an MCP host starts the
 binary from another working directory.

@@ -6,6 +6,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 For the architectural rationale behind each change, see [DECISIONS.md](DECISIONS.md).
 
+## [0.6.0] — 2026-05-19
+
+### Added
+
+- **Voice logging via Siri Shortcut.** New `npm run voice-server` (Express
+  on `0.0.0.0:8770`) accepts `POST /v1/log` with `{ text, captured_at,
+timezone, source }`, runs a headless Claude Agent under the user's
+  Claude Code subscription credentials (`~/.claude/`), and lets the agent
+  call `oura_add_annotation` (and read-only `oura_get_*`) over the same
+  local MCP server. One Shortcut, one tap, structured annotations land in
+  SQLite. Setup guide: [`docs/siri-shortcut.md`](docs/siri-shortcut.md).
+- **`voice_logs` table** with provenance (`raw_text`, `captured_at`,
+  `timezone`, `ok`, `error`, `annotation_count`, `claude_summary`,
+  `duration_ms`) plus an `annotations.voice_log_id` FK. Annotations
+  created during a voice run are linked back via a time-window UPDATE
+  after the agent finishes — no parsing of individual tool results
+  required.
+- **Tool allowlist for the voice agent.** The Claude Agent SDK's
+  `canUseTool` hook denies anything outside a fixed set of `mcp__oura__*`
+  tool names, so even with a misbehaving model the blast radius is
+  bounded.
+- **In-memory dedupe** (`SHA-256(text||captured_at)`, 60s TTL) so a
+  double-tap on the Shortcut doesn't write the same annotations twice.
+- **Travel-aware time context.** The Shortcut sends the iPhone's current
+  `timezone`; the system prompt computes the local date and time-of-day
+  via `Intl.DateTimeFormat` so "this morning" resolves correctly when
+  you're abroad.
+- 23 new tests (`tests/voice.test.ts`) covering auth, validation, dedupe,
+  agent invocation, log appending, and the system-prompt builder.
+
+### Changed
+
+- Bumped MCP server version to `0.6.0`.
+- `.env.example` gained a v0.6 section (`VOICE_LOG_TOKEN`,
+  `OURA_VOICE_PORT`, `OURA_VOICE_LOG_PATH`, `OURA_VOICE_MODEL`,
+  `OURA_MCP_ENTRY_PATH`).
+- `logs/` is gitignored so voice activity logs stay local-only.
+
+### Security
+
+- The voice server has no public-internet story by design. Bearer token
+  (`VOICE_LOG_TOKEN`) + Tailscale identity-based VPN is the boundary;
+  the README and Siri setup doc are explicit about not port-forwarding.
+- The voice agent runs **without** `--dangerously-skip-permissions`; the
+  `canUseTool` allowlist is the sandbox.
+
 ## [0.5.1] — 2026-05-11
 
 ### Fixed

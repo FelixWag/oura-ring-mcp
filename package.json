@@ -1,6 +1,6 @@
 {
   "name": "oura-ring-mcp",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "description": "A Model Context Protocol server that lets Claude Code (and any MCP client) query your Oura Ring data through the official Oura API v2.",
   "type": "module",
   "bin": {
@@ -20,6 +20,7 @@
     "oauth-login": "tsx scripts/oauth-login.ts",
     "sync": "tsx scripts/sync.ts",
     "init": "npm run setup && npm run oauth-login && npm run sync",
+    "voice-server": "tsx src/voice/server.ts",
     "test": "vitest run",
     "test:watch": "vitest",
     "format": "prettier --write .",
@@ -56,15 +57,20 @@
     "node": ">=20"
   },
   "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.144",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "better-sqlite3": "^12.9.0",
     "dotenv": "^17.4.2",
+    "express": "^5.2.1",
     "zod": "^4.4.3"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
+    "@types/express": "^5.0.6",
     "@types/node": "^22.0.0",
+    "@types/supertest": "^7.2.0",
     "prettier": "^3.8.3",
+    "supertest": "^7.2.2",
     "tsx": "^4.21.0",
     "typescript": "^5.6.0",
     "vitest": "^4.1.5"

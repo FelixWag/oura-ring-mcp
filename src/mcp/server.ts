@@ -22,7 +22,7 @@ export interface CreateServerOptions {
 export function createServer(opts: CreateServerOptions): McpServer {
   const server = new McpServer({
     name: 'oura-ring-mcp',
-    version: '0.5.1',
+    version: '0.6.0',
   });
   registerTools(server, opts);
   return server;
