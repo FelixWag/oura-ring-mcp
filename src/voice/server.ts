@@ -11,8 +11,8 @@
  * internet exposure. See README and docs/siri-shortcut.md for setup.
  */
 
-import { mkdir, appendFile } from 'node:fs/promises';
-import { dirname } from 'node:path';
+import { mkdir, appendFile, writeFile } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import express, { type Request, type Response, type NextFunction } from 'express';
 import { loadConfig, loadVoiceConfig, type VoiceConfig } from '../config.js';
@@ -57,7 +57,10 @@ export function buildVoiceApp(deps: VoiceServerDeps): express.Express {
     });
 
   const app = express();
-  app.use(express.json({ limit: '16kb' }));
+  // 16kb is plenty for voice transcripts; HealthKit batches can be much
+  // larger (hundreds of samples per import). Use a single generous limit
+  // for the whole app — JSON-only, so the upper bound is what matters.
+  app.use(express.json({ limit: '2mb' }));
 
   // Bearer-token middleware — applied per route since we want /healthz to
   // remain auth-free for liveness checks (no body, just "is the server up").
@@ -182,6 +185,48 @@ export function buildVoiceApp(deps: VoiceServerDeps): express.Express {
       repo.finishError(voice_log_id, msg, Date.now() - t0);
       await appendLog(`${new Date().toISOString()}  voice_log=${voice_log_id}  EXCEPTION  ${msg}`);
       res.status(500).json({ ok: false, voice_log_id, error: msg });
+    }
+  });
+
+  // ── Health debug endpoint (v0.7 inspector) ─────────────────────────
+  // Throwaway probe used to capture raw payloads from the iOS "Find
+  // Health Samples" Shortcut so we can design the real schema against
+  // real data. Writes the body verbatim to a timestamped file under the
+  // same dir as voice.log. Reuses the bearer token; no validation, no
+  // schema. Delete this route once health_samples is wired up.
+  app.post('/v1/health/debug', requireAuth, async (req, res) => {
+    const body = req.body ?? null;
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const filename = `health-debug-${stamp}.json`;
+    const filepath = join(dirname(voiceConfig.logPath), filename);
+
+    try {
+      await mkdir(dirname(filepath), { recursive: true });
+      const payload = JSON.stringify(body, null, 2);
+      await writeFile(filepath, payload, 'utf8');
+
+      // Summarize what we got so the iPhone shows something useful in Quick Look.
+      let topLevel: string;
+      let count: number | null = null;
+      if (Array.isArray(body)) {
+        topLevel = 'array';
+        count = body.length;
+      } else if (body !== null && typeof body === 'object') {
+        topLevel = 'object';
+        count = Object.keys(body as Record<string, unknown>).length;
+      } else {
+        topLevel = typeof body;
+      }
+
+      res.json({
+        ok: true,
+        saved_to: filepath,
+        bytes: Buffer.byteLength(payload, 'utf8'),
+        top_level: topLevel,
+        count,
+      });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: (err as Error).message });
     }
   });
 
