@@ -46,6 +46,25 @@ export interface VoiceConfig {
   model?: string;
 }
 
+export interface HealthConfig {
+  /**
+   * Shared secret the iOS Shortcut (or Health Auto Export) includes as
+   * `Authorization: Bearer <token>` when POSTing to /v1/health/import.
+   *
+   * Separate from `VOICE_LOG_TOKEN` so the two can be rotated independently
+   * — e.g. swap the iOS Shortcut's token without invalidating the voice
+   * flow, or the other way around.
+   */
+  token: string;
+  /** TCP port the health server binds to. Default 8771. */
+  port: number;
+  /**
+   * Append-only activity log for /v1/health/import. Defaults to
+   * `./logs/health.log` relative to the project root.
+   */
+  logPath: string;
+}
+
 export const OURA_AUTH_URL = 'https://cloud.ouraring.com/oauth/authorize';
 export const OURA_TOKEN_URL = 'https://api.ouraring.com/oauth/token';
 export const OURA_API_BASE = 'https://api.ouraring.com/v2';
@@ -95,6 +114,11 @@ export function defaultDbPath(): string {
  */
 export function defaultVoiceLogPath(): string {
   return join(projectRoot, 'logs', 'voice.log');
+}
+
+/** Default health activity log path: ./logs/health.log under the project root. */
+export function defaultHealthLogPath(): string {
+  return join(projectRoot, 'logs', 'health.log');
 }
 
 /**
@@ -149,4 +173,24 @@ export function loadVoiceConfig(): VoiceConfig {
   }
 
   return { token, port, logPath, mcpEntryPath, model };
+}
+
+export function loadHealthConfig(): HealthConfig {
+  const token = process.env.HEALTH_IMPORT_TOKEN?.trim() ?? '';
+  const portRaw = process.env.OURA_HEALTH_PORT?.trim();
+  const port = portRaw ? Number(portRaw) : 8771;
+  const logPath = process.env.OURA_HEALTH_LOG_PATH?.trim() || defaultHealthLogPath();
+
+  if (!token) {
+    throw new ConfigError(
+      'Missing HEALTH_IMPORT_TOKEN. Generate a random string (e.g. `openssl rand -hex 32`) ' +
+        'and add it to your .env. This is distinct from VOICE_LOG_TOKEN so the two can be ' +
+        'rotated independently.',
+    );
+  }
+  if (!Number.isFinite(port) || port < 1 || port > 65_535) {
+    throw new ConfigError(`OURA_HEALTH_PORT must be a valid TCP port; got "${portRaw}".`);
+  }
+
+  return { token, port, logPath };
 }

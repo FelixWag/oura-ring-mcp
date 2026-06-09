@@ -6,6 +6,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 For the architectural rationale behind each change, see [DECISIONS.md](DECISIONS.md).
 
+## [0.7.0] — 2026-06-08
+
+### Added
+
+- **Apple Health import via iOS Shortcut.** New `npm run health-server`
+  (Express on `0.0.0.0:8771`) accepts `POST /v1/health/import` with a
+  batch of HealthKit samples from an iOS Shortcut and writes them into
+  a new generic `health_samples` SQLite table. Same shape works for
+  nutrition (`dietary_energy_consumed`, `dietary_protein`, …), activity
+  (`steps`, `active_energy_burned`), body composition (`body_mass`),
+  or anything else iOS apps write to Apple Health. Setup guide:
+  [`docs/apple-health.md`](docs/apple-health.md).
+- **`health_samples` table** (schema migration v7) with a composite
+  `UNIQUE(sample_type, start_time, source_name, value)` for idempotent
+  re-imports. Raw per-sample JSON envelope preserved in a `raw` column
+  for lossless re-shaping later.
+- **`HealthSamplesRepo`** with `insertBatch()` (single-transaction
+  `INSERT OR IGNORE`), `recentByType()`, `countAll()`.
+- **Forgiving request parser.** The endpoint accepts four body shapes
+  (proper JSON array, `{samples: [...]}` wrapped array, `{samples:
+"<NDJSON>"}` stringified accumulation, or a single sample dict) to
+  paper over how iOS Shortcuts serializes lists-of-dictionaries
+  inconsistently across iOS versions.
+- 25 new tests (`tests/health-import.test.ts`) covering auth, all four
+  body shapes, validation + coercion, dedup, log appending.
+- New `.env.example` section documenting `HEALTH_IMPORT_TOKEN`,
+  `OURA_HEALTH_PORT`, `OURA_HEALTH_LOG_PATH`.
+
+### Changed
+
+- Bumped MCP server version to `0.7.0`.
+- The voice server and health server are **separate processes on
+  separate ports** with **separate bearer tokens** by design — restart
+  or rotate either independently.
+
+### Security
+
+- `HEALTH_IMPORT_TOKEN` is distinct from `VOICE_LOG_TOKEN`. Same
+  defense-in-depth posture as v0.6: bearer token + Tailscale, no
+  public-internet story.
+
 ## [0.6.0] — 2026-05-19
 
 ### Added
