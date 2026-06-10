@@ -58,6 +58,37 @@ export function buildHealthApp(deps: HealthServerDeps): express.Express {
     res.json({ ok: true, service: 'oura-ring-mcp health server' });
   });
 
+  // Throwaway echo endpoint: returns the parsed body back verbatim so the
+  // iOS Shortcut's Quick Look can show exactly what we received. Useful
+  // for figuring out what iOS is actually sending when the real endpoint
+  // rejects the payload. Same auth, no validation, no DB writes.
+  app.post('/v1/health/echo', requireAuth, async (req, res) => {
+    const body = req.body ?? null;
+    let topLevel: string;
+    let count: number | null = null;
+    let firstItemKeys: string[] | null = null;
+    if (Array.isArray(body)) {
+      topLevel = 'array';
+      count = body.length;
+      if (body.length > 0 && typeof body[0] === 'object' && body[0] !== null) {
+        firstItemKeys = Object.keys(body[0] as Record<string, unknown>);
+      }
+    } else if (body !== null && typeof body === 'object') {
+      topLevel = 'object';
+      count = Object.keys(body as Record<string, unknown>).length;
+      firstItemKeys = Object.keys(body as Record<string, unknown>);
+    } else {
+      topLevel = typeof body;
+    }
+    res.json({
+      ok: true,
+      top_level: topLevel,
+      count,
+      first_item_keys: firstItemKeys,
+      echo: body,
+    });
+  });
+
   app.post('/v1/health/import', requireAuth, async (req, res) => {
     const t0 = Date.now();
     let samples: HealthSample[];
