@@ -97,19 +97,32 @@ if you've enabled the CLI. Note the `100.x.y.z` address.
 
 ## 4. Build the iOS Shortcut
 
-Open **Shortcuts** → **+** → New Shortcut. Add these actions in order:
+Open **Shortcuts** → **+** → New Shortcut. Add these actions in order.
+This is the configuration verified end-to-end against a real
+SnapCalorie batch on iOS 18; if your iOS version produces a different
+on-the-wire shape, the server's payload parser is forgiving — see
+"Accepted body shapes" near the bottom.
 
-| #   | Action                        | Configuration                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| --- | ----------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 1   | **Find Health Samples Where** | Sample Type: **Dietary Energy** (start narrow; you can add types later). Sort by: Start Date. Order: Latest First. Limit: 20 (or a comfortable batch size).                                                                                                                                                                                                                                                                                                                  |
-| 2   | **Repeat with Each**          | Items: the **Health Samples** from step 1. Steps 2a–2b live inside.                                                                                                                                                                                                                                                                                                                                                                                                          |
-| 2a  | **Dictionary** (inside loop)  | Add six text fields: <br/> • `sample_type` → literal `dietary_energy_consumed` <br/> • `value` → Repeat Item → Get Details of Health Sample → **Value** <br/> • `unit` → Repeat Item → Get Details of Health Sample → **Unit** <br/> • `start_time` → Repeat Item → Get Details → **Start Date** → Format Date → **ISO 8601** with milliseconds <br/> • `end_time` → same as start_time but pick **End Date** <br/> • `source_name` → Repeat Item → Get Details → **Source** |
-| 2b  | (end of loop body)            | Make sure the Dictionary is the LAST action inside Repeat. Do NOT use "Add to Variable" — it concatenates as text and breaks list serialization.                                                                                                                                                                                                                                                                                                                             |
-| 3   | (auto) **End Repeat**         | Inserted automatically.                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| 4   | **Get Contents of URL**       | URL: `http://100.x.y.z:8771/v1/health/import` (your Tailscale IP) <br/> Method: **POST** <br/> Headers: `Authorization: Bearer <HEALTH_IMPORT_TOKEN>`, `Content-Type: application/json` <br/> Request Body: **JSON** → pick the **Repeat Results** magic variable as the body. <br/> _Fallback if Shortcuts refuses to send a list as a list:_ wrap in a Dictionary `{samples: Repeat Results}`. The server accepts both shapes.                                             |
-| 5   | **Quick Look** (optional)     | Input: Contents of URL. Lets you see the server's response inline when debugging.                                                                                                                                                                                                                                                                                                                                                                                            |
+| #   | Action                            | Configuration                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| --- | --------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | **Find Health Samples Where**     | Sample Type: **Dietary Energy** (start narrow; you can extend to other macros later). Sort by: Start Date. Order: Latest First. Limit: 100 (or whatever covers the batch interval you want).                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| 2   | **Repeat with Each**              | Items: the **Health Samples** from step 1. Step 2a lives inside.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| 2a  | **Dictionary** (inside loop)      | Add six fields, all type **Text**: <br/> • `sample_type` → type the literal string `dietary_energy_consumed` <br/> • `value` → **Repeat Item** → Get Details of Health Sample → **Value** <br/> • `unit` → **Repeat Item** → Get Details → **Unit** <br/> • `start_time` → **Repeat Item** → Get Details → **Start Date** → Format Date → **ISO 8601**. **Toggle "Include ISO 8601 Time" ON** — without it you only get the date portion and every meal collapses to midnight. <br/> • `end_time` → same as `start_time` but pick **End Date** <br/> • `source_name` → **Repeat Item** → Get Details → **Source**                        |
+| 2b  | (end of loop body)                | The Dictionary must be the LAST action inside Repeat. Do NOT use "Add to Variable" inside the loop — it concatenates as text and breaks list serialization.                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| 3   | (auto) **End Repeat**             | Inserted automatically. Exposes a magic variable called **Repeat Results** containing the list of all per-iteration Dictionaries.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| 4   | **Dictionary** (after End Repeat) | One field: <br/> • Key: `samples` <br/> • Type: **Array** (tap the type indicator on the left, default Text → switch to Array) <br/> • Value: the **Repeat Results** magic variable                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| 5   | **Get Contents of URL**           | URL: `http://100.x.y.z:8771/v1/health/import` (your Tailscale IP) <br/> Method: **POST** <br/> Headers: `Authorization: Bearer <HEALTH_IMPORT_TOKEN>` and `Content-Type: application/json` <br/> Request Body: **File** — pick the **Dictionary** from step 4 as the file. <br/> _Why File and not JSON_: JSON body type re-serializes the variable through Apple's encoder, which collapses or stringifies lists-of-dictionaries inconsistently across iOS versions. File body sends the Dictionary's raw JSON bytes, which preserves the array structure. The server's parser handles the resulting `{samples: [...]}` shape verbatim. |
+| 6   | **Quick Look** (optional)         | Input: Contents of URL. Shows the server's `{total_received, inserted, deduped}` response inline.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 
 Save as **"Import to Oura DB"** or similar.
+
+> **The "Include ISO 8601 Time" toggle is easy to miss.** In the Format
+> Date sub-action, picking ISO 8601 as the format gives you only the date
+> portion (`2026-06-10`) by default. The toggle labeled **Include ISO
+> 8601 Time** sits below the format picker; flip it ON and you get a
+> full timestamp like `2026-06-10T09:36:31+01:00`. Without the time,
+> every sample collapses to midnight and the dedup key (which includes
+> the timestamp) starts colliding across same-day rows.
 
 ## 5. Schedule it
 
@@ -165,6 +178,30 @@ care, only your queries do):
 - Steps → `steps`
 - Body Mass → `body_mass`
 - Active Energy Burned → `active_energy_burned`
+
+## Accepted body shapes
+
+The endpoint is intentionally forgiving about how the array of samples
+is wrapped, because iOS Shortcuts serializes lists-of-dictionaries
+differently depending on the body type, the variable type, and the iOS
+version. All of the following normalize to the same flat array of
+samples server-side:
+
+1. Top-level JSON array of sample dicts:
+   `[{sample_type, value, ...}, {...}, ...]`
+2. Object wrapping an array of dicts:
+   `{"samples": [{sample_type, ...}, {...}]}`
+3. Object wrapping an array containing NDJSON strings (this is what the
+   Dictionary+Array+File approach above produces):
+   `{"samples": ["{...}\n{...}\n{...}"]}`
+4. Object wrapping a single NDJSON string:
+   `{"samples": "{...}\n{...}\n..."}`
+5. A single sample dict — wrapped server-side as a one-element list.
+
+The recommended Shortcut configuration produces shape #3. If you hit a
+shape this list doesn't cover, the server returns 400 with a clear
+error message — usually enough to either fix the Shortcut or add a new
+case to `normalizePayload` in `src/health/server.ts`.
 
 ## Troubleshooting
 
