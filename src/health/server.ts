@@ -138,24 +138,29 @@ export function buildHealthApp(deps: HealthServerDeps): express.Express {
 }
 
 /**
- * Accept four shapes the iOS Shortcut might send and produce a flat array
- * of sample envelopes. Each is intentionally lenient — strict typing happens
- * downstream in validateAndCoerce.
+ * Accept several shapes the iOS Shortcut might send and produce a flat
+ * array of sample envelopes. Each is intentionally lenient — strict
+ * typing happens downstream in validateAndCoerce.
  *
- *   1. proper JSON array of dicts: [ {…}, {…} ]
- *   2. object wrapping an array:   { "samples": [ {…}, {…} ] }
- *   3. object wrapping NDJSON:     { "samples": "<json>\n<json>\n…" }
- *   4. single sample dict:         { … }
+ *   1. proper JSON array of dicts:    [ {…}, {…} ]
+ *   2. object wrapping an array:      { "samples": [ {…}, {…} ] }
+ *   3. object wrapping NDJSON:        { "samples": "<json>\n<json>\n…" }
+ *   4. object wrapping mixed array:   { "samples": [ "<json>\n<json>…" ] }
+ *                                     — iOS's quirky serialization when you
+ *                                     wrap Repeat Results in a Dictionary's
+ *                                     Array-typed field. Each array element
+ *                                     may itself be an NDJSON string.
+ *   5. single sample dict:            { … }
  */
 export function normalizePayload(body: unknown): HealthSample[] {
   if (Array.isArray(body)) {
-    return body as HealthSample[];
+    return flattenSamplesArray(body);
   }
   if (body !== null && typeof body === 'object') {
     const rec = body as Record<string, unknown>;
     if ('samples' in rec) {
       const s = rec['samples'];
-      if (Array.isArray(s)) return s as HealthSample[];
+      if (Array.isArray(s)) return flattenSamplesArray(s);
       if (typeof s === 'string') return parseNdjson(s);
       throw new Error('`samples` must be an array or a newline-delimited JSON string');
     }
@@ -163,6 +168,28 @@ export function normalizePayload(body: unknown): HealthSample[] {
     return [body as HealthSample];
   }
   throw new Error('request body must be a JSON array, object, or NDJSON-wrapping object');
+}
+
+/**
+ * Flatten an array whose elements may individually be either sample dicts
+ * or NDJSON strings (each containing multiple JSON-encoded samples).
+ * iOS Shortcuts produces shape #4 above when Repeat Results is wrapped
+ * in a Dictionary's Array field — Apple's serializer concatenates the
+ * iterations into a single newline-separated string instead of preserving
+ * the list structure.
+ */
+function flattenSamplesArray(arr: unknown[]): HealthSample[] {
+  const out: HealthSample[] = [];
+  for (const item of arr) {
+    if (typeof item === 'string') {
+      out.push(...parseNdjson(item));
+    } else if (item !== null && typeof item === 'object') {
+      out.push(item as HealthSample);
+    } else {
+      throw new Error('array elements must be objects or NDJSON strings');
+    }
+  }
+  return out;
 }
 
 function parseNdjson(s: string): HealthSample[] {

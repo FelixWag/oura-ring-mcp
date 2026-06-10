@@ -90,6 +90,19 @@ describe('POST /v1/health/import — body shapes', () => {
     expect(res.body.inserted).toBe(1);
   });
 
+  it('accepts {samples: ["<NDJSON string>"]} — iOS Dictionary+Array quirk', async () => {
+    const a = sample();
+    const b = sample({ start_time: '2026-06-08T14:00:00+01:00', value: '500' });
+    const ndjson = JSON.stringify(a) + '\n' + JSON.stringify(b);
+    const res = await request(buildApp())
+      .post('/v1/health/import')
+      .set('Authorization', `Bearer ${TOKEN}`)
+      .send({ samples: [ndjson] }); // ← array wrapping one NDJSON string
+    expect(res.status).toBe(200);
+    expect(res.body.total_received).toBe(2);
+    expect(res.body.inserted).toBe(2);
+  });
+
   it('accepts {samples: "<NDJSON string>"} from the legacy iOS pattern', async () => {
     const a = sample();
     const b = sample({ start_time: '2026-06-08T14:00:00+01:00', value: '500' });
