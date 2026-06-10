@@ -626,3 +626,72 @@ README and `docs/siri-shortcut.md` are explicit about this.
 free; the bearer token is defense-in-depth in case another tailnet
 device is compromised. Anything fancier (mTLS, OIDC) is overkill for a
 single-user setup and would block adoption.
+
+---
+
+## 2026-06-08 — v0.7: Apple Health import as a separate server
+
+**Context.** v0.6 voice ingestion solved "log lived context by talking";
+v0.7 needed a way to bring in meals and other quantitative data that
+Oura's API doesn't expose. Apple Health is the natural hub on iOS — many
+apps (Cronometer, SnapCalorie, Apple Watch, glucose CGMs) already write
+to it.
+
+**Decision.** A second small Express server (`src/health/server.ts`,
+port `8771`) sits next to the voice server. It accepts batches of
+HealthKit samples from an iOS Shortcut and writes them into a new
+generic `health_samples` table (schema migration v7). Voice and health
+are **separate processes with separate bearer tokens** so they can be
+restarted, rotated, and reasoned about independently.
+
+**Rationale.** Three things drove the split: (1) the failure modes are
+unrelated (voice depends on Claude rate limits; health is just a SQL
+write), (2) the payload sizes differ by 100× (voice is a sentence;
+health is a batched array), and (3) the token concern is real — losing
+one token shouldn't compromise the other surface. Keeping the data in
+the same SQLite is the important part; the agents downstream don't
+care which server wrote which rows.
+
+---
+
+## 2026-06-08 — Generic `health_samples` table; no per-nutrient tables
+
+**Context.** HealthKit has 100+ quantity/category sample types. We
+needed a schema choice for the v0.7 import.
+
+**Decision.** One generic `health_samples` table with a `sample_type`
+discriminator column. Same shape handles every type — nutrition,
+steps, weight, mindfulness, body temperature, anything iOS apps write
+to Health. JSON paths into the raw envelope (`raw` column) are how we
+preserve future fields without re-migrating.
+
+**Rationale.** Per-nutrient tables would mean a migration each time we
+add a tracked type, plus duplicated index logic. The discriminator-
+column approach is the same pattern the Oura mirror tables use for
+their `data` JSON column (Decision 2026-05-08). Composite UNIQUE on
+`(sample_type, start_time, source_name, value)` serves as the dedup
+key since HealthKit UUIDs don't come through iOS Shortcuts reliably —
+verified empirically against SnapCalorie samples during the v0.7
+probe phase.
+
+---
+
+## 2026-06-08 — Forgiving payload parser for iOS Shortcuts quirks
+
+**Context.** iOS Shortcuts' "Find Health Samples" → "Repeat with Each"
+→ "Add to Variable" / "Repeat Results" patterns produce subtly
+different on-the-wire JSON depending on iOS version: sometimes a clean
+array, sometimes `{samples: <NDJSON-string>}`, sometimes a single
+collapsed dict. Three Shortcut variants during probing produced three
+different shapes.
+
+**Decision.** The `POST /v1/health/import` endpoint accepts four input
+shapes (array; `{samples: [...]}`; `{samples: "<NDJSON>"}`; single
+dict) and normalizes to a flat array of samples. Strict typing happens
+in `validateAndCoerce` after normalization.
+
+**Rationale.** Postel's principle. Wrestling iOS Shortcuts into one
+canonical shape isn't worth the time when ~30 lines of server code
+solves it once and forever. The same forgiving endpoint also accepts
+the output of Health Auto Export and any future scripted sources
+without re-coding.

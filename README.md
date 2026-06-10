@@ -205,6 +205,40 @@ Full setup (iOS Shortcut steps, Tailscale, troubleshooting):
 
 ---
 
+## Apple Health Import (v0.7)
+
+Bring HealthKit data — nutrition (calories, protein, carbs), steps,
+weight, anything iOS apps write to Apple Health — into the same local
+SQLite. Useful because Oura's API doesn't expose meals or glucose;
+Apple Health does, and many apps (Cronometer, SnapCalorie, MyFitnessPal,
+Apple Watch) already write to it.
+
+How it works:
+
+1. A second Express server runs on `:8771` next to the voice server.
+2. An iOS Shortcut (Personal Automation, scheduled daily) reads recent
+   HealthKit samples and POSTs them to `/v1/health/import`.
+3. Samples land in a generic `health_samples` table — same shape for
+   every type, discriminated by a `sample_type` column.
+
+Run it:
+
+```bash
+echo "HEALTH_IMPORT_TOKEN=$(openssl rand -hex 32)" >> .env
+npm run build
+npm run health-server
+```
+
+Voice and health are **separate processes on separate ports with
+separate tokens** — restart or rotate either independently. Bearer token
+
+- Tailscale is the security boundary.
+
+Full setup (iOS Shortcut steps, sample types, troubleshooting):
+[`docs/apple-health.md`](docs/apple-health.md).
+
+---
+
 ## Why Local-First Matters
 
 This project stores your synced data and annotations locally in SQLite instead of forwarding everything through another cloud service.
@@ -303,19 +337,22 @@ Read preference for local-first tools:
 
 ## Configuration
 
-| Variable              | Default                               | Purpose                                                                        |
-| --------------------- | ------------------------------------- | ------------------------------------------------------------------------------ |
-| `OURA_CLIENT_ID`      | -                                     | Required. From your Oura OAuth app.                                            |
-| `OURA_CLIENT_SECRET`  | -                                     | Required. From your Oura OAuth app.                                            |
-| `OURA_REDIRECT_URI`   | `http://127.0.0.1:8765/callback`      | Must match your Oura app exactly.                                              |
-| `OURA_TOKEN_PATH`     | `~/.config/oura-ring-mcp/tokens.json` | OAuth token file.                                                              |
-| `OURA_DB_PATH`        | `~/.config/oura-ring-mcp/data.sqlite` | SQLite database for synced data/annotations.                                   |
-| `OURA_DEBUG`          | unset                                 | Set to `1` for verbose stderr logs.                                            |
-| `VOICE_LOG_TOKEN`     | -                                     | Required for `npm run voice-server`. Bearer token the Siri Shortcut must send. |
-| `OURA_VOICE_PORT`     | `8770`                                | Port the voice server listens on.                                              |
-| `OURA_VOICE_LOG_PATH` | `<repo>/logs/voice.log`               | Append-only activity log for voice ingestion.                                  |
-| `OURA_MCP_ENTRY_PATH` | `<repo>/dist/index.js`                | MCP server entry the voice agent spawns.                                       |
-| `OURA_VOICE_MODEL`    | unset (SDK default)                   | Optional model override for the voice agent.                                   |
+| Variable               | Default                               | Purpose                                                                             |
+| ---------------------- | ------------------------------------- | ----------------------------------------------------------------------------------- |
+| `OURA_CLIENT_ID`       | -                                     | Required. From your Oura OAuth app.                                                 |
+| `OURA_CLIENT_SECRET`   | -                                     | Required. From your Oura OAuth app.                                                 |
+| `OURA_REDIRECT_URI`    | `http://127.0.0.1:8765/callback`      | Must match your Oura app exactly.                                                   |
+| `OURA_TOKEN_PATH`      | `~/.config/oura-ring-mcp/tokens.json` | OAuth token file.                                                                   |
+| `OURA_DB_PATH`         | `~/.config/oura-ring-mcp/data.sqlite` | SQLite database for synced data/annotations.                                        |
+| `OURA_DEBUG`           | unset                                 | Set to `1` for verbose stderr logs.                                                 |
+| `VOICE_LOG_TOKEN`      | -                                     | Required for `npm run voice-server`. Bearer token the Siri Shortcut must send.      |
+| `OURA_VOICE_PORT`      | `8770`                                | Port the voice server listens on.                                                   |
+| `OURA_VOICE_LOG_PATH`  | `<repo>/logs/voice.log`               | Append-only activity log for voice ingestion.                                       |
+| `OURA_MCP_ENTRY_PATH`  | `<repo>/dist/index.js`                | MCP server entry the voice agent spawns.                                            |
+| `OURA_VOICE_MODEL`     | unset (SDK default)                   | Optional model override for the voice agent.                                        |
+| `HEALTH_IMPORT_TOKEN`  | -                                     | Required for `npm run health-server`. Bearer token the Apple Health Shortcut sends. |
+| `OURA_HEALTH_PORT`     | `8771`                                | Port the health server listens on.                                                  |
+| `OURA_HEALTH_LOG_PATH` | `<repo>/logs/health.log`              | Append-only activity log for health imports.                                        |
 
 `.env` is loaded from the project root, even when an MCP host starts the
 binary from another working directory.

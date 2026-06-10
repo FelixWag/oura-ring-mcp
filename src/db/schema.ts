@@ -354,6 +354,43 @@ const MIGRATIONS: readonly Migration[] = [
       CREATE INDEX IF NOT EXISTS idx_annotations_voice_log_id ON annotations(voice_log_id);
     `,
   },
+  {
+    version: 7,
+    // v0.7: Apple Health import.
+    //
+    // Generic samples table that holds anything an iOS HealthKit-backed
+    // source POSTs at us — nutrition first, but the same shape handles
+    // steps, weight, mindfulness minutes, body temperature, etc. via the
+    // `sample_type` discriminator.
+    //
+    // Dedup key is (sample_type, start_time, source_name, value):
+    // HealthKit UUIDs don't come through iOS Shortcuts reliably, and a
+    // single source can't legitimately emit the same value at the same
+    // millisecond twice. False-positive collision risk is essentially
+    // zero in practice.
+    //
+    // `raw` keeps the original per-sample JSON envelope so future fields
+    // (metadata, device, uuid if iOS ever exposes it) can be backfilled
+    // without a schema change — same pattern as `data` on the Oura
+    // mirror tables.
+    name: 'v0.7: health_samples (Apple Health import)',
+    sql: `
+      CREATE TABLE IF NOT EXISTS health_samples (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        sample_type     TEXT NOT NULL,    -- 'dietary_energy_consumed', 'dietary_protein', 'steps', ...
+        start_time      TEXT NOT NULL,    -- ISO 8601 with offset, as iOS sends it
+        end_time        TEXT NOT NULL,    -- usually == start_time for point samples
+        value           REAL NOT NULL,    -- numeric quantity (CAST from string at write time)
+        unit            TEXT NOT NULL,    -- 'kcal', 'g', 'count', 'kJ', ...
+        source_name     TEXT,             -- 'SnapCalorie', 'Cronometer', 'Apple Watch', NULL allowed
+        imported_at     TEXT NOT NULL,    -- server's UTC timestamp at insert
+        raw             TEXT,             -- raw per-sample JSON, for losslessness
+        UNIQUE(sample_type, start_time, source_name, value)
+      );
+      CREATE INDEX IF NOT EXISTS idx_health_samples_type_time ON health_samples(sample_type, start_time);
+      CREATE INDEX IF NOT EXISTS idx_health_samples_imported  ON health_samples(imported_at);
+    `,
+  },
 ];
 
 export function currentSchemaVersion(db: Database): number {
