@@ -695,3 +695,24 @@ canonical shape isn't worth the time when ~30 lines of server code
 solves it once and forever. The same forgiving endpoint also accepts
 the output of Health Auto Export and any future scripted sources
 without re-coding.
+
+---
+
+## 2026-06-12 — Hourly auto-sync via launchd (docs-only)
+
+**Context.** The mirror only updated when the user remembered to run
+`npm run sync`. With the downstream health-agents project running daily
+rounds against the SQLite, staleness became a real cost.
+
+**Decision.** Ship a documented launchd recipe (`docs/launchd.md`)
+rather than code: a user-level plist running `npm run sync` hourly via
+a login shell (`/bin/zsh -lc`, so PATH resolves without hardcoding the
+npm location). No daemon process in the repo itself.
+
+**Rationale.** Sync is already incremental, idempotent (PK upserts on
+`day` / `oura_id` / `(timestamp, source)`), and cheap (~15–20 API calls
+per run against Oura's generous limits) — the only missing piece was
+scheduling, which is the OS's job, not ours. launchd beats cron on
+macOS (survives reboots, coalesces missed runs after sleep, per-user).
+The same pattern extends to the voice/health servers once their
+surfaces stabilize; deliberately not templated yet.
