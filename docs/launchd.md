@@ -99,6 +99,23 @@ launchctl kickstart gui/$(id -u)/com.oura-ring-mcp.sync
     automatically.
   - **volta/asdf**: same idea — put the shim directory
     (`~/.volta/bin` / `~/.asdf/shims`) on PATH; shims are stable.
+- **The error is still in the err.log after you fixed it** — probably
+  stale. Both log files are append-only, and `tail -f` first prints the
+  last lines of the _existing_ file — including failures from before
+  your fix. Verify against a clean slate:
+
+  ```bash
+  > logs/sync.launchd.log && > logs/sync.launchd.err.log
+  launchctl kickstart gui/$(id -u)/com.oura-ring-mcp.sync
+  tail -f logs/sync.launchd.log logs/sync.launchd.err.log
+  ```
+
+  Success = sync output in the out-log, err.log empty. (Stray
+  `npm notice …` lines on stderr are harmless update nags, not errors.)
+  If a _fresh_ `command not found` appears alongside a successful sync,
+  you likely have a second stale job loaded under an old label — check
+  `launchctl list | grep -i oura` and unload the one you don't want.
+
 - **Exit code 78 in `launchctl list`** — usually a malformed plist;
   validate with `plutil -lint <path>`.
 - **Job loaded but never fires** — check the plist filename matches the
