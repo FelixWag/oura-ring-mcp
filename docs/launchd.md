@@ -24,13 +24,16 @@ Save the following as `~/Library/LaunchAgents/com.oura-ring-mcp.sync.plist`,
   <key>WorkingDirectory</key>
   <string>/Users/you/path/to/oura-ring-mcp</string>
 
-  <!-- A login shell (-l) so npm/node resolve from your normal PATH,
-       no hardcoded /usr/local/bin vs /opt/homebrew/bin guessing. -->
+  <!-- IMPORTANT: launchd's login shell (-l) reads ~/.zprofile and
+       ~/.zshenv but NOT ~/.zshrc — where nvm and often Homebrew put
+       their PATH setup. Prepend your node directory explicitly:
+       run `dirname "$(which npm)"` in a normal terminal and put the
+       result here in place of /opt/homebrew/bin. -->
   <key>ProgramArguments</key>
   <array>
     <string>/bin/zsh</string>
     <string>-lc</string>
-    <string>npm run sync</string>
+    <string>export PATH="/opt/homebrew/bin:$PATH" &amp;&amp; npm run sync</string>
   </array>
 
   <!-- Every hour. Also runs once at load/login. -->
@@ -72,6 +75,21 @@ launchctl kickstart gui/$(id -u)/com.oura-ring-mcp.sync
 
 # After editing the plist, unload + load again to apply.
 ```
+
+## Troubleshooting
+
+- **`command not found: npm` in the err.log** — the most common failure.
+  launchd's `zsh -lc` is a login shell, which skips `~/.zshrc` — exactly
+  where nvm (and sometimes Homebrew) initialize PATH. Fix: run
+  `dirname "$(which npm)"` in a normal terminal and prepend that
+  directory in the plist's command string (see the template above).
+  Note for nvm users: that directory changes when you upgrade Node —
+  re-check the plist after `nvm install`.
+- **Exit code 78 in `launchctl list`** — usually a malformed plist;
+  validate with `plutil -lint <path>`.
+- **Job loaded but never fires** — check the plist filename matches the
+  `Label` value, and that it lives in `~/Library/LaunchAgents/` (not
+  `/Library/LaunchAgents/`, which is system-wide and needs root).
 
 ## Notes
 
