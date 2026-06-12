@@ -80,11 +80,25 @@ launchctl kickstart gui/$(id -u)/com.oura-ring-mcp.sync
 
 - **`command not found: npm` in the err.log** — the most common failure.
   launchd's `zsh -lc` is a login shell, which skips `~/.zshrc` — exactly
-  where nvm (and sometimes Homebrew) initialize PATH. Fix: run
-  `dirname "$(which npm)"` in a normal terminal and prepend that
-  directory in the plist's command string (see the template above).
-  Note for nvm users: that directory changes when you upgrade Node —
-  re-check the plist after `nvm install`.
+  where node version managers initialize PATH. The fix depends on how
+  node is installed (`dirname "$(which npm)"` tells you which case
+  you're in):
+  - **Plain Homebrew or installer node** (path like `/opt/homebrew/bin`
+    or `/usr/local/bin`): prepend that directory in the plist command,
+    as in the template above. Stable across upgrades.
+  - **nvm** (path contains `.nvm/versions/node/vX.Y.Z`): prepend that
+    directory, but note it changes when you upgrade Node — re-check the
+    plist after `nvm install`.
+  - **fnm** (path contains `fnm_multishells/`): do NOT use that path —
+    it's a temporary per-terminal symlink that disappears when the
+    terminal closes. Instead initialize fnm in the command itself:
+    `export PATH="<dir-of-fnm-binary>:$PATH" && eval "$(fnm env)" && npm run sync`
+    (find the binary with `which fnm`; remember `&&` must be written
+    `&amp;&amp;` inside plist XML). Requires a default version
+    (`fnm default $(fnm current)` once). Tracks Node upgrades
+    automatically.
+  - **volta/asdf**: same idea — put the shim directory
+    (`~/.volta/bin` / `~/.asdf/shims`) on PATH; shims are stable.
 - **Exit code 78 in `launchctl list`** — usually a malformed plist;
   validate with `plutil -lint <path>`.
 - **Job loaded but never fires** — check the plist filename matches the
