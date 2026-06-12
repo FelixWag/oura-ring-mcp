@@ -359,6 +359,16 @@ binary from another working directory.
 
 ---
 
+## Keep the Mirror Fresh (auto-sync)
+
+`npm run sync` is incremental and idempotent — every table upserts on
+its primary key, so re-running never duplicates rows. To run it
+automatically every hour on macOS, set up a launchd agent:
+[`docs/launchd.md`](docs/launchd.md). One plist file, two commands,
+no terminal needed afterwards.
+
+---
+
 ## Troubleshooting
 
 **`No saved tokens at ...`**  
