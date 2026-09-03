@@ -165,6 +165,10 @@ CLAUDE.md
 # These files are for Codex
 AGENTS.md
 
+# Personal Obsidian wiki (project memory) — this repo is PUBLIC,
+# the wiki holds personal health context. Never commit it.
+chiron-wiki/
+
 docs/README.md
 # v0.6 voice server logs
 logs/
