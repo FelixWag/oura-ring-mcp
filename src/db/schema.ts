@@ -458,6 +458,23 @@ const MIGRATIONS: readonly Migration[] = [
       CREATE INDEX IF NOT EXISTS idx_resolved_sessions_res ON resolved_sessions(is_resistance, day);
     `,
   },
+  {
+    version: 10,
+    name: 'v0.8: external_workouts.external_id (HealthKit UUID)',
+    sql: `
+      -- HealthKit gives every sample a stable UUID. iOS Shortcuts drops it,
+      -- which is why the original dedupe key was (source_name, start, end,
+      -- type) — a heuristic that breaks if an app edits a workout's times.
+      -- A native reader can send the UUID, making re-import dedupe exact.
+      ALTER TABLE external_workouts ADD COLUMN external_id TEXT;
+
+      -- Partial index: rows imported from an export (no UUID) still collide
+      -- on the older heuristic key, which stays in force alongside this one.
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_external_workouts_uuid
+        ON external_workouts(source_name, external_id)
+        WHERE external_id IS NOT NULL;
+    `,
+  },
 ];
 
 export function currentSchemaVersion(db: Database): number {

@@ -12,6 +12,7 @@ import {
   isResistance,
   type WorkoutCandidate,
 } from '../src/health/resolve.js';
+import { auditSessions } from '../src/health/audit.js';
 
 function hk(
   source_name: string,
@@ -189,5 +190,77 @@ describe('activity labels', () => {
   it('snake_cases everything else', () => {
     expect(canonicalActivity('TableTennis')).toBe('table_tennis');
     expect(canonicalActivity('Walking')).toBe('walking');
+  });
+});
+
+describe('auditSessions', () => {
+  const session = (activity: string, start: string, end: string, source = 'apple_health:Oura') => ({
+    start_time: `2026-01-15T${start}:00+02:00`,
+    end_time: `2026-01-15T${end}:00+02:00`,
+    duration_min: 30,
+    activity,
+    is_resistance: activity === 'strength_training',
+    energy_kcal: null,
+    avg_heart_rate: null,
+    source,
+    members: [],
+  });
+
+  it('is silent on a clean resolve', () => {
+    const findings = auditSessions({
+      candidates: [],
+      sessions: [
+        session('strength_training', '12:08', '12:59'),
+        session('cycling', '13:00', '13:35'),
+      ],
+    });
+
+    expect(findings).toEqual([]);
+  });
+
+  it('errors when two counted sessions overlap', () => {
+    // The failure mode that matters: the same workout counted twice.
+    const findings = auditSessions({
+      candidates: [],
+      sessions: [
+        session('strength_training', '12:08', '12:59'),
+        session('strength_training', '12:10', '12:55', 'apple_health:OtherApp'),
+      ],
+    });
+
+    expect(findings.some((f) => f.code === 'overlapping_sessions' && f.severity === 'error')).toBe(
+      true,
+    );
+  });
+
+  it('flags a writer it has never seen before', () => {
+    const findings = auditSessions({
+      candidates: [
+        {
+          origin: 'apple_health',
+          source_name: 'BrandNewTracker',
+          activity_type: 'Running',
+          start_time: '2026-01-15T07:00:00+02:00',
+          end_time: '2026-01-15T07:30:00+02:00',
+        },
+      ],
+      sessions: [],
+      knownSources: ['Oura'],
+    });
+
+    expect(findings.some((f) => f.code === 'new_writer')).toBe(true);
+  });
+
+  it('flags near-miss duplicates from different sources', () => {
+    // Clocks drifted too far for the overlap rule, but it smells like one session.
+    const findings = auditSessions({
+      candidates: [],
+      sessions: [
+        session('strength_training', '12:08', '12:40'),
+        session('strength_training', '12:50', '13:30', 'apple_health:OtherApp'),
+      ],
+    });
+
+    expect(findings.some((f) => f.code === 'possible_cross_source_duplicate')).toBe(true);
   });
 });

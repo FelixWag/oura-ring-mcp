@@ -14,6 +14,12 @@ import type { Db } from '../index.js';
 
 export interface ExternalWorkout {
   source: string;
+  /**
+   * HealthKit's own UUID for the record. Present when a native reader sent
+   * it; absent for rows parsed out of an export, where iOS drops it. When
+   * present it makes re-import dedupe exact rather than heuristic.
+   */
+  external_id?: string | null;
   source_name: string;
   activity_type: string;
   start_time: string;
@@ -46,8 +52,9 @@ export class ExternalWorkoutsRepo {
     const stmt = this.db.prepare(
       `INSERT OR IGNORE INTO external_workouts
          (source, source_name, activity_type, start_time, end_time, duration_min,
-          energy_kcal, distance_km, avg_heart_rate, device, created_at, imported_at, raw)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          energy_kcal, distance_km, avg_heart_rate, device, created_at, imported_at, raw,
+          external_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     );
     const importedAt = new Date().toISOString();
     let inserted = 0;
@@ -68,6 +75,7 @@ export class ExternalWorkoutsRepo {
           w.created_at ?? null,
           importedAt,
           w.raw ?? null,
+          w.external_id ?? null,
         );
         if (info.changes > 0) inserted += 1;
       }
