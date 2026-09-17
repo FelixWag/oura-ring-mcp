@@ -22,6 +22,7 @@ import express, { type Request, type Response, type NextFunction } from 'express
 import { loadConfig, loadHealthConfig, type HealthConfig } from '../config.js';
 import { openDatabase, type Db } from '../db/index.js';
 import { HealthSamplesRepo, type HealthSample } from '../db/repos/health_samples.js';
+import { ExternalWorkoutsRepo, type ExternalWorkout } from '../db/repos/external_workouts.js';
 
 interface HealthServerDeps {
   db: Db;
@@ -56,6 +57,60 @@ export function buildHealthApp(deps: HealthServerDeps): express.Express {
 
   app.get('/healthz', (_req, res) => {
     res.json({ ok: true, service: 'oura-ring-mcp health server' });
+  });
+
+  /**
+   * Workouts arrive here rather than through /v1/health/import because an
+   * HKWorkout isn't a quantity sample: it has a type, duration, energy and
+   * distance, and no single `value`. It also can't come from a Shortcut at
+   * all — `Find Health Samples` doesn't expose workouts — so this endpoint
+   * exists for native readers, which can also send HealthKit's UUID and get
+   * exact dedupe.
+   */
+  app.post('/v1/health/workouts', requireAuth, async (req, res) => {
+    const t0 = Date.now();
+    let workouts: ExternalWorkout[];
+    try {
+      workouts = normalizeWorkoutPayload(req.body);
+    } catch (err) {
+      res.status(400).json({ ok: false, error: (err as Error).message });
+      return;
+    }
+
+    if (workouts.length === 0) {
+      res.status(400).json({ ok: false, error: 'no workouts in payload' });
+      return;
+    }
+
+    const validation = validateWorkouts(workouts);
+    if (validation.errors.length > 0) {
+      res.status(400).json({
+        ok: false,
+        error: 'one or more workouts failed validation',
+        details: validation.errors.slice(0, 10),
+        rejected: validation.errors.length,
+        accepted: validation.workouts.length,
+      });
+      return;
+    }
+
+    const result = new ExternalWorkoutsRepo(db).insertBatch(validation.workouts);
+    const duration_ms = Date.now() - t0;
+
+    await appendLog(
+      `${new Date().toISOString()}  /v1/health/workouts  ok  received=${result.total_received}  ` +
+        `inserted=${result.inserted}  deduped=${result.deduped}  ${duration_ms}ms`,
+    );
+
+    res.json({
+      ok: true,
+      total_received: result.total_received,
+      inserted: result.inserted,
+      deduped: result.deduped,
+      duration_ms,
+      // The client can stop re-sending everything once it sees this.
+      note: 'run `npm run resolve-sessions` to refresh resolved_sessions',
+    });
   });
 
   app.post('/v1/health/import', requireAuth, async (req, res) => {
@@ -176,6 +231,86 @@ function parseNdjson(s: string): HealthSample[] {
     }
   }
   return out;
+}
+
+/**
+ * Workout payloads are simpler than sample payloads: they come from a native
+ * client we control, not from Shortcuts, so only an array or `{workouts: []}`
+ * need supporting.
+ */
+export function normalizeWorkoutPayload(body: unknown): ExternalWorkout[] {
+  if (Array.isArray(body)) return body as ExternalWorkout[];
+  if (body !== null && typeof body === 'object') {
+    const rec = body as Record<string, unknown>;
+    if ('workouts' in rec) {
+      const w = rec['workouts'];
+      if (Array.isArray(w)) return w as ExternalWorkout[];
+      throw new Error('`workouts` must be an array');
+    }
+    return [body as ExternalWorkout];
+  }
+  throw new Error('request body must be a JSON array or object');
+}
+
+interface ValidatedWorkouts {
+  workouts: ExternalWorkout[];
+  errors: Array<{ index: number; error: string }>;
+}
+
+/**
+ * Times and an activity type are required; everything else is optional,
+ * because HealthKit itself leaves most of it blank for some workout types.
+ */
+export function validateWorkouts(input: ExternalWorkout[]): ValidatedWorkouts {
+  const workouts: ExternalWorkout[] = [];
+  const errors: Array<{ index: number; error: string }> = [];
+
+  input.forEach((raw, index) => {
+    const activity_type = typeof raw.activity_type === 'string' ? raw.activity_type.trim() : '';
+    if (!activity_type) {
+      errors.push({ index, error: 'activity_type is required' });
+      return;
+    }
+    const start_time = typeof raw.start_time === 'string' ? raw.start_time : '';
+    const end_time = typeof raw.end_time === 'string' ? raw.end_time : '';
+    if (!start_time || Number.isNaN(Date.parse(start_time))) {
+      errors.push({ index, error: 'start_time is required and must be ISO 8601' });
+      return;
+    }
+    if (!end_time || Number.isNaN(Date.parse(end_time))) {
+      errors.push({ index, error: 'end_time is required and must be ISO 8601' });
+      return;
+    }
+    if (Date.parse(end_time) < Date.parse(start_time)) {
+      errors.push({ index, error: 'end_time precedes start_time' });
+      return;
+    }
+
+    const optionalNumber = (v: unknown): number | null => {
+      if (v === null || v === undefined || v === '') return null;
+      const n = Number(v);
+      return Number.isFinite(n) ? n : null;
+    };
+
+    workouts.push({
+      source: typeof raw.source === 'string' && raw.source ? raw.source : 'apple_health',
+      source_name:
+        typeof raw.source_name === 'string' && raw.source_name ? raw.source_name : 'unknown',
+      activity_type,
+      start_time,
+      end_time,
+      duration_min: optionalNumber(raw.duration_min),
+      energy_kcal: optionalNumber(raw.energy_kcal),
+      distance_km: optionalNumber(raw.distance_km),
+      avg_heart_rate: optionalNumber(raw.avg_heart_rate),
+      device: typeof raw.device === 'string' ? raw.device : null,
+      created_at: typeof raw.created_at === 'string' ? raw.created_at : null,
+      external_id: typeof raw.external_id === 'string' ? raw.external_id : null,
+      raw: JSON.stringify(raw),
+    });
+  });
+
+  return { workouts, errors };
 }
 
 interface ValidatedBatch {

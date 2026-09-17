@@ -293,3 +293,96 @@ describe('normalizePayload — unit', () => {
     expect(() => normalizePayload({ samples: s } as never)).toThrow(/line 2/);
   });
 });
+
+describe('POST /v1/health/workouts', () => {
+  // What a native HealthKit reader sends: an HKWorkout, UUID included.
+  function workout(overrides: Record<string, unknown> = {}) {
+    return {
+      external_id: '5B2E1C6E-0000-4000-8000-000000000001',
+      source_name: 'Oura',
+      activity_type: 'TraditionalStrengthTraining',
+      start_time: '2026-01-15T12:08:18+02:00',
+      end_time: '2026-01-15T12:59:46+02:00',
+      duration_min: 51.4,
+      energy_kcal: 278.65,
+      ...overrides,
+    };
+  }
+
+  it('rejects an unauthenticated request', async () => {
+    const res = await request(buildApp()).post('/v1/health/workouts').send([workout()]);
+    expect(res.status).toBe(401);
+  });
+
+  it('stores a workout and reports it', async () => {
+    const res = await request(buildApp())
+      .post('/v1/health/workouts')
+      .set('Authorization', `Bearer ${TOKEN}`)
+      .send([workout()]);
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ ok: true, inserted: 1, deduped: 0 });
+
+    const row = db.prepare('SELECT * FROM external_workouts').get() as Record<string, unknown>;
+    expect(row['activity_type']).toBe('TraditionalStrengthTraining');
+    expect(row['external_id']).toBe('5B2E1C6E-0000-4000-8000-000000000001');
+    expect(row['source']).toBe('apple_health');
+  });
+
+  it('dedupes on HealthKit UUID even when the times were edited', async () => {
+    // The point of sending UUIDs: the heuristic key would miss this.
+    const app = buildApp();
+    await request(app)
+      .post('/v1/health/workouts')
+      .set('Authorization', `Bearer ${TOKEN}`)
+      .send([workout()]);
+    const res = await request(app)
+      .post('/v1/health/workouts')
+      .set('Authorization', `Bearer ${TOKEN}`)
+      .send([workout({ end_time: '2026-01-15T13:05:00+02:00', duration_min: 56.7 })]);
+
+    expect(res.body).toMatchObject({ inserted: 0, deduped: 1 });
+    const count = db.prepare('SELECT COUNT(*) AS n FROM external_workouts').get() as { n: number };
+    expect(count.n).toBe(1);
+  });
+
+  it('accepts a {workouts: [...]} envelope', async () => {
+    const res = await request(buildApp())
+      .post('/v1/health/workouts')
+      .set('Authorization', `Bearer ${TOKEN}`)
+      .send({
+        workouts: [
+          workout(),
+          // A second, genuinely different session. Note two records with the
+          // same times and type still collide on the pre-UUID key, which is
+          // what keeps re-imported exports (where iOS drops UUIDs) idempotent.
+          workout({
+            external_id: 'other-uuid',
+            start_time: '2026-01-15T18:00:00+02:00',
+            end_time: '2026-01-15T18:40:00+02:00',
+          }),
+        ],
+      });
+
+    expect(res.body).toMatchObject({ ok: true, inserted: 2 });
+  });
+
+  it('names the field when a workout is malformed', async () => {
+    const res = await request(buildApp())
+      .post('/v1/health/workouts')
+      .set('Authorization', `Bearer ${TOKEN}`)
+      .send([workout({ start_time: 'not-a-date' })]);
+
+    expect(res.status).toBe(400);
+    expect(JSON.stringify(res.body)).toContain('start_time');
+  });
+
+  it('rejects a workout that ends before it starts', async () => {
+    const res = await request(buildApp())
+      .post('/v1/health/workouts')
+      .set('Authorization', `Bearer ${TOKEN}`)
+      .send([workout({ end_time: '2026-01-15T11:00:00+02:00' })]);
+
+    expect(res.status).toBe(400);
+  });
+});

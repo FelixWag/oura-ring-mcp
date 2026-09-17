@@ -32,6 +32,17 @@ For the architectural rationale behind each change, see [DECISIONS.md](DECISIONS
   clustering with source precedence — so without this, SQL-only consumers
   count one session several times.
 
+- **`POST /v1/health/workouts`** accepts HKWorkout records from a native
+  client, including HealthKit's UUID (`external_id`, schema v10), which makes
+  re-import dedupe exact rather than a guess from timestamps.
+- **Dedupe audit** runs on every `resolve-sessions` rebuild: resolved sessions
+  must not overlap, previously unseen writer apps are flagged, and near-miss
+  cross-source pairs are surfaced. Errors exit non-zero so a scheduled rebuild
+  fails loudly instead of publishing double-counted numbers.
+- **`ios/HealthBridge`** — a SwiftUI companion app that reads HealthKit and
+  posts to the two endpoints. It exists because Shortcuts cannot read workouts
+  at all; see [`ios/README.md`](ios/README.md).
+
 ### Notes
 
 - Storage stays lossless: every source record is kept, and deduplication
