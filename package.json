@@ -1,6 +1,6 @@
 {
   "name": "oura-ring-mcp",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "A Model Context Protocol server that lets Claude Code (and any MCP client) query your Oura Ring data through the official Oura API v2.",
   "type": "module",
   "bin": {
@@ -19,6 +19,8 @@
     "setup": "tsx scripts/setup.ts",
     "oauth-login": "tsx scripts/oauth-login.ts",
     "sync": "tsx scripts/sync.ts",
+    "import-health-export": "tsx scripts/import-health-export.ts",
+    "resolve-sessions": "tsx scripts/resolve-sessions.ts",
     "init": "npm run setup && npm run oauth-login && npm run sync",
     "voice-server": "tsx src/voice/server.ts",
     "health-server": "tsx src/health/server.ts",

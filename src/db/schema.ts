@@ -391,6 +391,73 @@ const MIGRATIONS: readonly Migration[] = [
       CREATE INDEX IF NOT EXISTS idx_health_samples_imported  ON health_samples(imported_at);
     `,
   },
+  {
+    version: 8,
+    name: 'v0.8: external_workouts (HealthKit workout records)',
+    sql: `
+      -- HealthKit HKWorkout records, which the Oura API does NOT return for
+      -- live-tracked sessions. One row per source record, stored verbatim —
+      -- dedupe happens at READ time, never here. The rules (and why) live in
+      -- the wiki page "HealthKit workouts — how to count them exactly once".
+      --
+      -- Key facts encoded by this shape:
+      --   * the same session legitimately appears several times (typed row,
+      --     live-activity wrapper, plus any third-party app), so there is no
+      --     UNIQUE constraint across sources;
+      --   * activity_type 'Other' is NOT a duplicate marker — it's what Oura
+      --     writes for anything Apple has no type for (e.g. stretching);
+      --   * an unstopped live activity can span >24h, so duration is not
+      --     trustworthy on its own.
+      CREATE TABLE IF NOT EXISTS external_workouts (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        source          TEXT NOT NULL,    -- 'apple_health' (future: other bridges)
+        source_name     TEXT NOT NULL,    -- writing app: 'Oura', a lifting tracker, ...
+        activity_type   TEXT NOT NULL,    -- HK type minus prefix: 'TraditionalStrengthTraining', 'Other', ...
+        start_time      TEXT NOT NULL,    -- ISO 8601 with offset
+        end_time        TEXT NOT NULL,
+        duration_min    REAL,             -- as reported; sanity-check before use
+        energy_kcal     REAL,
+        distance_km     REAL,
+        avg_heart_rate  REAL,             -- present on phone-recorded wrapper rows
+        device          TEXT,             -- HKDevice string; non-null ⇒ phone-recorded
+        created_at      TEXT,             -- HK creationDate (when the app wrote it)
+        imported_at     TEXT NOT NULL,
+        raw             TEXT,             -- full attribute set, for losslessness
+        UNIQUE(source_name, start_time, end_time, activity_type)
+      );
+      CREATE INDEX IF NOT EXISTS idx_external_workouts_start  ON external_workouts(start_time);
+      CREATE INDEX IF NOT EXISTS idx_external_workouts_source ON external_workouts(source_name, start_time);
+    `,
+  },
+  {
+    version: 9,
+    name: 'v0.8: resolved_sessions (materialised dedupe output)',
+    sql: `
+      -- Derived cache, NOT a source of truth: the output of resolveSessions()
+      -- over 'workouts' + 'external_workouts'. Rebuilt wholesale by
+      -- \`npm run resolve-sessions\`, so it can be dropped and regenerated.
+      --
+      -- It exists because SQL can't express the dedupe (transitive overlap
+      -- clustering with source precedence), and consumers that speak only SQL
+      -- would otherwise count the same session several times.
+      CREATE TABLE IF NOT EXISTS resolved_sessions (
+        start_time      TEXT NOT NULL,
+        end_time        TEXT NOT NULL,
+        day             TEXT NOT NULL,    -- local calendar day of start_time
+        activity        TEXT NOT NULL,    -- canonical: 'strength_training', 'walking', ...
+        is_resistance   INTEGER NOT NULL, -- 0/1, so SQL can SUM() it
+        duration_min    REAL,
+        energy_kcal     REAL,
+        avg_heart_rate  REAL,
+        source          TEXT NOT NULL,    -- winning record, e.g. 'apple_health:Oura'
+        member_count    INTEGER NOT NULL, -- source records collapsed into this session
+        resolved_at     TEXT NOT NULL,
+        PRIMARY KEY (start_time, activity)
+      );
+      CREATE INDEX IF NOT EXISTS idx_resolved_sessions_day ON resolved_sessions(day);
+      CREATE INDEX IF NOT EXISTS idx_resolved_sessions_res ON resolved_sessions(is_resistance, day);
+    `,
+  },
 ];
 
 export function currentSchemaVersion(db: Database): number {

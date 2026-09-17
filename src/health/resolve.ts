@@ -1,0 +1,228 @@
+/**
+ * Read-time deduplication: many workout records → one session list.
+ *
+ * A single session can legitimately produce several HealthKit records: the
+ * recording app's typed row, its phone-recorded live-activity wrapper, and a
+ * second app tracking the same session twice over — plus possibly an Oura API
+ * row. Storage keeps them all; this module decides which one *is* the session.
+ *
+ * The rules, in order:
+ *
+ *   1. Oura API wins. If an API workout overlaps, that's the session.
+ *   2. Then Oura via HealthKit — the only route to live-tracked sessions.
+ *   3. Third-party writers can be excluded via `excludeSources` — a lifting
+ *      tracker's timer typically runs well past the real session, and the
+ *      detail justifying it (sets/reps) stays in its own app anyway.
+ *   4. Same-source overlap collapses to one session, preferring the typed row
+ *      over the phone-recorded wrapper (`device` set, type often 'Other').
+ *   5. Adjacent records are NEVER merged — strength immediately followed by
+ *      cardio is a real, common pattern.
+ *
+ * Trap this encodes: 'Other' is not a duplicate marker. Most 'Other' rows are
+ * standalone real sessions — Oura writes 'Other' for anything Apple has no
+ * type for, stretching being the common case.
+ */
+
+/** Overlap needed (as a fraction of the shorter record) to call it one session. */
+const OVERLAP_FRACTION = 0.5;
+
+/**
+ * Live activities that were never stopped run for >24h. Anything longer than
+ * this is a wrapper artefact: it may not win its cluster, and its duration is
+ * not reported.
+ */
+const MAX_PLAUSIBLE_DURATION_MIN = 6 * 60;
+
+/**
+ * Writers whose records are stored but not counted. Empty by default: which
+ * apps to trust is deployment-specific. Pass `excludeSources` to drop a
+ * third-party tracker whose timer runs long, keeping its rows on disk.
+ */
+export const DEFAULT_EXCLUDED_SOURCES: readonly string[] = [];
+
+export interface WorkoutCandidate {
+  /** 'oura_api' | 'apple_health' */
+  origin: string;
+  /** Writing app for HealthKit rows ('Oura', a lifting tracker, …). */
+  source_name: string;
+  /** Raw type as the source spells it ('strengthTraining', 'Other', ...). */
+  activity_type: string;
+  start_time: string;
+  end_time: string;
+  energy_kcal?: number | null;
+  avg_heart_rate?: number | null;
+  /** HKDevice string; non-null means the phone recorded it (wrapper row). */
+  device?: string | null;
+}
+
+export interface ResolvedSession {
+  start_time: string;
+  end_time: string;
+  duration_min: number | null;
+  /** Canonical activity label, e.g. 'strength_training', 'walking'. */
+  activity: string;
+  is_resistance: boolean;
+  energy_kcal: number | null;
+  avg_heart_rate: number | null;
+  /** Winning record's origin + writer, e.g. 'apple_health:Oura'. */
+  source: string;
+  /** Every record that collapsed into this session, winner first. */
+  members: WorkoutCandidate[];
+}
+
+/** HealthKit + Oura activity names that count as resistance training. */
+const RESISTANCE_TYPES = new Set([
+  'traditionalstrengthtraining',
+  'functionalstrengthtraining',
+  'strengthtraining',
+  'coretraining',
+  'crosstraining',
+]);
+
+/** Origin ranking: lower wins. */
+function originRank(origin: string): number {
+  return origin === 'oura_api' ? 0 : 1;
+}
+
+/**
+ * Writer ranking: Oura is the reference for every timing figure. Other apps
+ * only win a cluster Oura isn't in — and then only if they aren't excluded.
+ */
+function sourceRank(sourceName: string): number {
+  return sourceName.toLowerCase() === 'oura' ? 0 : 1;
+}
+
+function ms(iso: string): number {
+  return Date.parse(iso);
+}
+
+function durationMin(c: WorkoutCandidate): number {
+  return (ms(c.end_time) - ms(c.start_time)) / 60000;
+}
+
+function isWrapper(c: WorkoutCandidate): boolean {
+  return (
+    (c.device != null && c.activity_type.toLowerCase() === 'other') ||
+    durationMin(c) > MAX_PLAUSIBLE_DURATION_MIN
+  );
+}
+
+/**
+ * Canonical label for a raw source type. Traditional vs functional strength
+ * training is a distinction the sources make inconsistently for the same gym
+ * visit, so both collapse to 'strength_training'.
+ */
+export function canonicalActivity(rawType: string): string {
+  const t = rawType.toLowerCase();
+  if (RESISTANCE_TYPES.has(t)) return 'strength_training';
+  // camelCase / PascalCase → snake_case ('TableTennis' → 'table_tennis')
+  return rawType
+    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_');
+}
+
+export function isResistance(rawType: string): boolean {
+  return RESISTANCE_TYPES.has(rawType.toLowerCase());
+}
+
+/** Fraction of the shorter record that the two records share in time. */
+function overlapFraction(a: WorkoutCandidate, b: WorkoutCandidate): number {
+  const start = Math.max(ms(a.start_time), ms(b.start_time));
+  const end = Math.min(ms(a.end_time), ms(b.end_time));
+  const shared = end - start;
+  if (shared <= 0) return 0;
+  const shortest = Math.min(ms(a.end_time) - ms(a.start_time), ms(b.end_time) - ms(b.start_time));
+  return shortest <= 0 ? 0 : shared / shortest;
+}
+
+/**
+ * Pick the record that represents the session: best origin, then a typed row
+ * over a wrapper, then the longer record (an interrupted recording is likelier
+ * to be the truncated one).
+ */
+function pickWinner(cluster: WorkoutCandidate[]): WorkoutCandidate {
+  const sorted = [...cluster].sort((a, b) => {
+    const rank = originRank(a.origin) - originRank(b.origin);
+    if (rank !== 0) return rank;
+    const writer = sourceRank(a.source_name) - sourceRank(b.source_name);
+    if (writer !== 0) return writer;
+    const wrapper = Number(isWrapper(a)) - Number(isWrapper(b));
+    if (wrapper !== 0) return wrapper;
+    const typed =
+      Number(a.activity_type.toLowerCase() === 'other') -
+      Number(b.activity_type.toLowerCase() === 'other');
+    if (typed !== 0) return typed;
+    return durationMin(b) - durationMin(a);
+  });
+  // Non-null: callers only build clusters from at least one candidate.
+  return sorted[0] as WorkoutCandidate;
+}
+
+export interface ResolveOptions {
+  /** Writers to ignore entirely. Defaults to {@link DEFAULT_EXCLUDED_SOURCES}. */
+  excludeSources?: string[];
+}
+
+/**
+ * Collapse overlapping workout records into one session each.
+ *
+ * Clustering is transitive on overlap only: A joins a cluster if it overlaps
+ * any member by >= OVERLAP_FRACTION of the shorter record. Records that merely
+ * touch (strength 12:08-12:59 then cycling 13:00-13:35) stay separate.
+ */
+export function resolveSessions(
+  candidates: WorkoutCandidate[],
+  options: ResolveOptions = {},
+): ResolvedSession[] {
+  const excluded = new Set(
+    (options.excludeSources ?? DEFAULT_EXCLUDED_SOURCES).map((s) => s.toLowerCase()),
+  );
+  const usable = candidates
+    .filter((c) => !excluded.has(c.source_name.toLowerCase()))
+    .filter((c) => Number.isFinite(ms(c.start_time)) && Number.isFinite(ms(c.end_time)))
+    // Discard never-stopped live activities *before* clustering. One 27h
+    // wrapper otherwise chains through every walk it spans and swallows a
+    // whole day into a single session. Oura always writes a typed row
+    // alongside, so nothing real is lost.
+    .filter((c) => durationMin(c) <= MAX_PLAUSIBLE_DURATION_MIN)
+    .sort((a, b) => ms(a.start_time) - ms(b.start_time));
+
+  const clusters: WorkoutCandidate[][] = [];
+  for (const candidate of usable) {
+    const target = clusters.find((cluster) =>
+      cluster.some((member) => overlapFraction(member, candidate) >= OVERLAP_FRACTION),
+    );
+    if (target) target.push(candidate);
+    else clusters.push([candidate]);
+  }
+
+  return clusters.map((cluster) => {
+    const winner = pickWinner(cluster);
+    const members = [winner, ...cluster.filter((c) => c !== winner)];
+    const minutes = durationMin(winner);
+    // A wrapper that still won (nothing better overlapped it) keeps its window
+    // but not its implausible duration — see the 27h Aug 19 record.
+    const plausible = minutes <= MAX_PLAUSIBLE_DURATION_MIN;
+    // Prefer a real measurement from any member over the winner's blank.
+    const kcal = members.find((m) => m.energy_kcal != null)?.energy_kcal ?? null;
+    const hr = members.find((m) => m.avg_heart_rate != null)?.avg_heart_rate ?? null;
+    // If the winner is an untyped wrapper, take a typed label from the cluster.
+    const typedMember =
+      winner.activity_type.toLowerCase() === 'other'
+        ? (members.find((m) => m.activity_type.toLowerCase() !== 'other') ?? winner)
+        : winner;
+
+    return {
+      start_time: winner.start_time,
+      end_time: winner.end_time,
+      duration_min: plausible ? Math.round(minutes * 10) / 10 : null,
+      activity: canonicalActivity(typedMember.activity_type),
+      is_resistance: isResistance(typedMember.activity_type),
+      energy_kcal: kcal ?? null,
+      avg_heart_rate: hr ?? null,
+      source: `${winner.origin}:${winner.source_name}`,
+      members,
+    };
+  });
+}
