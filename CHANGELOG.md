@@ -26,6 +26,12 @@ For the architectural rationale behind each change, see [DECISIONS.md](DECISIONS
   collapses overlapping records into one session, preferring the Oura API,
   then Oura via HealthKit, and excluding configured third-party writers.
 
+- **`npm run resolve-sessions`** materialises the resolver's output into a
+  `resolved_sessions` table (schema v9) for consumers that speak only SQL.
+  The deduplication can't be expressed in SQL — it needs transitive overlap
+  clustering with source precedence — so without this, SQL-only consumers
+  count one session several times.
+
 ### Notes
 
 - Storage stays lossless: every source record is kept, and deduplication

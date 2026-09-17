@@ -269,3 +269,16 @@ const resistance = sessions.filter((s) => s.is_resistance);
 
 Pass `{ excludeSources: ['SomeApp'] }` to drop a third-party writer whose
 timer runs long — its rows stay on disk, they just stop being counted.
+
+For consumers that speak only SQL (reporting scripts, agents), materialise
+the resolver's output instead:
+
+```bash
+npm run resolve-sessions                      # rebuild resolved_sessions
+npm run resolve-sessions -- --exclude SomeApp # drop a third-party writer
+```
+
+`resolved_sessions` holds one row per real session — `day`, `activity`,
+`is_resistance`, `duration_min`, `energy_kcal`, `source` — so
+`SUM(is_resistance)` is a correct count. It's a cache: rebuild it after each
+sync or import.

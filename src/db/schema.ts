@@ -429,6 +429,35 @@ const MIGRATIONS: readonly Migration[] = [
       CREATE INDEX IF NOT EXISTS idx_external_workouts_source ON external_workouts(source_name, start_time);
     `,
   },
+  {
+    version: 9,
+    name: 'v0.8: resolved_sessions (materialised dedupe output)',
+    sql: `
+      -- Derived cache, NOT a source of truth: the output of resolveSessions()
+      -- over 'workouts' + 'external_workouts'. Rebuilt wholesale by
+      -- \`npm run resolve-sessions\`, so it can be dropped and regenerated.
+      --
+      -- It exists because SQL can't express the dedupe (transitive overlap
+      -- clustering with source precedence), and consumers that speak only SQL
+      -- would otherwise count the same session several times.
+      CREATE TABLE IF NOT EXISTS resolved_sessions (
+        start_time      TEXT NOT NULL,
+        end_time        TEXT NOT NULL,
+        day             TEXT NOT NULL,    -- local calendar day of start_time
+        activity        TEXT NOT NULL,    -- canonical: 'strength_training', 'walking', ...
+        is_resistance   INTEGER NOT NULL, -- 0/1, so SQL can SUM() it
+        duration_min    REAL,
+        energy_kcal     REAL,
+        avg_heart_rate  REAL,
+        source          TEXT NOT NULL,    -- winning record, e.g. 'apple_health:Oura'
+        member_count    INTEGER NOT NULL, -- source records collapsed into this session
+        resolved_at     TEXT NOT NULL,
+        PRIMARY KEY (start_time, activity)
+      );
+      CREATE INDEX IF NOT EXISTS idx_resolved_sessions_day ON resolved_sessions(day);
+      CREATE INDEX IF NOT EXISTS idx_resolved_sessions_res ON resolved_sessions(is_resistance, day);
+    `,
+  },
 ];
 
 export function currentSchemaVersion(db: Database): number {
