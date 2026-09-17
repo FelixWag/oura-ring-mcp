@@ -232,3 +232,40 @@ whichever feels right for your tolerance for iOS quirks.
   `.env`, the Shortcut, and any other clients).
 - **The DB is the only thing the endpoint writes.** No shell execution,
   no filesystem reads beyond the configured log path.
+
+## Workouts (v0.8)
+
+Workouts do **not** travel through the Shortcut above: the `Find Health
+Samples` action only handles quantity and category samples, and `HKWorkout`
+is neither. They also can't come from the Oura API — sessions recorded with
+Oura's Live Activity Tracking never appear in `/v2/usercollection/workout`.
+
+Until an app pushes them continuously, backfill from an export:
+
+```bash
+# Health app → profile picture → Export All Health Data → unzip
+npm run import-health-export -- ~/Downloads/apple_health_export/export.xml
+
+# See what it would do first
+npm run import-health-export -- <path> --dry-run
+```
+
+Workouts land in `external_workouts`; body-composition and `dietary_*`
+records land in `health_samples`. Both are idempotent, so re-importing a
+newer export only adds what's new.
+
+### Counting sessions
+
+Query `external_workouts` through `resolveSessions()` in
+`src/health/resolve.ts` rather than counting rows directly. One session can
+produce several records — a typed row, a live-activity wrapper written by the
+phone, plus any other app tracking the same workout — and the resolver
+collapses them, preferring the Oura API, then Oura via HealthKit:
+
+```ts
+const sessions = resolveSessions([...apiCandidates, ...healthKitCandidates]);
+const resistance = sessions.filter((s) => s.is_resistance);
+```
+
+Pass `{ excludeSources: ['SomeApp'] }` to drop a third-party writer whose
+timer runs long — its rows stay on disk, they just stop being counted.

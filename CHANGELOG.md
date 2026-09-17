@@ -6,6 +6,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 For the architectural rationale behind each change, see [DECISIONS.md](DECISIONS.md).
 
+## [0.8.0] — 2026-09-17
+
+### Added
+
+- **HealthKit workout import.** New `external_workouts` table (schema v8)
+  stores `HKWorkout` records. This is the only route to workouts recorded
+  with Oura's **Live Activity Tracking**, which the Oura API does not
+  return — `/v2/usercollection/workout` omits them entirely, so anything
+  tracked live is invisible to API-only consumers.
+- **`npm run import-health-export -- <export.xml>`** backfills history from
+  an Apple Health export (Health app → profile → Export All Health Data).
+  Streams the file, so a ~900 MB export parses in about five seconds without
+  loading it into memory. Also imports body-composition and nutrition
+  records, which closes the same gap for `body_mass` and `dietary_*`.
+- **Read-time session resolution** (`src/health/resolve.ts`). One session can
+  produce several records — a typed row, a phone-recorded live-activity
+  wrapper, plus any third-party app writing the same workout. `resolveSessions()`
+  collapses overlapping records into one session, preferring the Oura API,
+  then Oura via HealthKit, and excluding configured third-party writers.
+
+### Notes
+
+- Storage stays lossless: every source record is kept, and deduplication
+  happens at read time, so a rule change needs no re-import.
+- Adjacent records are never merged — strength training immediately followed
+  by cardio is a normal pattern and stays two sessions.
+- Live activities that were never stopped (multi-day durations) are discarded
+  before clustering; left in, one spans a whole day and absorbs every workout
+  it overlaps.
+
 ## [0.7.0] — 2026-06-08
 
 ### Added

@@ -716,3 +716,34 @@ scheduling, which is the OS's job, not ours. launchd beats cron on
 macOS (survives reboots, coalesces missed runs after sleep, per-user).
 The same pattern extends to the voice/health servers once their
 surfaces stabilize; deliberately not templated yet.
+
+## v0.8: HealthKit workouts, and why deduplication happens at read time
+
+Oura's API does not return workouts recorded through Live Activity Tracking.
+Verified against `/v2/usercollection/workout` (OpenAPI 1.39, whose
+`PublicWorkoutSource` enum is `manual | autodetected | confirmed |
+workout_heart_rate`): live-tracked sessions simply never appear, while the
+Oura app does write them to Apple Health. HealthKit is therefore the only
+route to them, which makes workout import a correctness fix rather than a
+convenience feature — an API-only consumer silently undercounts training.
+
+The design question was where to deduplicate. One session can legitimately
+produce several HealthKit records: the app's typed row, a phone-recorded
+live-activity wrapper (`device` set, average heart rate attached, type often
+`Other`), and a second app tracking the same workout. We considered resolving
+on write — one canonical row per session — and rejected it: the rules are
+heuristic (what counts as "the same session"?), and baking a heuristic into
+storage makes a bad rule permanent. `external_workouts` instead keeps every
+source record verbatim, and `resolveSessions()` collapses them on read. A rule
+change is a code change, not a re-import.
+
+Three rules earned their place by breaking first. (1) `Other` is not a
+duplicate marker — it is what Oura writes for any activity Apple has no type
+for, stretching in particular, and most `Other` rows are standalone real
+sessions. (2) Only overlapping records merge, never adjacent ones, because
+strength training followed immediately by cardio is a normal pattern that
+would otherwise collapse into one workout. (3) Records whose duration exceeds
+a plausibility ceiling are dropped before clustering, not merely down-ranked:
+a live activity that was never stopped can span more than a day, and because
+clustering is transitive on overlap it otherwise chains through every workout
+in that window and swallows the day.

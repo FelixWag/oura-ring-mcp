@@ -391,6 +391,44 @@ const MIGRATIONS: readonly Migration[] = [
       CREATE INDEX IF NOT EXISTS idx_health_samples_imported  ON health_samples(imported_at);
     `,
   },
+  {
+    version: 8,
+    name: 'v0.8: external_workouts (HealthKit workout records)',
+    sql: `
+      -- HealthKit HKWorkout records, which the Oura API does NOT return for
+      -- live-tracked sessions. One row per source record, stored verbatim —
+      -- dedupe happens at READ time, never here. The rules (and why) live in
+      -- the wiki page "HealthKit workouts — how to count them exactly once".
+      --
+      -- Key facts encoded by this shape:
+      --   * the same session legitimately appears several times (typed row,
+      --     live-activity wrapper, plus any third-party app), so there is no
+      --     UNIQUE constraint across sources;
+      --   * activity_type 'Other' is NOT a duplicate marker — it's what Oura
+      --     writes for anything Apple has no type for (e.g. stretching);
+      --   * an unstopped live activity can span >24h, so duration is not
+      --     trustworthy on its own.
+      CREATE TABLE IF NOT EXISTS external_workouts (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        source          TEXT NOT NULL,    -- 'apple_health' (future: other bridges)
+        source_name     TEXT NOT NULL,    -- writing app: 'Oura', a lifting tracker, ...
+        activity_type   TEXT NOT NULL,    -- HK type minus prefix: 'TraditionalStrengthTraining', 'Other', ...
+        start_time      TEXT NOT NULL,    -- ISO 8601 with offset
+        end_time        TEXT NOT NULL,
+        duration_min    REAL,             -- as reported; sanity-check before use
+        energy_kcal     REAL,
+        distance_km     REAL,
+        avg_heart_rate  REAL,             -- present on phone-recorded wrapper rows
+        device          TEXT,             -- HKDevice string; non-null ⇒ phone-recorded
+        created_at      TEXT,             -- HK creationDate (when the app wrote it)
+        imported_at     TEXT NOT NULL,
+        raw             TEXT,             -- full attribute set, for losslessness
+        UNIQUE(source_name, start_time, end_time, activity_type)
+      );
+      CREATE INDEX IF NOT EXISTS idx_external_workouts_start  ON external_workouts(start_time);
+      CREATE INDEX IF NOT EXISTS idx_external_workouts_source ON external_workouts(source_name, start_time);
+    `,
+  },
 ];
 
 export function currentSchemaVersion(db: Database): number {
