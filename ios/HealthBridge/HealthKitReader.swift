@@ -89,7 +89,8 @@ enum HealthKitReader {
             "start_time": iso8601.string(from: workout.startDate),
             "end_time": iso8601.string(from: workout.endDate),
             "duration_min": workout.duration / 60.0,
-            "created_at": iso8601.string(from: workout.startDate),
+            // No created_at: HealthKit doesn't expose when a record was
+            // written, and sending the start date instead would be a lie.
         ]
 
         // A device is attached when the phone recorded the session live. The
@@ -156,6 +157,9 @@ enum HealthKitReader {
 
     /// Ask HealthKit to wake the app when new data lands, so a sync doesn't
     /// depend on the app being opened. iOS decides the actual timing.
+    ///
+    /// On its own this only *wakes* the app. The observer queries registered
+    /// by `startObserving` are what actually run a sync once it's awake.
     static func enableBackgroundDelivery() async throws {
         try await store.enableBackgroundDelivery(
             for: HKObjectType.workoutType(),
@@ -165,6 +169,32 @@ enum HealthKitReader {
             if let type = HKQuantityType.quantityType(forIdentifier: entry.identifier) {
                 try? await store.enableBackgroundDelivery(for: type, frequency: .hourly)
             }
+        }
+    }
+
+    /// Register one observer query per synced type. Must run at every launch —
+    /// including background launches, when no UI is created — because observer
+    /// queries don't survive the process. `onChange` must finish before the
+    /// completion handler is called, or iOS stops granting background time.
+    static func startObserving(onChange: @escaping @Sendable () async -> Void) {
+        var types: [HKSampleType] = [HKObjectType.workoutType()]
+        for entry in quantityTypes {
+            if let t = HKQuantityType.quantityType(forIdentifier: entry.identifier) {
+                types.append(t)
+            }
+        }
+        for type in types {
+            let query = HKObserverQuery(sampleType: type, predicate: nil) { _, completionHandler, error in
+                guard error == nil else {
+                    completionHandler()
+                    return
+                }
+                Task {
+                    await onChange()
+                    completionHandler()
+                }
+            }
+            store.execute(query)
         }
     }
 
@@ -209,7 +239,10 @@ enum HealthKitReader {
         // Apple maps anything without a match to .other, which is NOT a
         // duplicate marker — stretching commonly lands here.
         case .other: return "Other"
-        @unknown default: return "Unknown"
+        // HealthKit has ~80 types; the rest are rare enough not to name. The
+        // raw value keeps them distinct (and never mistaken for resistance)
+        // rather than collapsing them all into one bucket.
+        default: return "ActivityType\(type.rawValue)"
         }
     }
 }

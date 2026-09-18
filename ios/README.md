@@ -24,25 +24,33 @@ What it syncs:
 
 ## Build it
 
-Xcode 16 or newer, iOS 17 or newer.
+The Xcode project is generated from `project.yml` by
+[XcodeGen](https://github.com/yonaskolb/XcodeGen) and committed, so you only
+need Xcode to build. Xcode 16 or newer, iOS 17 or newer.
 
-1. **New project** → iOS → App. Product name `HealthBridge`, interface
-   SwiftUI, language Swift.
-2. Delete the generated `ContentView.swift` and `HealthBridgeApp.swift`, then
-   drag in the three files from `HealthBridge/` here.
-3. **Signing & Capabilities** → select your team → **+ Capability** →
-   **HealthKit**, and tick **Background Delivery**.
-4. **Info** tab → add:
-   - `NSHealthShareUsageDescription` — "Reads your workouts, weight and
-     nutrition so they can be saved to your own server."
-   - (No write description: the app never writes to HealthKit.)
-5. Run on the device. Grant the Health permissions when asked.
-6. Enter the server URL (`http://<host>:8771`) and your `HEALTH_IMPORT_TOKEN`,
-   then tap **Sync now**.
+1. Open `ios/HealthBridge.xcodeproj`.
+2. **Xcode → Settings → Accounts** → add your Apple ID.
+3. Select the **HealthBridge** target → **Signing & Capabilities** → pick your
+   team. If Xcode says the bundle identifier is taken, change it to anything
+   unique — it only has to be unique to your team.
+4. Connect the iPhone by cable, unlock it, tap **Trust**. On iOS 16+ enable
+   **Settings → Privacy & Security → Developer Mode** (the phone restarts).
+5. Choose the iPhone as the run destination and press **⌘R**.
+6. With a free Apple ID, the first launch is blocked until you trust the
+   certificate: **Settings → General → VPN & Device Management**.
+7. In the app, enter the server URL (`http://<host>:8771`) and your
+   `HEALTH_IMPORT_TOKEN`, tap **Sync now**, and allow every Health category.
 
-> **HTTP on a private network.** If the server isn't behind TLS, add an App
-> Transport Security exception for that host in Info.plist, or put the server
-> behind HTTPS. Don't disable ATS wholesale.
+Health permissions, the HealthKit entitlement with Background Delivery, and
+the App Transport Security exception are already set in `project.yml`.
+
+After editing `project.yml`, regenerate with `cd ios && xcodegen generate`
+rather than editing the `.xcodeproj` by hand.
+
+> **HTTP on a private network.** `project.yml` allows plain HTTP because the
+> server is normally reached over a private network such as Tailscale. An App
+> Store build should require HTTPS instead (for example via `tailscale serve`)
+> and drop `NSAllowsArbitraryLoads`.
 
 ### Signing lifetimes
 

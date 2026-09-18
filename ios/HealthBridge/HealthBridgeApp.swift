@@ -3,13 +3,23 @@ import SwiftUI
 
 @main
 struct HealthBridgeApp: App {
-    @StateObject private var settings = Settings()
+    @StateObject private var settings: Settings
     @StateObject private var sync: SyncService
 
     init() {
         let settings = Settings()
+        let sync = SyncService(settings: settings)
         _settings = StateObject(wrappedValue: settings)
-        _sync = StateObject(wrappedValue: SyncService(settings: settings))
+        _sync = StateObject(wrappedValue: sync)
+
+        // Registered in init, not in a view: on a background launch iOS runs
+        // the app without building any UI, so a view's .task never fires.
+        // Several types changing at once each trigger a sync; SyncService
+        // ignores calls while one is already running, and anchors make any
+        // extra run a cheap no-op.
+        HealthKitReader.startObserving {
+            await sync.sync()
+        }
     }
 
     var body: some Scene {
@@ -38,7 +48,7 @@ struct ContentView: View {
         NavigationStack {
             Form {
                 Section("Server") {
-                    TextField("https://host:8771", text: $settings.serverURL)
+                    TextField("http://server-address:8771", text: $settings.serverURL)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                         .keyboardType(.URL)
