@@ -177,6 +177,98 @@ describe('resolveSessions', () => {
   });
 });
 
+describe('handoff merging (one effort split across two apps)', () => {
+  const rec = (
+    source_name: string,
+    activity_type: string,
+    start: string,
+    end: string,
+  ): WorkoutCandidate => ({
+    origin: 'apple_health',
+    source_name,
+    activity_type,
+    start_time: `2026-01-31T${start}:00+02:00`,
+    end_time: `2026-01-31T${end}:00+02:00`,
+  });
+
+  it('merges a run two apps each caught half of', () => {
+    // The real shape: a run tracker stops at 11:37, the ring picks up 11:36.
+    const sessions = resolveSessions([
+      rec('RunTracker', 'Running', '11:21', '11:37'),
+      rec('Oura', 'Running', '11:36', '11:57'),
+    ]);
+
+    expect(sessions).toHaveLength(1);
+    expect(sessions[0]?.activity).toBe('running');
+    // Oura still supplies the window — precedence is unchanged by merging.
+    expect(sessions[0]?.source).toBe('apple_health:Oura');
+    expect(sessions[0]?.members).toHaveLength(2);
+  });
+
+  it('keeps two back-to-back records from the SAME app separate', () => {
+    // Interval work, or simply two walks. Same writer means two sessions.
+    const sessions = resolveSessions([
+      rec('Oura', 'Running', '11:21', '11:37'),
+      rec('Oura', 'Running', '11:38', '11:57'),
+    ]);
+
+    expect(sessions).toHaveLength(2);
+  });
+
+  it('does not merge different activities across apps', () => {
+    // A run then core training is two workouts, not one handoff.
+    const sessions = resolveSessions([
+      rec('RunTracker', 'Running', '11:21', '11:37'),
+      rec('Watch', 'CoreTraining', '11:39', '11:50'),
+    ]);
+
+    expect(sessions).toHaveLength(2);
+  });
+
+  it('does not merge across a gap wider than the handoff window', () => {
+    const sessions = resolveSessions([
+      rec('RunTracker', 'Running', '11:21', '11:37'),
+      rec('Oura', 'Running', '11:50', '12:10'),
+    ]);
+
+    expect(sessions).toHaveLength(2);
+  });
+
+  it('will not chain short records into an implausible super-session', () => {
+    // Alternating writers, each 5 min apart, must not accumulate past the cap.
+    const candidates: WorkoutCandidate[] = [];
+    for (let i = 0; i < 40; i += 1) {
+      const startMin = i * 15;
+      const pad = (n: number) => String(n).padStart(2, '0');
+      candidates.push(
+        rec(
+          i % 2 === 0 ? 'AppA' : 'AppB',
+          'Walking',
+          `${pad(6 + Math.floor(startMin / 60))}:${pad(startMin % 60)}`,
+          `${pad(6 + Math.floor((startMin + 10) / 60))}:${pad((startMin + 10) % 60)}`,
+        ),
+      );
+    }
+    const sessions = resolveSessions(candidates);
+
+    expect(sessions.length).toBeGreaterThan(1);
+    for (const s of sessions) {
+      const minutes = (Date.parse(s.end_time) - Date.parse(s.start_time)) / 60000;
+      expect(minutes).toBeLessThanOrEqual(6 * 60);
+    }
+  });
+
+  it('keeps strength then cardio separate even across apps', () => {
+    // The pattern that must never merge, now tested cross-source too.
+    const sessions = resolveSessions([
+      rec('Oura', 'TraditionalStrengthTraining', '12:08', '12:59'),
+      rec('OtherApp', 'Cycling', '13:00', '13:35'),
+    ]);
+
+    expect(sessions).toHaveLength(2);
+  });
+});
+
 describe('activity labels', () => {
   it('treats both strength-training flavours as resistance', () => {
     // The same gym visit is labelled differently across days.
@@ -262,5 +354,28 @@ describe('auditSessions', () => {
     });
 
     expect(findings.some((f) => f.code === 'possible_cross_source_duplicate')).toBe(true);
+  });
+});
+
+describe('same-app artefacts', () => {
+  it("merges one app's two overlapping records of the same activity", () => {
+    // One app cannot have you lifting twice at once.
+    const sessions = resolveSessions([
+      hk('Oura', 'TraditionalStrengthTraining', '20:06', '20:25'),
+      hk('Oura', 'TraditionalStrengthTraining', '20:12', '20:22'),
+    ]);
+
+    expect(sessions).toHaveLength(1);
+  });
+
+  it("leaves one app's overlapping records of DIFFERENT activities alone", () => {
+    // A walk detected inside a ride: which is real is not this code's call.
+    // 29% overlap — past the same-activity threshold, short of the generic one.
+    const sessions = resolveSessions([
+      hk('Oura', 'Cycling', '11:27', '11:55'),
+      hk('Oura', 'Walking', '11:47', '12:15'),
+    ]);
+
+    expect(sessions).toHaveLength(2);
   });
 });

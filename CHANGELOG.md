@@ -43,6 +43,15 @@ For the architectural rationale behind each change, see [DECISIONS.md](DECISIONS
   posts to the two endpoints. It exists because Shortcuts cannot read workouts
   at all; see [`ios/README.md`](ios/README.md).
 
+- **Two narrower dedupe rules**, both found by auditing real data:
+  a _handoff_ — one continuous effort that two different apps each caught part
+  of (a run tracker stopping as the ring picks up) — now resolves to one
+  session when the records sit within 5 minutes and agree on the activity; and
+  a single app's two overlapping records of the _same_ activity now collapse,
+  since one app cannot have you doing a thing twice at once. Both are
+  deliberately narrow: a wrong merge erases a real session, whereas a missed
+  merge only leaves a duplicate the audit flags.
+
 ### Notes
 
 - Storage stays lossless: every source record is kept, and deduplication

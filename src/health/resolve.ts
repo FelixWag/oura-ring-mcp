@@ -34,6 +34,22 @@ const OVERLAP_FRACTION = 0.5;
 const MAX_PLAUSIBLE_DURATION_MIN = 6 * 60;
 
 /**
+ * Edge-to-edge gap within which two *different* apps recording the same
+ * activity are treated as one interrupted session rather than two. Kept
+ * small: a genuine back-to-back pair is usually further apart, and a missed
+ * merge only produces a duplicate the audit flags, whereas a wrong merge
+ * erases a real session.
+ */
+const CROSS_SOURCE_HANDOFF_GAP_MIN = 5;
+
+/**
+ * Overlap at which one app's two records of the SAME activity are treated as
+ * one session. Lower than {@link OVERLAP_FRACTION} because a single app
+ * recording itself twice is a detection artefact, not two workouts.
+ */
+const SAME_SOURCE_SAME_ACTIVITY_OVERLAP = 0.15;
+
+/**
  * Writers whose records are stored but not counted. Empty by default: which
  * apps to trust is deployment-specific. Pass `excludeSources` to drop a
  * third-party tracker whose timer runs long, keeping its rows on disk.
@@ -165,6 +181,72 @@ export interface ResolveOptions {
 }
 
 /**
+ * Merge "handoffs": one continuous effort that two apps split between them,
+ * each capturing a different slice. Observed shape — a run tracker recording
+ * 11:21-11:37 and the ring auto-detecting 11:36-11:57. Barely any overlap, so
+ * the overlap rule leaves them as two sessions; in reality it's one run.
+ *
+ * The conditions are deliberately narrow, because the cost of a wrong merge
+ * (a real session disappears) is worse than the cost of a missed one (a
+ * duplicate, which the audit then flags):
+ *
+ *   - DIFFERENT writers. Two records from the same app that don't overlap are
+ *     two sessions — that's how interval work and strength-then-cardio look.
+ *   - SAME canonical activity. A run next to strength training is a superset
+ *     workout, not a handoff.
+ *   - Edge-to-edge gap within CROSS_SOURCE_HANDOFF_GAP_MIN, measured between
+ *     the clusters, not their starts.
+ *   - The union stays within MAX_PLAUSIBLE_DURATION_MIN, so a chain of short
+ *     records can't silently grow into an all-day "session".
+ *
+ * Merging only affects *counting*: the winning record still supplies the
+ * window and metrics, per the source precedence rules.
+ */
+function mergeHandoffs(clusters: WorkoutCandidate[][]): WorkoutCandidate[][] {
+  if (clusters.length < 2) return clusters;
+
+  const span = (cluster: WorkoutCandidate[]): { start: number; end: number } => ({
+    start: Math.min(...cluster.map((c) => ms(c.start_time))),
+    end: Math.max(...cluster.map((c) => ms(c.end_time))),
+  });
+  const sources = (cluster: WorkoutCandidate[]): Set<string> =>
+    new Set(cluster.map((c) => c.source_name.toLowerCase()));
+  const activities = (cluster: WorkoutCandidate[]): Set<string> =>
+    new Set(cluster.map((c) => canonicalActivity(c.activity_type)));
+
+  const ordered = [...clusters].sort((a, b) => span(a).start - span(b).start);
+  const merged: WorkoutCandidate[][] = [];
+
+  for (const cluster of ordered) {
+    const previous = merged[merged.length - 1];
+    if (!previous) {
+      merged.push(cluster);
+      continue;
+    }
+
+    const gapMin = (span(cluster).start - span(previous).end) / 60000;
+    const unionMin = (span(cluster).end - span(previous).start) / 60000;
+    const sharedActivity = [...activities(cluster)].some((a) => activities(previous).has(a));
+    // Disjoint writers: if the same app appears on both sides, these are its
+    // own two sessions and must stay separate.
+    const disjointSources = [...sources(cluster)].every((s) => !sources(previous).has(s));
+
+    if (
+      sharedActivity &&
+      disjointSources &&
+      gapMin <= CROSS_SOURCE_HANDOFF_GAP_MIN &&
+      unionMin <= MAX_PLAUSIBLE_DURATION_MIN
+    ) {
+      previous.push(...cluster);
+    } else {
+      merged.push(cluster);
+    }
+  }
+
+  return merged;
+}
+
+/**
  * Collapse overlapping workout records into one session each.
  *
  * Clustering is transitive on overlap only: A joins a cluster if it overlaps
@@ -191,13 +273,26 @@ export function resolveSessions(
   const clusters: WorkoutCandidate[][] = [];
   for (const candidate of usable) {
     const target = clusters.find((cluster) =>
-      cluster.some((member) => overlapFraction(member, candidate) >= OVERLAP_FRACTION),
+      cluster.some(
+        (member) =>
+          overlapFraction(member, candidate) >= OVERLAP_FRACTION ||
+          // One app cannot have you doing the same activity twice at once, so
+          // any real overlap between its own same-activity records is an
+          // artefact of its detection, not two sessions. Deliberately narrow:
+          // different activities from one app (it auto-detected a walk inside
+          // a ride) stay separate, because which one is real is a judgement
+          // this code shouldn't make silently.
+          (member.source_name.toLowerCase() === candidate.source_name.toLowerCase() &&
+            canonicalActivity(member.activity_type) ===
+              canonicalActivity(candidate.activity_type) &&
+            overlapFraction(member, candidate) >= SAME_SOURCE_SAME_ACTIVITY_OVERLAP),
+      ),
     );
     if (target) target.push(candidate);
     else clusters.push([candidate]);
   }
 
-  return clusters.map((cluster) => {
+  return mergeHandoffs(clusters).map((cluster) => {
     const winner = pickWinner(cluster);
     const members = [winner, ...cluster.filter((c) => c !== winner)];
     const minutes = durationMin(winner);
