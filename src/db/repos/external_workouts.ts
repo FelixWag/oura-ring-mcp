@@ -53,8 +53,8 @@ export class ExternalWorkoutsRepo {
       `INSERT OR IGNORE INTO external_workouts
          (source, source_name, activity_type, start_time, end_time, duration_min,
           energy_kcal, distance_km, avg_heart_rate, device, created_at, imported_at, raw,
-          external_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          external_id, start_epoch, end_epoch)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     );
     const importedAt = new Date().toISOString();
     let inserted = 0;
@@ -76,6 +76,11 @@ export class ExternalWorkoutsRepo {
           importedAt,
           w.raw ?? null,
           w.external_id ?? null,
+          // Offset-free identity: the same instant written with different
+          // UTC offsets must collide, or an export and a native sync store
+          // the same workout twice.
+          Math.floor(Date.parse(w.start_time) / 1000),
+          Math.floor(Date.parse(w.end_time) / 1000),
         );
         if (info.changes > 0) inserted += 1;
       }

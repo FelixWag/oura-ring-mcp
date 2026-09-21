@@ -346,6 +346,38 @@ describe('POST /v1/health/workouts', () => {
     expect(count.n).toBe(1);
   });
 
+  it('dedupes the same instant written with a different UTC offset', async () => {
+    // The bug this pins: Apple's export stamps every record with the offset
+    // in force on export day, while a native reader uses the offset that
+    // applied on the day itself. Same moment, different text, two rows.
+    const app = buildApp();
+    await request(app)
+      .post('/v1/health/workouts')
+      .set('Authorization', `Bearer ${TOKEN}`)
+      .send([
+        workout({
+          external_id: null,
+          start_time: '2026-01-15T20:29:43+02:00',
+          end_time: '2026-01-15T21:00:00+02:00',
+        }),
+      ]);
+    const res = await request(app)
+      .post('/v1/health/workouts')
+      .set('Authorization', `Bearer ${TOKEN}`)
+      .send([
+        workout({
+          start_time: '2026-01-15T19:29:43+01:00',
+          end_time: '2026-01-15T20:00:00+01:00',
+        }),
+      ]);
+
+    expect(res.body).toMatchObject({ inserted: 0, deduped: 1 });
+    const count = db.prepare('SELECT COUNT(*) AS n FROM external_workouts').get() as {
+      n: number;
+    };
+    expect(count.n).toBe(1);
+  });
+
   it('accepts a {workouts: [...]} envelope', async () => {
     const res = await request(buildApp())
       .post('/v1/health/workouts')

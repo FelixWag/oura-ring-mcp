@@ -52,6 +52,17 @@ For the architectural rationale behind each change, see [DECISIONS.md](DECISIONS
   deliberately narrow: a wrong merge erases a real session, whereas a missed
   merge only leaves a duplicate the audit flags.
 
+- **Dedupe by instant, not by timestamp text** (schema v11). Apple's export
+  stamps every record with the UTC offset in force on export day, while a
+  native reader uses the offset that applied on the day itself — the same
+  moment written two ways, so 327 workouts were stored twice. Epoch columns
+  now carry identity; the migration collapses the existing duplicates.
+- **A live-activity wrapper can no longer swallow neighbouring records.**
+  Wrappers attach to a cluster but never build one: one that overran its
+  workout by a minute used to bridge that session to an unrelated record and
+  cost it its identity. A seconds-long fragment can no longer represent a
+  cluster containing a real session either, whatever its source.
+
 ### Notes
 
 - Storage stays lossless: every source record is kept, and deduplication

@@ -43,6 +43,16 @@ const MAX_PLAUSIBLE_DURATION_MIN = 6 * 60;
 const CROSS_SOURCE_HANDOFF_GAP_MIN = 5;
 
 /**
+ * A record this short sitting beside a same-activity record is a detection
+ * fragment, not a session — observed: a 21-second "run" recorded 19 seconds
+ * before the real 11-minute one. Absorbed into its neighbour rather than
+ * dropped, so its energy still counts; a fragment with no neighbour stays a
+ * session, because a genuinely brief workout is still a workout.
+ */
+const FRAGMENT_MAX_MIN = 2;
+const FRAGMENT_GAP_MIN = 2;
+
+/**
  * Overlap at which one app's two records of the SAME activity are treated as
  * one session. Lower than {@link OVERLAP_FRACTION} because a single app
  * recording itself twice is a detection artefact, not two workouts.
@@ -158,7 +168,16 @@ function overlapFraction(a: WorkoutCandidate, b: WorkoutCandidate): number {
  * to be the truncated one).
  */
 function pickWinner(cluster: WorkoutCandidate[]): WorkoutCandidate {
+  const longest = Math.max(...cluster.map(durationMin));
+  // A seconds-long detection blip must not speak for a cluster that contains
+  // a real session, however good its source. Observed: a 21-second Oura API
+  // "run" outranking a 51-minute gym session and erasing it from the day.
+  const isFragment = (c: WorkoutCandidate): boolean =>
+    durationMin(c) <= FRAGMENT_MAX_MIN && longest > FRAGMENT_MAX_MIN;
+
   const sorted = [...cluster].sort((a, b) => {
+    const fragment = Number(isFragment(a)) - Number(isFragment(b));
+    if (fragment !== 0) return fragment;
     const rank = originRank(a.origin) - originRank(b.origin);
     if (rank !== 0) return rank;
     const writer = sourceRank(a.source_name) - sourceRank(b.source_name);
@@ -231,12 +250,17 @@ function mergeHandoffs(clusters: WorkoutCandidate[][]): WorkoutCandidate[][] {
     // own two sessions and must stay separate.
     const disjointSources = [...sources(cluster)].every((s) => !sources(previous).has(s));
 
-    if (
-      sharedActivity &&
-      disjointSources &&
-      gapMin <= CROSS_SOURCE_HANDOFF_GAP_MIN &&
-      unionMin <= MAX_PLAUSIBLE_DURATION_MIN
-    ) {
+    // A fragment may be absorbed by the SAME writer too: one app emitting a
+    // blip next to the real record is the common case. Interval work is
+    // unaffected, since those records are far longer than a fragment.
+    const shorterMin = Math.min(
+      (span(cluster).end - span(cluster).start) / 60000,
+      (span(previous).end - span(previous).start) / 60000,
+    );
+    const isFragment = shorterMin <= FRAGMENT_MAX_MIN && gapMin <= FRAGMENT_GAP_MIN;
+    const isHandoff = disjointSources && gapMin <= CROSS_SOURCE_HANDOFF_GAP_MIN;
+
+    if (sharedActivity && (isHandoff || isFragment) && unionMin <= MAX_PLAUSIBLE_DURATION_MIN) {
       previous.push(...cluster);
     } else {
       merged.push(cluster);
@@ -270,8 +294,16 @@ export function resolveSessions(
     .filter((c) => durationMin(c) <= MAX_PLAUSIBLE_DURATION_MIN)
     .sort((a, b) => ms(a.start_time) - ms(b.start_time));
 
+  // Wrappers are attached to a cluster but never used to build one. A live
+  // activity left running past its workout (e.g. a 52-min wrapper around a
+  // 51-min gym session) otherwise acts as a bridge: an unrelated record that
+  // happens to fall inside it joins the same cluster, and the gym session
+  // then loses its identity to whatever wins there.
+  const seeds = usable.filter((c) => !isWrapper(c));
+  const wrappers = usable.filter((c) => isWrapper(c));
+
   const clusters: WorkoutCandidate[][] = [];
-  for (const candidate of usable) {
+  for (const candidate of seeds) {
     const target = clusters.find((cluster) =>
       cluster.some(
         (member) =>
@@ -291,6 +323,33 @@ export function resolveSessions(
     if (target) target.push(candidate);
     else clusters.push([candidate]);
   }
+
+  // Attach each wrapper to whichever cluster it shares the most *time* with —
+  // not the highest overlap fraction, which a seconds-long record would win
+  // outright. A wrapper matching nothing stands alone, so a live activity
+  // recorded without a typed twin is still a session.
+  for (const wrapper of wrappers) {
+    let best: WorkoutCandidate[] | null = null;
+    let bestShared = 0;
+    for (const cluster of clusters) {
+      const shared = Math.max(
+        ...cluster.map((m) =>
+          Math.max(
+            0,
+            Math.min(ms(m.end_time), ms(wrapper.end_time)) -
+              Math.max(ms(m.start_time), ms(wrapper.start_time)),
+          ),
+        ),
+      );
+      if (shared > bestShared) {
+        bestShared = shared;
+        best = cluster;
+      }
+    }
+    if (best) best.push(wrapper);
+    else clusters.push([wrapper]);
+  }
+  clusters.sort((a, b) => ms(a[0]?.start_time ?? '') - ms(b[0]?.start_time ?? ''));
 
   return mergeHandoffs(clusters).map((cluster) => {
     const winner = pickWinner(cluster);

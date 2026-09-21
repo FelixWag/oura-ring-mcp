@@ -379,3 +379,86 @@ describe('same-app artefacts', () => {
     expect(sessions).toHaveLength(2);
   });
 });
+
+describe('detection fragments', () => {
+  const at = (start: string, end: string, source = 'Oura'): WorkoutCandidate => ({
+    origin: 'apple_health',
+    source_name: source,
+    activity_type: 'Running',
+    start_time: `2026-01-15T${start}+02:00`,
+    end_time: `2026-01-15T${end}+02:00`,
+  });
+
+  it('absorbs a seconds-long blip into the real session beside it', () => {
+    // Observed: a 21-second "run" 19 seconds before the actual run.
+    const sessions = resolveSessions([at('18:02:58', '18:03:19'), at('18:03:38', '18:15:04')]);
+
+    expect(sessions).toHaveLength(1);
+    expect(sessions[0]?.duration_min).toBeCloseTo(11.4, 1);
+  });
+
+  it('keeps a short workout that stands alone', () => {
+    // Brief but real: nothing adjacent to absorb it into.
+    const sessions = resolveSessions([at('18:02:58', '18:04:30')]);
+
+    expect(sessions).toHaveLength(1);
+  });
+
+  it('still keeps genuine back-to-back intervals apart', () => {
+    // Both well past fragment length, so the rule doesn't touch them.
+    const sessions = resolveSessions([at('11:21:00', '11:37:00'), at('11:38:00', '11:57:00')]);
+
+    expect(sessions).toHaveLength(2);
+  });
+});
+
+describe('a live-activity wrapper must not swallow the day', () => {
+  const rec = (
+    activity_type: string,
+    start: string,
+    end: string,
+    extra: Partial<WorkoutCandidate> = {},
+  ): WorkoutCandidate => ({
+    origin: 'apple_health',
+    source_name: 'Oura',
+    activity_type,
+    start_time: `2026-01-15T${start}+02:00`,
+    end_time: `2026-01-15T${end}+02:00`,
+    ...extra,
+  });
+
+  it('keeps the gym session when a wrapper overruns into an unrelated blip', () => {
+    // The real failure: a 52-min wrapper ran 1 min past the strength session,
+    // caught a 21-second "run", bridged the two into one cluster, and the
+    // API-sourced blip then won it — the gym session disappeared entirely.
+    const sessions = resolveSessions([
+      rec('Other', '17:11:32', '18:03:30', { device: '<<HKDevice: name:iPhone>>' }),
+      rec('TraditionalStrengthTraining', '17:11:35', '18:02:33'),
+      {
+        origin: 'oura_api',
+        source_name: 'Oura',
+        activity_type: 'running',
+        start_time: '2026-01-15T18:02:58+02:00',
+        end_time: '2026-01-15T18:03:19+02:00',
+      },
+      rec('Running', '18:03:38', '18:15:04'),
+    ]);
+
+    const strength = sessions.filter((s) => s.is_resistance);
+    expect(strength).toHaveLength(1);
+    expect(strength[0]?.duration_min).toBeCloseTo(51, 0);
+
+    // And the blip is absorbed by the real run rather than counted.
+    const runs = sessions.filter((s) => s.activity === 'running');
+    expect(runs).toHaveLength(1);
+    expect(runs[0]?.duration_min).toBeGreaterThan(10);
+  });
+
+  it('still keeps a wrapper that has no typed twin', () => {
+    const sessions = resolveSessions([
+      rec('Other', '07:25:00', '07:55:00', { device: '<<HKDevice: name:iPhone>>' }),
+    ]);
+
+    expect(sessions).toHaveLength(1);
+  });
+});

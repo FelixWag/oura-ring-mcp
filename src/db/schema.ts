@@ -475,6 +475,46 @@ const MIGRATIONS: readonly Migration[] = [
         WHERE external_id IS NOT NULL;
     `,
   },
+  {
+    version: 11,
+    name: 'v0.8: dedupe workouts by instant, not by timestamp text',
+    sql: `
+      -- The original key compared ISO strings, which silently failed across
+      -- UTC offsets: Apple's export stamps every record with the offset in
+      -- force on export day (e.g. +02:00 for a January workout), while a
+      -- native reader uses the offset that actually applied then (+01:00).
+      -- Same instant, different text, so 327 rows imported twice.
+      --
+      -- Epoch seconds are offset-free, so this compares what the times mean
+      -- rather than how they were written. The columns are maintained by the
+      -- repo rather than GENERATED, because SQLite won't index date/time
+      -- functions (it can't prove they're deterministic).
+      ALTER TABLE external_workouts ADD COLUMN start_epoch INTEGER;
+      ALTER TABLE external_workouts ADD COLUMN end_epoch INTEGER;
+
+      UPDATE external_workouts
+         SET start_epoch = CAST(strftime('%s', start_time) AS INTEGER),
+             end_epoch   = CAST(strftime('%s', end_time) AS INTEGER);
+
+      -- Collapse the rows that got in before the fix, keeping the copy that
+      -- carries a HealthKit UUID (exact identity for future syncs) and
+      -- otherwise the one imported first.
+      DELETE FROM external_workouts
+       WHERE id NOT IN (
+         SELECT id FROM (
+           SELECT id, ROW_NUMBER() OVER (
+             PARTITION BY source_name, activity_type, start_epoch, end_epoch
+             ORDER BY (external_id IS NULL), id
+           ) AS rn
+           FROM external_workouts
+         )
+         WHERE rn = 1
+       );
+
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_external_workouts_instant
+        ON external_workouts(source_name, activity_type, start_epoch, end_epoch);
+    `,
+  },
 ];
 
 export function currentSchemaVersion(db: Database): number {
