@@ -25,8 +25,15 @@ What it syncs:
 ## Build it
 
 The Xcode project is generated from `project.yml` by
-[XcodeGen](https://github.com/yonaskolb/XcodeGen) and committed, so you only
-need Xcode to build. Xcode 16 or newer, iOS 17 or newer.
+[XcodeGen](https://github.com/yonaskolb/XcodeGen). It is deliberately **not**
+committed: Xcode writes `DEVELOPMENT_TEAM` — a personal Apple Developer
+identifier — into the project file as soon as you choose a signing team, and
+this repository is public. Xcode 16 or newer, iOS 17 or newer.
+
+```bash
+brew install xcodegen      # once
+cd ios && xcodegen generate
+```
 
 1. Open `ios/HealthBridge.xcodeproj`.
 2. **Xcode → Settings → Accounts** → add your Apple ID.
@@ -45,7 +52,8 @@ Health permissions, the HealthKit entitlement with Background Delivery, and
 the App Transport Security exception are already set in `project.yml`.
 
 After editing `project.yml`, regenerate with `cd ios && xcodegen generate`
-rather than editing the `.xcodeproj` by hand.
+rather than editing the `.xcodeproj` by hand. Your signing team lives only in
+your local copy, which is the point.
 
 > **HTTP on a private network.** `project.yml` allows plain HTTP because the
 > server is normally reached over a private network such as Tailscale. An App
