@@ -33,7 +33,7 @@ Save the following as `~/Library/LaunchAgents/com.oura-ring-mcp.sync.plist`,
   <array>
     <string>/bin/zsh</string>
     <string>-lc</string>
-    <string>export PATH="/opt/homebrew/bin:$PATH" &amp;&amp; npm run sync</string>
+    <string>export PATH="/opt/homebrew/bin:$PATH" &amp;&amp; npm run sync &amp;&amp; npm run resolve-sessions</string>
   </array>
 
   <!-- Every hour. Also runs once at load/login. -->
@@ -63,6 +63,12 @@ tail -f logs/sync.launchd.log
 ```
 
 From now on the sync runs hourly and at every login. No terminal needed.
+
+`resolve-sessions` is chained onto the sync because `resolved_sessions` is a
+cache derived from what the sync just fetched — leaving it stale is how a
+report ends up quietly missing a workout. It also runs the dedupe audit, and
+exits non-zero if two counted sessions overlap, so `sync.launchd.log` is where
+a double-counting problem shows up first.
 
 ## Managing it
 

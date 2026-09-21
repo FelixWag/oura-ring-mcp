@@ -747,3 +747,28 @@ a plausibility ceiling are dropped before clustering, not merely down-ranked:
 a live activity that was never stopped can span more than a day, and because
 clustering is transitive on overlap it otherwise chains through every workout
 in that window and swallows the day.
+
+## v0.8: auditing the deduplication, and a native reader
+
+Two follow-ups to the read-time resolver, both aimed at the same failure
+mode: a dedupe heuristic that quietly stops working produces a plausible
+number, and plausible numbers don't get questioned.
+
+**The audit runs on every rebuild, not on request.** It asserts the invariant
+that resolved sessions must not overlap each other — if they do, clustering
+failed and a workout is counted twice — and exits non-zero so a scheduled job
+fails loudly. It also flags the two shapes that precede future duplicates:
+a writer app appearing in HealthKit for the first time (the likeliest cause,
+since it silently adds a second record per session), and same-activity pairs
+from different sources that start close together but overlap too little to
+merge. Run against real data it immediately surfaced both a same-source pair
+six minutes apart and a run recorded by two apps twenty minutes apart.
+
+**Dedupe gets an exact key where one is available.** HealthKit assigns every
+sample a UUID, but iOS Shortcuts drops it, which is why the original key was
+`(source_name, start_time, end_time, activity_type)` — a heuristic that breaks
+if an app edits a workout's times afterwards. A native reader can send the
+UUID, so `external_workouts.external_id` (schema v10) carries it, with a
+partial unique index so export-imported rows without one still dedupe on the
+old key. That is the main argument for the companion app in `ios/`: not
+convenience, but the difference between exact and approximate identity.

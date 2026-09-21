@@ -458,6 +458,95 @@ const MIGRATIONS: readonly Migration[] = [
       CREATE INDEX IF NOT EXISTS idx_resolved_sessions_res ON resolved_sessions(is_resistance, day);
     `,
   },
+  {
+    version: 10,
+    name: 'v0.8: external_workouts.external_id (HealthKit UUID)',
+    sql: `
+      -- HealthKit gives every sample a stable UUID. iOS Shortcuts drops it,
+      -- which is why the original dedupe key was (source_name, start, end,
+      -- type) — a heuristic that breaks if an app edits a workout's times.
+      -- A native reader can send the UUID, making re-import dedupe exact.
+      ALTER TABLE external_workouts ADD COLUMN external_id TEXT;
+
+      -- Partial index: rows imported from an export (no UUID) still collide
+      -- on the older heuristic key, which stays in force alongside this one.
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_external_workouts_uuid
+        ON external_workouts(source_name, external_id)
+        WHERE external_id IS NOT NULL;
+    `,
+  },
+  {
+    version: 11,
+    name: 'v0.8: dedupe workouts by instant, not by timestamp text',
+    sql: `
+      -- The original key compared ISO strings, which silently failed across
+      -- UTC offsets: Apple's export stamps every record with the offset in
+      -- force on export day (e.g. +02:00 for a January workout), while a
+      -- native reader uses the offset that actually applied then (+01:00).
+      -- Same instant, different text, so 327 rows imported twice.
+      --
+      -- Epoch seconds are offset-free, so this compares what the times mean
+      -- rather than how they were written. The columns are maintained by the
+      -- repo rather than GENERATED, because SQLite won't index date/time
+      -- functions (it can't prove they're deterministic).
+      ALTER TABLE external_workouts ADD COLUMN start_epoch INTEGER;
+      ALTER TABLE external_workouts ADD COLUMN end_epoch INTEGER;
+
+      UPDATE external_workouts
+         SET start_epoch = CAST(strftime('%s', start_time) AS INTEGER),
+             end_epoch   = CAST(strftime('%s', end_time) AS INTEGER);
+
+      -- Collapse the rows that got in before the fix, keeping the copy that
+      -- carries a HealthKit UUID (exact identity for future syncs) and
+      -- otherwise the one imported first.
+      DELETE FROM external_workouts
+       WHERE id NOT IN (
+         SELECT id FROM (
+           SELECT id, ROW_NUMBER() OVER (
+             PARTITION BY source_name, activity_type, start_epoch, end_epoch
+             ORDER BY (external_id IS NULL), id
+           ) AS rn
+           FROM external_workouts
+         )
+         WHERE rn = 1
+       );
+
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_external_workouts_instant
+        ON external_workouts(source_name, activity_type, start_epoch, end_epoch);
+    `,
+  },
+  {
+    version: 12,
+    name: 'v0.8: store percentages as percentage points',
+    sql: `
+      -- HealthKit's percent unit is a FRACTION: 25% body fat arrives as 0.25.
+      -- Stored verbatim next to unit '%', it reads as "0.25 %" — a trap for
+      -- anything querying this table, and body fat is now a tracked goal.
+      -- Percentage points are what every consumer means by '%'.
+      --
+      -- Guarded on value <= 1 so it can't double-apply: no human body
+      -- composition reading is legitimately below 1%.
+      --
+      -- Duplicates must go first. The UNIQUE key includes value, a REAL,
+      -- so float noise defeats it: the export parsed "0.246" to exactly
+      -- 0.246 while the app sent 0.246000000000000002, and both were stored.
+      -- Rounding makes them equal, which would break this UPDATE, so the
+      -- older copy of each pair is dropped before rescaling.
+      DELETE FROM health_samples
+       WHERE sample_type LIKE '%_percentage'
+         AND id NOT IN (
+           SELECT MIN(id) FROM health_samples
+            WHERE sample_type LIKE '%_percentage'
+            GROUP BY sample_type, start_time, source_name,
+                     ROUND(CASE WHEN value <= 1.0 THEN value * 100.0 ELSE value END, 2)
+         );
+
+      UPDATE health_samples
+         SET value = ROUND(value * 100.0, 2)
+       WHERE sample_type LIKE '%_percentage'
+         AND value <= 1.0;
+    `,
+  },
 ];
 
 export function currentSchemaVersion(db: Database): number {

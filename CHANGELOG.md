@@ -32,6 +32,44 @@ For the architectural rationale behind each change, see [DECISIONS.md](DECISIONS
   clustering with source precedence — so without this, SQL-only consumers
   count one session several times.
 
+- **`POST /v1/health/workouts`** accepts HKWorkout records from a native
+  client, including HealthKit's UUID (`external_id`, schema v10), which makes
+  re-import dedupe exact rather than a guess from timestamps.
+- **Dedupe audit** runs on every `resolve-sessions` rebuild: resolved sessions
+  must not overlap, previously unseen writer apps are flagged, and near-miss
+  cross-source pairs are surfaced. Errors exit non-zero so a scheduled rebuild
+  fails loudly instead of publishing double-counted numbers.
+- **`ios/HealthBridge`** — a SwiftUI companion app that reads HealthKit and
+  posts to the two endpoints. It exists because Shortcuts cannot read workouts
+  at all; see [`ios/README.md`](ios/README.md).
+
+- **Two narrower dedupe rules**, both found by auditing real data:
+  a _handoff_ — one continuous effort that two different apps each caught part
+  of (a run tracker stopping as the ring picks up) — now resolves to one
+  session when the records sit within 5 minutes and agree on the activity; and
+  a single app's two overlapping records of the _same_ activity now collapse,
+  since one app cannot have you doing a thing twice at once. Both are
+  deliberately narrow: a wrong merge erases a real session, whereas a missed
+  merge only leaves a duplicate the audit flags.
+
+- **Dedupe by instant, not by timestamp text** (schema v11). Apple's export
+  stamps every record with the UTC offset in force on export day, while a
+  native reader uses the offset that applied on the day itself — the same
+  moment written two ways, so 327 workouts were stored twice. Epoch columns
+  now carry identity; the migration collapses the existing duplicates.
+- **A live-activity wrapper can no longer swallow neighbouring records.**
+  Wrappers attach to a cluster but never build one: one that overran its
+  workout by a minute used to bridge that session to an unrelated record and
+  cost it its identity. A seconds-long fragment can no longer represent a
+  cluster containing a real session either, whatever its source.
+
+- **Percentages are stored as percentage points** (schema v12). HealthKit's
+  percent unit is a fraction, so 25% body fat arrived as `0.25` alongside unit
+  `'%'` — which reads as "0.25 %" to anything querying the table. Values are
+  normalised on write, covering every route in, and rounded, because `value`
+  is part of the UNIQUE key and float noise (`0.246` vs `0.246000000000000002`
+  for one reading arriving by two routes) otherwise stored it twice.
+
 ### Notes
 
 - Storage stays lossless: every source record is kept, and deduplication

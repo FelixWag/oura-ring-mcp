@@ -18,6 +18,7 @@
 import { loadConfig } from '../src/config.js';
 import { openDatabase } from '../src/db/index.js';
 import { resolveSessions, type WorkoutCandidate } from '../src/health/resolve.js';
+import { auditSessions } from '../src/health/audit.js';
 
 function argValue(flag: string): string | undefined {
   const i = process.argv.indexOf(flag);
@@ -107,13 +108,44 @@ async function main(): Promise<void> {
   });
   rebuild();
 
+  // Audit every rebuild, not on request: a dedupe rule that quietly stops
+  // working produces a plausible-looking number, which nobody questions.
+  const knownSources = db
+    .prepare<unknown[], { source_name: string }>(
+      'SELECT DISTINCT source_name FROM external_workouts',
+    )
+    .all()
+    .map((r) => r.source_name);
+  const findings = auditSessions({
+    candidates: [...apiCandidates, ...extCandidates],
+    sessions,
+    knownSources: argValue('--known')?.split(',') ?? knownSources,
+  });
+
+  const errors = findings.filter((f) => f.severity === 'error');
+  const warnings = findings.filter((f) => f.severity === 'warning');
+  if (findings.length > 0) {
+    process.stdout.write('\naudit:\n');
+    for (const f of findings) {
+      const where = f.day ? ` [${f.day}]` : '';
+      process.stdout.write(`  ${f.severity.toUpperCase()}${where} ${f.code}: ${f.message}\n`);
+    }
+  }
+
   const resistance = sessions.filter((s) => s.is_resistance).length;
   process.stdout.write(
     `resolved ${apiCandidates.length + extCandidates.length} records → ` +
       `${sessions.length} sessions (${resistance} resistance)` +
       (exclude.length > 0 ? `, excluding ${exclude.join(', ')}` : '') +
-      `\nwritten to resolved_sessions in ${config.dbPath}\n`,
+      `\nwritten to resolved_sessions in ${config.dbPath}\n` +
+      (findings.length === 0
+        ? 'audit: clean\n'
+        : `audit: ${errors.length} error(s), ${warnings.length} warning(s)\n`),
   );
+
+  // Non-zero on errors so a scheduled rebuild fails loudly instead of
+  // publishing double-counted numbers.
+  if (errors.length > 0) process.exitCode = 1;
 }
 
 main().catch((err) => {

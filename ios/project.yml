@@ -1,0 +1,57 @@
+# XcodeGen spec for the Health Bridge app.
+#
+#   cd ios && xcodegen generate
+#
+# The generated HealthBridge.xcodeproj is committed too, so opening the app
+# doesn't require XcodeGen. Regenerate after editing this file; never
+# hand-edit the .xcodeproj.
+name: HealthBridge
+options:
+  bundleIdPrefix: io.github.felixwag
+  deploymentTarget:
+    iOS: '17.0'
+  createIntermediateGroups: true
+
+settings:
+  base:
+    # Swift 5 language mode: HealthKit's callback APIs predate strict
+    # concurrency, and Swift 6 mode turns their non-Sendable payloads into
+    # errors without making the app any safer.
+    SWIFT_VERSION: '5.0'
+    MARKETING_VERSION: '0.1.0'
+    CURRENT_PROJECT_VERSION: '1'
+    # Set your team in Xcode (Signing & Capabilities) — deliberately not here,
+    # so the repo carries no personal signing identity.
+    CODE_SIGN_STYLE: Automatic
+
+targets:
+  HealthBridge:
+    type: application
+    platform: iOS
+    sources:
+      - path: HealthBridge
+    entitlements:
+      path: HealthBridge/HealthBridge.entitlements
+      properties:
+        com.apple.developer.healthkit: true
+        com.apple.developer.healthkit.background-delivery: true
+        com.apple.developer.healthkit.access: []
+    info:
+      path: HealthBridge/Info.plist
+      properties:
+        CFBundleDisplayName: Health Bridge
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        NSHealthShareUsageDescription: >-
+          Health Bridge reads your workouts, body composition and nutrition so
+          they can be saved to your own server. Nothing is sent anywhere else.
+        # Required by the SDK once HealthKit is linked, even though the app
+        # never writes: it requests no share types.
+        NSHealthUpdateUsageDescription: >-
+          Health Bridge does not write to Health.
+        # The server is usually reached over a private network (e.g. a
+        # Tailscale IP) without TLS. An App Store build should require HTTPS
+        # instead — e.g. `tailscale serve` — and drop this.
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
