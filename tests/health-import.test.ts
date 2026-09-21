@@ -418,3 +418,77 @@ describe('POST /v1/health/workouts', () => {
     expect(res.status).toBe(400);
   });
 });
+
+describe('percentage normalisation', () => {
+  it('stores HealthKit fractions as percentage points', async () => {
+    // HealthKit sends 25% body fat as 0.25 with unit '%' — stored verbatim
+    // that reads as "0.25 %", which is how a goal gets tracked wrongly.
+    const res = await request(buildApp())
+      .post('/v1/health/import')
+      .set('Authorization', `Bearer ${TOKEN}`)
+      .send([
+        {
+          sample_type: 'body_fat_percentage',
+          value: 0.248,
+          unit: '%',
+          start_time: '2026-01-15T07:30:00+01:00',
+          end_time: '2026-01-15T07:30:00+01:00',
+          source_name: 'Scale',
+        },
+      ]);
+
+    expect(res.status).toBe(200);
+    const row = db
+      .prepare("SELECT value FROM health_samples WHERE sample_type='body_fat_percentage'")
+      .get() as { value: number };
+    expect(row.value).toBeCloseTo(24.8, 1);
+  });
+
+  it('leaves a value already in percentage points alone', async () => {
+    await request(buildApp())
+      .post('/v1/health/import')
+      .set('Authorization', `Bearer ${TOKEN}`)
+      .send([
+        {
+          sample_type: 'body_fat_percentage',
+          value: 24.8,
+          unit: '%',
+          start_time: '2026-01-16T07:30:00+01:00',
+          end_time: '2026-01-16T07:30:00+01:00',
+          source_name: 'Scale',
+        },
+      ]);
+
+    const row = db
+      .prepare("SELECT value FROM health_samples WHERE start_time LIKE '2026-01-16%'")
+      .get() as { value: number };
+    expect(row.value).toBeCloseTo(24.8, 1);
+  });
+});
+
+describe('float noise in the dedupe key', () => {
+  it('treats the same reading from two routes as one row', async () => {
+    // Observed: an export parsed "0.246" to exactly 0.246 while the app sent
+    // 0.246000000000000002. REAL comparison let both in.
+    const app = buildApp();
+    const send = (value: number) =>
+      request(app)
+        .post('/v1/health/import')
+        .set('Authorization', `Bearer ${TOKEN}`)
+        .send([
+          {
+            sample_type: 'body_fat_percentage',
+            value,
+            unit: '%',
+            start_time: '2026-01-15T07:49:10+02:00',
+            end_time: '2026-01-15T07:49:10+02:00',
+            source_name: 'Scale',
+          },
+        ]);
+
+    await send(0.246);
+    const res = await send(0.246000000000000002);
+
+    expect(res.body).toMatchObject({ inserted: 0, deduped: 1 });
+  });
+});

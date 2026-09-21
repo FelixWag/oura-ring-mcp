@@ -63,6 +63,13 @@ For the architectural rationale behind each change, see [DECISIONS.md](DECISIONS
   cost it its identity. A seconds-long fragment can no longer represent a
   cluster containing a real session either, whatever its source.
 
+- **Percentages are stored as percentage points** (schema v12). HealthKit's
+  percent unit is a fraction, so 25% body fat arrived as `0.25` alongside unit
+  `'%'` — which reads as "0.25 %" to anything querying the table. Values are
+  normalised on write, covering every route in, and rounded, because `value`
+  is part of the UNIQUE key and float noise (`0.246` vs `0.246000000000000002`
+  for one reading arriving by two routes) otherwise stored it twice.
+
 ### Notes
 
 - Storage stays lossless: every source record is kept, and deduplication

@@ -515,6 +515,38 @@ const MIGRATIONS: readonly Migration[] = [
         ON external_workouts(source_name, activity_type, start_epoch, end_epoch);
     `,
   },
+  {
+    version: 12,
+    name: 'v0.8: store percentages as percentage points',
+    sql: `
+      -- HealthKit's percent unit is a FRACTION: 25% body fat arrives as 0.25.
+      -- Stored verbatim next to unit '%', it reads as "0.25 %" — a trap for
+      -- anything querying this table, and body fat is now a tracked goal.
+      -- Percentage points are what every consumer means by '%'.
+      --
+      -- Guarded on value <= 1 so it can't double-apply: no human body
+      -- composition reading is legitimately below 1%.
+      --
+      -- Duplicates must go first. The UNIQUE key includes value, a REAL,
+      -- so float noise defeats it: the export parsed "0.246" to exactly
+      -- 0.246 while the app sent 0.246000000000000002, and both were stored.
+      -- Rounding makes them equal, which would break this UPDATE, so the
+      -- older copy of each pair is dropped before rescaling.
+      DELETE FROM health_samples
+       WHERE sample_type LIKE '%_percentage'
+         AND id NOT IN (
+           SELECT MIN(id) FROM health_samples
+            WHERE sample_type LIKE '%_percentage'
+            GROUP BY sample_type, start_time, source_name,
+                     ROUND(CASE WHEN value <= 1.0 THEN value * 100.0 ELSE value END, 2)
+         );
+
+      UPDATE health_samples
+         SET value = ROUND(value * 100.0, 2)
+       WHERE sample_type LIKE '%_percentage'
+         AND value <= 1.0;
+    `,
+  },
 ];
 
 export function currentSchemaVersion(db: Database): number {

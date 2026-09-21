@@ -57,6 +57,18 @@ export class HealthSamplesRepo {
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
     );
     const importedAt = nowIso();
+    // HealthKit reports percentages as fractions (0.25 for 25%), whatever
+    // the unit string says. Normalising here covers every route in — the
+    // app, the export importer and the Shortcut — so no consumer has to
+    // know which source a row came from. `raw` keeps the original value.
+    // Rounded as well as rescaled: `value` is part of the UNIQUE key, and
+    // float noise (0.246 vs 0.246000000000000002, the same reading from two
+    // routes) otherwise slips past it and stores the row twice.
+    const normalized = samples.map((s) =>
+      s.sample_type.endsWith('_percentage')
+        ? { ...s, value: Math.round((s.value <= 1 ? s.value * 100 : s.value) * 100) / 100 }
+        : s,
+    );
     let inserted = 0;
 
     const tx = this.db.transaction((rows: HealthSample[]) => {
@@ -74,12 +86,12 @@ export class HealthSamplesRepo {
         if (info.changes > 0) inserted += 1;
       }
     });
-    tx(samples);
+    tx(normalized);
 
     return {
-      total_received: samples.length,
+      total_received: normalized.length,
       inserted,
-      deduped: samples.length - inserted,
+      deduped: normalized.length - inserted,
     };
   }
 
