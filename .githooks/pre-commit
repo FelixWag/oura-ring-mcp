@@ -1,0 +1,50 @@
+#!/bin/sh
+# Block personal data from reaching a public repository.
+#
+# This repo is public; the machine it runs on is personal. The gap between
+# those two facts is where accidents happen — a signing identity written into
+# a project file by an IDE, a private-network address pasted into a doc, a
+# token echoed into a log. Each pattern below has either already happened or
+# is one careless `git add -A` away.
+#
+# Enable (once per clone):  git config core.hooksPath .githooks
+# Bypass, deliberately:     git commit --no-verify
+
+# The hook's own files are excluded: they quote the patterns they match on,
+# so scanning them flags the documentation as the leak.
+staged=$(git diff --cached --name-only --diff-filter=ACM | grep -v '^\.githooks/' || true)
+[ -z "$staged" ] && exit 0
+
+fail=0
+report() {
+  echo "BLOCKED: $1"
+  echo "$2" | head -3 | sed 's/^/    /'
+  fail=1
+}
+
+# Apple Developer Team ID — Xcode writes this into project.pbxproj the moment
+# a signing team is selected. Reached this public repo in 66ae50e (2026-09-21).
+hits=$(git diff --cached -U0 -- $staged | grep -nE '^\+.*DEVELOPMENT_TEAM[[:space:]]*=[[:space:]]*[A-Z0-9]{10}' || true)
+[ -n "$hits" ] && report "Apple Developer Team ID (keep signing config local; the .xcodeproj is generated)" "$hits"
+
+# Tailscale / CGNAT addresses (100.64.0.0/10) — the private network boundary.
+hits=$(git diff --cached -U0 -- $staged | grep -nE '^\+.*\b100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.[0-9]{1,3}\.[0-9]{1,3}\b' || true)
+[ -n "$hits" ] && report "private tailnet address" "$hits"
+
+# Bearer tokens and API keys pasted into code, docs or fixtures.
+hits=$(git diff --cached -U0 -- $staged | grep -nE '^\+.*(Bearer [A-Za-z0-9_-]{16,}|[A-Za-z0-9_-]{24,}\.[A-Za-z0-9_-]{24,})' || true)
+[ -n "$hits" ] && report "what looks like a token" "$hits"
+
+# Personal email addresses (noreply and example.com are fine).
+hits=$(git diff --cached -U0 -- $staged | grep -nE '^\+.*[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}' | grep -vE 'example\.(com|org)|noreply|@types/|user@host' || true)
+[ -n "$hits" ] && report "an email address" "$hits"
+
+# The wiki holds personal health context and must never be force-added.
+echo "$staged" | grep -q '^chiron-wiki/' && report "a chiron-wiki path (personal health context)" "chiron-wiki/"
+
+if [ "$fail" = 1 ]; then
+  echo ""
+  echo "Nothing was committed. Remove the line, or --no-verify if you are certain."
+  exit 1
+fi
+exit 0
