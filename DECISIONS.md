@@ -772,3 +772,35 @@ UUID, so `external_workouts.external_id` (schema v10) carries it, with a
 partial unique index so export-imported rows without one still dedupe on the
 old key. That is the main argument for the companion app in `ios/`: not
 convenience, but the difference between exact and approximate identity.
+
+## v0.8.1: units are a correctness boundary, not metadata
+
+Three defects in `health_samples`, all invisible to anything reading the
+table, and all found only because a number finally looked absurd: a day of
+intake totalling 6,682,560 "kcal".
+
+The root cause was treating `unit` as a label rather than a contract. The
+same logger wrote dietary energy as `kcal` and as `J` on different runs, and
+sodium and cholesterol as `mg` and `g`; `SUM(value)` mixed them silently.
+Units are now canonical per sample type and converted on write, because the
+alternative — every consumer converting defensively — fails the moment one
+consumer forgets, and the failure is a plausible-looking number.
+
+The second defect was the same class migration 11 fixed for workouts: the
+dedupe key compared `start_time` as text, so one instant written with two UTC
+offsets (an iOS Shortcut in one timezone, an export re-stamping it in
+another) was stored twice. Identity is the instant, not its spelling.
+
+The third was day attribution: `date(start_time)` converts to UTC before
+taking the date, so a 00:30 meal belonged to the previous day and the
+boundary moved with DST. Rows now carry `local_day` as the source asserted
+it. The alternative — a configured IANA zone applied to the instant — is
+right across DST but wrong while travelling, and travel is the case where
+"which day did I eat this" matters most.
+
+Order matters in the migration: duplicates are collapsed _before_ units are
+converted. Converting first makes a joule row equal its kcal twin, and the
+pre-existing UNIQUE constraint rejects the update. The collapse compares
+canonical values at one decimal, coarser than the two decimals stored,
+because conversion drift (470.81 vs 470.8) would otherwise leave the pair
+intact.

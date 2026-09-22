@@ -152,7 +152,10 @@ describe('POST /v1/health/import — validation + coercion', () => {
     const repo = new HealthSamplesRepo(db);
     const rows = repo.recentByType('dietary_energy_consumed', 5);
     expect(rows).toHaveLength(1);
-    expect(rows[0]!.value).toBeCloseTo(447.0515, 4);
+    // Two decimals: values are rounded on write because `value` is part of
+    // the dedupe key, and float noise from two routes writing one reading
+    // otherwise stores it twice. 0.0015 kcal is not a nutrition fact.
+    expect(rows[0]!.value).toBeCloseTo(447.05, 2);
     expect(typeof rows[0]!.value).toBe('number');
   });
 
@@ -488,6 +491,123 @@ describe('float noise in the dedupe key', () => {
 
     await send(0.246);
     const res = await send(0.246000000000000002);
+
+    expect(res.body).toMatchObject({ inserted: 0, deduped: 1 });
+  });
+});
+
+describe('unit normalisation', () => {
+  const post = (app: ReturnType<typeof buildApp>, body: unknown) =>
+    request(app).post('/v1/health/import').set('Authorization', `Bearer ${TOKEN}`).send(body);
+
+  const sampleOf = (overrides: Record<string, unknown>) => ({
+    sample_type: 'dietary_energy_consumed',
+    value: 100,
+    unit: 'kcal',
+    start_time: '2026-01-15T12:03:47+02:00',
+    end_time: '2026-01-15T12:03:47+02:00',
+    source_name: 'Logger',
+    ...overrides,
+  });
+
+  it('converts joules to kilocalories', async () => {
+    // Real incident: 31 rows arrived in J, so one day summed to 6.68 million.
+    await post(buildApp(), [sampleOf({ value: 1969859.4, unit: 'J' })]);
+
+    const row = db
+      .prepare("SELECT value, unit FROM health_samples WHERE sample_type='dietary_energy_consumed'")
+      .get() as { value: number; unit: string };
+    expect(row.unit).toBe('kcal');
+    expect(row.value).toBeCloseTo(470.8, 1);
+  });
+
+  it('converts grams to milligrams for sodium', async () => {
+    await post(buildApp(), [sampleOf({ sample_type: 'dietary_sodium', value: 1.57, unit: 'g' })]);
+
+    const row = db
+      .prepare("SELECT value, unit FROM health_samples WHERE sample_type='dietary_sodium'")
+      .get() as { value: number; unit: string };
+    expect(row.unit).toBe('mg');
+    expect(row.value).toBeCloseTo(1570, 0);
+  });
+
+  it('dedupes a reading whose two routes used different units', async () => {
+    // The joule row and its kcal twin describe one meal; after conversion
+    // they must collide rather than both being summed.
+    const app = buildApp();
+    await post(app, [sampleOf({ value: 470.8, unit: 'kcal' })]);
+    const res = await post(app, [sampleOf({ value: 1969859.4, unit: 'J' })]);
+
+    expect(res.body).toMatchObject({ inserted: 0, deduped: 1 });
+  });
+
+  it('leaves an unknown sample type untouched', async () => {
+    // The table is generic on purpose: a new type must not need a code change.
+    await post(buildApp(), [
+      sampleOf({ sample_type: 'blood_glucose', value: 5.4, unit: 'mmol/L' }),
+    ]);
+
+    const row = db
+      .prepare("SELECT value, unit FROM health_samples WHERE sample_type='blood_glucose'")
+      .get() as { value: number; unit: string };
+    expect(row.unit).toBe('mmol/L');
+    expect(row.value).toBeCloseTo(5.4, 2);
+  });
+});
+
+describe('local day attribution', () => {
+  it('keeps a past-midnight meal on the day it was eaten', async () => {
+    // date(start_time) converts to UTC first, moving a 00:30 meal to the
+    // previous day — and the boundary shifts at each DST change.
+    await request(buildApp())
+      .post('/v1/health/import')
+      .set('Authorization', `Bearer ${TOKEN}`)
+      .send([
+        {
+          sample_type: 'dietary_energy_consumed',
+          value: 320,
+          unit: 'kcal',
+          start_time: '2026-06-30T00:30:00+02:00',
+          end_time: '2026-06-30T00:30:00+02:00',
+          source_name: 'Logger',
+        },
+      ]);
+
+    const row = db.prepare('SELECT local_day, local_time FROM health_samples').get() as {
+      local_day: string;
+      local_time: string;
+    };
+    expect(row.local_day).toBe('2026-06-30');
+    expect(row.local_time).toBe('00:30:00');
+
+    // What the old idiom would have said:
+    const utc = db.prepare('SELECT date(start_time) AS d FROM health_samples').get() as {
+      d: string;
+    };
+    expect(utc.d).toBe('2026-06-29');
+  });
+
+  it('dedupes one instant written with two different offsets', async () => {
+    // A Shortcut wrote +01:00 in Oxford; the export re-stamped the same
+    // moment +02:00 in Vienna. Text comparison stored both.
+    const app = buildApp();
+    const send = (start: string) =>
+      request(app)
+        .post('/v1/health/import')
+        .set('Authorization', `Bearer ${TOKEN}`)
+        .send([
+          {
+            sample_type: 'dietary_protein',
+            value: 32.5,
+            unit: 'g',
+            start_time: start,
+            end_time: start,
+            source_name: 'Logger',
+          },
+        ]);
+
+    await send('2026-06-10T13:00:00+01:00');
+    const res = await send('2026-06-10T14:00:00+02:00');
 
     expect(res.body).toMatchObject({ inserted: 0, deduped: 1 });
   });

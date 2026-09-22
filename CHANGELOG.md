@@ -6,6 +6,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 For the architectural rationale behind each change, see [DECISIONS.md](DECISIONS.md).
 
+## [0.8.1] — 2026-09-22
+
+### Fixed
+
+- **Mixed units in `health_samples`** (schema v13). The same logger wrote
+  dietary energy as both `kcal` and `J`, and sodium and cholesterol as both
+  `mg` and `g`, so `SUM(value)` mixed them silently — one day totalled
+  6,682,560 "kcal" because 31 rows were joules. Units are now canonical per
+  sample type, converted on write (`src/health/units.ts`), and the migration
+  converts the existing rows. Verified before converting: every joule row had
+  a kcal twin at the same instant matching `value / 4184` exactly.
+- **The same sample stored twice.** `health_samples` deduped on `start_time`
+  as text, so one instant written with different UTC offsets — an iOS
+  Shortcut at `+01:00`, an Apple Health export re-stamping it `+02:00` —
+  passed the key twice. Migration 13 adds `start_epoch`/`end_epoch`, collapses
+  the duplicates and indexes on the instant. Same defect migration 11 fixed
+  for `external_workouts`.
+- **Nutrition attributed to the wrong day.** Consumers grouped by
+  `date(start_time)`, which converts to UTC first, so a 00:30 meal landed on
+  the previous day and the boundary moved at each DST change. Rows now carry
+  `local_day` and `local_time`, the day the source itself asserted.
+
 ## [0.8.0] — 2026-09-17
 
 ### Added
