@@ -696,6 +696,16 @@ const MIGRATIONS: readonly Migration[] = [
         -- tell which is current instead of double-counting a corrected meal.
         superseded_by     INTEGER REFERENCES telegram_updates(id),
 
+        -- Third-party content wearing the owner's envelope. A forwarded
+        -- message has the owner's chat_id and from.id — the envelope check
+        -- passes — but its text was written by someone else. Today that only
+        -- breaks "nothing about a third party is stored"; once a caption
+        -- becomes a prompt for an agent holding write tools, it is
+        -- attacker-chosen text arriving on the trusted path. The flag exists
+        -- now, while the table is empty, so the interpreter has something to
+        -- refuse on rather than needing a re-key later.
+        is_forwarded      INTEGER NOT NULL DEFAULT 0,
+
         raw               TEXT NOT NULL,     -- whole update JSON, verbatim
 
         UNIQUE(bot_id, update_id),

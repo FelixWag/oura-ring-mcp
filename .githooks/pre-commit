@@ -35,6 +35,19 @@ hits=$(git diff --cached -U0 -- $staged | grep -nE '^\+.*\b100\.(6[4-9]|[7-9][0-
 hits=$(git diff --cached -U0 -- $staged | grep -nE '^\+.*(Bearer [A-Za-z0-9_-]{16,}|[A-Za-z0-9_-]{24,}\.[A-Za-z0-9_-]{24,})' || true)
 [ -n "$hits" ] && report "what looks like a token" "$hits"
 
+# Telegram bot token: <8-10 digits>:<35 chars>. Matches neither the Bearer nor
+# the JWT pattern above, and whoever holds it can READ inbound messages via
+# getUpdates, not merely send.
+# Length-tolerant: pinning the secret to exactly 35 chars let a 36-char
+# fixture through when this was first tested.
+hits=$(git diff --cached -U0 -- $staged | grep -nE '^\+.*[0-9]{8,10}:[A-Za-z0-9_-]{30,}' || true)
+[ -n "$hits" ] && report "what looks like a Telegram bot token" "$hits"
+
+# A Telegram chat id is a personal identifier, not a secret — but it belongs
+# in .env, not in a committed file.
+hits=$(git diff --cached -U0 -- $staged | grep -nE '^\+.*TELEGRAM_(ALLOWED_)?CHAT_ID[[:space:]]*=[[:space:]]*[0-9]' || true)
+[ -n "$hits" ] && report "a Telegram chat id" "$hits"
+
 # Personal email addresses (noreply and example.com are fine).
 hits=$(git diff --cached -U0 -- $staged | grep -nE '^\+.*[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}' | grep -vE 'example\.(com|org)|noreply|@types/|user@host' || true)
 [ -n "$hits" ] && report "an email address" "$hits"

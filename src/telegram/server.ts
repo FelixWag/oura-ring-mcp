@@ -46,7 +46,49 @@ export interface ClassifiedMessage {
  * preserve quality. Dropping it would silently lose exactly the meal photos
  * this system exists to capture.
  */
+export function isForwarded(message: TelegramMessage): boolean {
+  return (
+    message.forward_origin != null ||
+    message.forward_from != null ||
+    message.forward_sender_name != null ||
+    message.via_bot != null
+  );
+}
+
+/**
+ * Strip a nested third party out of an update before it is stored.
+ *
+ * `reply_to_message` and `quote` embed another person's message wholesale —
+ * their user id, their name, their words — inside an update whose envelope is
+ * the owner's. "Nothing about a third party is stored" has to survive the
+ * nesting, not just the top level.
+ */
+export function redactNested(update: TelegramUpdate): TelegramUpdate {
+  const clean = JSON.parse(JSON.stringify(update)) as TelegramUpdate;
+  for (const message of [clean.message, clean.edited_message]) {
+    if (!message) continue;
+    delete message.reply_to_message;
+    delete message.quote;
+  }
+  return clean;
+}
+
 export function classifyMessage(message: TelegramMessage): ClassifiedMessage {
+  // A forward carries the owner's envelope and a stranger's words. Today that
+  // would put a third party's text in an indexed column; once a caption
+  // becomes a prompt, it is attacker-chosen text on the trusted path. So the
+  // message is recorded as having arrived, and its text is not adopted.
+  if (isForwarded(message)) {
+    return {
+      kind: 'other',
+      text: null,
+      file_id: null,
+      file_unique_id: null,
+      photo_width: null,
+      photo_height: null,
+    };
+  }
+
   const text = message.text ?? message.caption ?? null;
 
   if (message.photo && message.photo.length > 0) {
@@ -176,8 +218,9 @@ export function processBatch(
       photo_width: classified.photo_width,
       photo_height: classified.photo_height,
       needs_media: classified.file_id != null,
-      raw: JSON.stringify(update),
+      raw: JSON.stringify(redactNested(update)),
       edits_message_id: isEdit ? message.message_id : null,
+      is_forwarded: isForwarded(message),
     });
   }
 
@@ -228,6 +271,9 @@ export async function drainMedia(
   return stored;
 }
 
+/** Consecutive poll failures before the server says so in the chat itself. */
+const ALERT_AFTER_FAILURES = 5;
+
 /** Entry point used by `npm run telegram-server`. */
 async function main(): Promise<void> {
   loadConfig(); // fail early and loudly on a broken .env
@@ -255,13 +301,21 @@ async function main(): Promise<void> {
       `tz ${config.tz}, media ${config.mediaDir}`,
   );
 
+  let consecutiveFailures = 0;
+  let lastRejectionLog = 0;
+
   for (;;) {
     try {
       const offset = repo.nextOffset(config.botId);
       const updates = await client.getUpdates(offset);
       if (updates.length > 0) {
         const result = processBatch(updates, repo, config);
-        if (result.accepted > 0 || result.rejected > 0) {
+        // Rejected-only batches are logged at most hourly: the log file is
+        // the one unbounded resource a stranger can grow, one line per batch.
+        const rejectedOnly = result.accepted === 0 && result.duplicates === 0;
+        const now = Date.now();
+        if (!rejectedOnly || now - lastRejectionLog > 3_600_000) {
+          if (rejectedOnly) lastRejectionLog = now;
           await log(
             `batch: accepted=${result.accepted} duplicates=${result.duplicates} ` +
               `rejected=${result.rejected}`,
@@ -285,12 +339,37 @@ async function main(): Promise<void> {
         const stored = await drainMedia(repo, client, config, log);
         if (stored > 0) await log(`media: stored=${stored}`);
       }
+      consecutiveFailures = 0;
     } catch (err) {
       // Never let one bad cycle kill the process: launchd would restart it,
       // but a tight crash loop would burn the 24h window Telegram keeps
       // undelivered updates for.
-      await log(`poll error: ${(err as Error).message}`);
-      await new Promise((resolve) => setTimeout(resolve, 5000));
+      //
+      // Failing closed is right — the offset only moves on committed rows, so
+      // a transient fault loses nothing. The danger is that a PERSISTENT
+      // fault looks identical to a quiet day: the loop retries forever, makes
+      // no progress, and after ~24h Telegram drops the backlog for good.
+      // launchd cannot help, because the wedged state is in the database, not
+      // the process. So back off, and eventually say so out loud on the one
+      // channel this process already holds.
+      consecutiveFailures += 1;
+      const message = (err as Error).message;
+      await log(`poll error (${consecutiveFailures} in a row): ${message}`);
+
+      if (consecutiveFailures === ALERT_AFTER_FAILURES) {
+        try {
+          await client.sendMessage(
+            config.allowedChatId,
+            `⚠️ Telegram ingestion has failed ${consecutiveFailures} times in a row and is ` +
+              `not storing messages. Last error: ${message}`,
+          );
+        } catch {
+          // If even this fails the network is gone; the log line above stands.
+        }
+      }
+
+      const backoffMs = Math.min(5000 * 2 ** Math.min(consecutiveFailures - 1, 6), 300_000);
+      await new Promise((resolve) => setTimeout(resolve, backoffMs));
     }
   }
 }

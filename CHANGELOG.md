@@ -18,6 +18,28 @@ For the architectural rationale behind each change, see [DECISIONS.md](DECISIONS
   content hash. Receive-and-store only: nothing interprets a message yet.
   Setup: [`docs/telegram.md`](docs/telegram.md).
 
+### Security
+
+- **A forwarded message is recorded but its text is not adopted.** A forward
+  carries the owner's `chat.id` and `from.id`, so the envelope check passes
+  while the words belong to someone else. Its text is dropped, the row is
+  flagged `is_forwarded`, and nested `reply_to_message` / `quote` payloads —
+  which embed a third party's id, name and words — are stripped before the
+  update is stored. Today that keeps a stranger out of the database; once a
+  caption becomes a prompt for an agent holding write tools, it is the
+  difference between data and instructions.
+- **Media downloads are streamed against a byte counter**, so a response with
+  no `content-length` cannot be buffered whole before a limit applies, with
+  `redirect: 'error'` (a 3xx could otherwise aim the fetch at the voice or
+  health server on localhost) and a 60s timeout.
+- **A persistent poll failure now backs off and says so in the chat.** Failing
+  closed is right — the offset only moves on committed rows — but a wedged
+  loop was indistinguishable from a quiet day, and Telegram discards
+  undelivered updates after ~24h.
+- **The pre-commit hook learned two new patterns**: Telegram bot tokens and
+  chat ids matched neither existing secret pattern. (The first version pinned
+  the token to exactly 35 characters and let a 36-character fixture through.)
+
 ### Notes
 
 - **The poll offset is derived from stored rows, never stored separately.**

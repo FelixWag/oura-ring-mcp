@@ -28,8 +28,10 @@ limit, so a separate briefing sender using the same bot needs no change.
 1. Create a bot with [@BotFather](https://t.me/botfather), or reuse an
    existing token.
 2. Put `TELEGRAM_BOT_TOKEN` and `TELEGRAM_ALLOWED_CHAT_ID` in `.env` — see
-   `.env.example`. To find your chat id, message the bot and read
-   `logs/telegram.log`, which reports rejected chat ids.
+   `.env.example`. Get your chat id from [@userinfobot](https://t.me/userinfobot).
+   The server deliberately never logs the id of a chat it rejects: a log file
+   survives into backups, and keeping third-party identity out of every sink
+   is the point of the design.
 3. `npm run telegram-server`
 4. Message the bot. It replies "Got it — saved."
 

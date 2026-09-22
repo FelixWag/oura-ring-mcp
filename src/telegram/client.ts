@@ -24,6 +24,18 @@ export interface TelegramMessage {
   chat: { id: number; type: string };
   from?: { id: number; is_bot: boolean };
   media_group_id?: string;
+
+  // Third-party content wearing the owner's envelope. A forwarded message has
+  // the owner's chat.id and from.id, but its TEXT was written by someone else
+  // — so these fields are the difference between "the owner said this" and
+  // "the owner passed on what a stranger said". Declared here so they are
+  // visible at review time rather than travelling invisibly inside `raw`.
+  forward_origin?: unknown;
+  forward_from?: unknown;
+  forward_sender_name?: string;
+  via_bot?: unknown;
+  reply_to_message?: TelegramMessage;
+  quote?: unknown;
   text?: string;
   caption?: string;
   photo?: TelegramPhotoSize[];

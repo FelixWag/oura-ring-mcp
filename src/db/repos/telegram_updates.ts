@@ -44,6 +44,7 @@ export interface TelegramUpdateRow {
   attempts: number;
   error: string | null;
   superseded_by: number | null;
+  is_forwarded: number;
   raw: string;
 }
 
@@ -66,6 +67,8 @@ export interface NewTelegramUpdate {
   raw: string;
   /** Set when this update is an edit of a message we already stored. */
   edits_message_id?: number | null;
+  /** True when the text came from someone other than the account owner. */
+  is_forwarded: boolean;
 }
 
 export interface StoreBatchResult {
@@ -95,8 +98,8 @@ export class TelegramUpdatesRepo {
       `INSERT OR IGNORE INTO telegram_updates
          (bot_id, update_id, chat_id, message_id, media_group_id, kind, text,
           sent_epoch, received_epoch, tz_assumed, file_id, file_unique_id,
-          photo_width, photo_height, status, raw)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          photo_width, photo_height, status, raw, is_forwarded)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     );
     // An edit arrives as a new update carrying the same message_id. Keep both
     // and point the older at the newer, so a consumer reading the message
@@ -138,6 +141,7 @@ export class TelegramUpdatesRepo {
           // synchronous and cannot await.
           u.needs_media ? 'pending' : 'stored',
           u.raw,
+          u.is_forwarded ? 1 : 0,
         );
         if (info.changes > 0) {
           inserted += 1;
