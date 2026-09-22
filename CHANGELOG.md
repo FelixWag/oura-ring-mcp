@@ -6,6 +6,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 For the architectural rationale behind each change, see [DECISIONS.md](DECISIONS.md).
 
+## [0.9.0] — 2026-09-22
+
+### Added
+
+- **Telegram inbound** (`npm run telegram-server`, schema v14). Owns a bot by
+  long polling, so there is no public endpoint and no inbound port — the
+  process only makes outbound calls. Messages from the one allowlisted private
+  chat are stored in `telegram_updates`; photos, voice notes and documents are
+  downloaded to a media root beside the database (`0700`/`0600`), named by
+  content hash. Receive-and-store only: nothing interprets a message yet.
+  Setup: [`docs/telegram.md`](docs/telegram.md).
+
+### Notes
+
+- **The poll offset is derived from stored rows, never stored separately.**
+  `getUpdates(offset=N)` acknowledges everything below N and Telegram then
+  discards it permanently, so an offset that advances before a durable write
+  loses messages irrecoverably.
+- **Rejected updates still move the cursor**, via a high-water mark rather
+  than a row. Without it the next poll refetches the same rejected update
+  forever and one stranger's message pins the queue; with a row per rejection,
+  a flood of spam would become a flood of rows in a health database.
+- **Media downloads run after the commit**, because better-sqlite3
+  transactions are synchronous and cannot await. `pending` names that gap.
+- **An edited message is kept as a second row** whose predecessor points at
+  it, so a corrected meal is not counted twice.
+
 ## [0.8.1] — 2026-09-22
 
 ### Fixed

@@ -121,6 +121,25 @@ export function defaultHealthLogPath(): string {
   return join(projectRoot, 'logs', 'health.log');
 }
 
+/** Default Telegram activity log path: ./logs/telegram.log under the project root. */
+export function defaultTelegramLogPath(): string {
+  return join(projectRoot, 'logs', 'telegram.log');
+}
+
+/**
+ * Default media root for inbound photos and voice notes: beside the database
+ * ACTUALLY in use, NOT inside the repo. A photo of a meal committed to a
+ * public repo is a privacy accident with a countdown on it.
+ *
+ * Resolved from OURA_DB_PATH rather than the default path, or media lands
+ * next to a database nobody is using — found by running the server and
+ * noticing the directory appear in the wrong place.
+ */
+export function defaultTelegramMediaDir(): string {
+  const dbPath = process.env.OURA_DB_PATH?.trim() || defaultDbPath();
+  return join(dirname(dbPath), 'telegram-media');
+}
+
 /**
  * Default MCP entry the voice agent spawns. dist/index.js relative to
  * the project root.
@@ -173,6 +192,48 @@ export function loadVoiceConfig(): VoiceConfig {
   }
 
   return { token, port, logPath, mcpEntryPath, model };
+}
+
+export interface TelegramConfig {
+  botToken: string;
+  /** Numeric prefix of the token. Identifies the bot without storing the secret. */
+  botId: number;
+  allowedChatId: number;
+  mediaDir: string;
+  /** IANA zone assumed for inbound messages; Telegram carries no timezone. */
+  tz: string;
+  logPath: string;
+}
+
+export function loadTelegramConfig(): TelegramConfig {
+  const botToken = process.env.TELEGRAM_BOT_TOKEN?.trim() ?? '';
+  const chatRaw = process.env.TELEGRAM_ALLOWED_CHAT_ID?.trim() ?? '';
+  const mediaDir = process.env.TELEGRAM_MEDIA_DIR?.trim() || defaultTelegramMediaDir();
+  const tz = process.env.TELEGRAM_TZ?.trim() || 'Europe/Vienna';
+  const logPath = process.env.TELEGRAM_LOG_PATH?.trim() || defaultTelegramLogPath();
+
+  if (!botToken) {
+    throw new ConfigError(
+      'Missing TELEGRAM_BOT_TOKEN. Create a bot with @BotFather, or reuse the token the ' +
+        'briefing sender already uses.',
+    );
+  }
+  // Tokens look like `123456789:AA...`. The prefix identifies the bot, so the
+  // secret itself never reaches the database.
+  const botId = Number(botToken.split(':')[0]);
+  if (!Number.isInteger(botId) || botId <= 0) {
+    throw new ConfigError('TELEGRAM_BOT_TOKEN is malformed: expected `<bot id>:<secret>`.');
+  }
+
+  const allowedChatId = Number(chatRaw);
+  if (!chatRaw || !Number.isInteger(allowedChatId)) {
+    throw new ConfigError(
+      'Missing or malformed TELEGRAM_ALLOWED_CHAT_ID. It must be the numeric id of your own ' +
+        'chat: every message from any other chat is discarded unread.',
+    );
+  }
+
+  return { botToken, botId, allowedChatId, mediaDir, tz, logPath };
 }
 
 export function loadHealthConfig(): HealthConfig {

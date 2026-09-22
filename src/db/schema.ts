@@ -637,6 +637,82 @@ const MIGRATIONS: readonly Migration[] = [
         ON health_samples(sample_type, local_day);
     `,
   },
+  {
+    version: 14,
+    name: 'v0.9: telegram_updates (inbound chat messages)',
+    sql: `
+      -- One row per inbound Telegram update we accepted. Receive-and-store
+      -- only: nothing here interprets a message.
+      --
+      -- Identity is (bot_id, update_id), not update_id alone. update_id is
+      -- the SENDER's counter, unique per bot token and restarting near zero
+      -- for a new bot — and rotating a leaked token is this project's
+      -- documented response to a leak. The surrogate id exists because meals
+      -- will reference these rows and foreign_keys is ON, so re-keying later
+      -- would be a rewrite.
+      CREATE TABLE IF NOT EXISTS telegram_updates (
+        id                INTEGER PRIMARY KEY AUTOINCREMENT,
+        bot_id            INTEGER NOT NULL,  -- numeric prefix of the token; never the token
+        update_id         INTEGER NOT NULL,  -- Telegram's per-bot counter
+        chat_id           INTEGER NOT NULL,
+        message_id        INTEGER NOT NULL,
+        media_group_id    TEXT,              -- album parts share this; no completion signal exists
+        kind              TEXT NOT NULL,
+        text              TEXT,              -- message text or media caption
+
+        -- Telegram sends the instant as an integer. Storing only our receipt
+        -- clock would correlate a backlogged message against the wrong
+        -- heart-rate window, and reorder a backlog.
+        sent_epoch        INTEGER NOT NULL,
+        received_epoch    INTEGER NOT NULL,
+
+        -- A Telegram message carries NO timezone. This is what the server
+        -- assumed, named as an assumption so nothing downstream mistakes it
+        -- for a fact the sender asserted. The local day is resolved on the
+        -- meal row later, from a source that actually knows.
+        tz_assumed        TEXT NOT NULL,
+
+        -- file_id is documented as volatile and bot-scoped; file_unique_id is
+        -- the stable identity. A photo arrives as several PhotoSizes, so the
+        -- dimensions record WHICH one was downloaded — the difference between
+        -- a credible nutrition estimate and one made from a thumbnail.
+        file_id           TEXT,
+        file_unique_id    TEXT,
+        photo_width       INTEGER,
+        photo_height      INTEGER,
+        media_path        TEXT,              -- RELATIVE to the configured media root
+        sha256            TEXT,
+        bytes             INTEGER,
+
+        -- Media download cannot live in the insert transaction: better-sqlite3
+        -- transactions are synchronous and cannot await. A row is committed
+        -- first and the file arrives after — 'pending' names that gap.
+        status            TEXT NOT NULL,
+        attempts          INTEGER NOT NULL DEFAULT 0,
+        error             TEXT,
+
+        -- An edit arrives as a NEW update_id carrying the SAME message_id.
+        -- Both rows are kept; the older points at the newer, so a consumer can
+        -- tell which is current instead of double-counting a corrected meal.
+        superseded_by     INTEGER REFERENCES telegram_updates(id),
+
+        raw               TEXT NOT NULL,     -- whole update JSON, verbatim
+
+        UNIQUE(bot_id, update_id),
+        CHECK (kind IN ('text', 'photo', 'voice', 'document', 'other')),
+        CHECK (status IN ('pending', 'stored', 'failed', 'dead'))
+      );
+
+      -- Partial: the working set stays tiny as the log grows.
+      CREATE INDEX IF NOT EXISTS idx_telegram_updates_queue
+        ON telegram_updates(status, update_id) WHERE status IN ('pending', 'failed');
+      -- Edits look themselves up by the message they revise.
+      CREATE INDEX IF NOT EXISTS idx_telegram_updates_message
+        ON telegram_updates(chat_id, message_id);
+      CREATE INDEX IF NOT EXISTS idx_telegram_updates_sent
+        ON telegram_updates(sent_epoch);
+    `,
+  },
 ];
 
 export function currentSchemaVersion(db: Database): number {
