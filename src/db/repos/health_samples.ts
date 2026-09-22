@@ -12,6 +12,7 @@
  */
 
 import type { Db } from '../index.js';
+import { toCanonical } from '../../health/units.js';
 
 export interface HealthSample {
   sample_type: string;
@@ -53,22 +54,23 @@ export class HealthSamplesRepo {
   insertBatch(samples: HealthSample[]): InsertBatchResult {
     const stmt = this.db.prepare(
       `INSERT OR IGNORE INTO health_samples
-         (sample_type, start_time, end_time, value, unit, source_name, imported_at, raw)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+         (sample_type, start_time, end_time, value, unit, source_name, imported_at, raw,
+          start_epoch, end_epoch, local_day, local_time)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     );
     const importedAt = nowIso();
     // HealthKit reports percentages as fractions (0.25 for 25%), whatever
     // the unit string says. Normalising here covers every route in — the
     // app, the export importer and the Shortcut — so no consumer has to
     // know which source a row came from. `raw` keeps the original value.
-    // Rounded as well as rescaled: `value` is part of the UNIQUE key, and
-    // float noise (0.246 vs 0.246000000000000002, the same reading from two
-    // routes) otherwise slips past it and stores the row twice.
-    const normalized = samples.map((s) =>
-      s.sample_type.endsWith('_percentage')
-        ? { ...s, value: Math.round((s.value <= 1 ? s.value * 100 : s.value) * 100) / 100 }
-        : s,
-    );
+    // Canonical units, rounded. Both matter: a sum over mixed units is
+    // silently wrong (dietary energy once arrived as joules), and `value` is
+    // part of the dedupe key, so float noise from two routes writing one
+    // reading otherwise stores it twice. See src/health/units.ts.
+    const normalized = samples.map((s) => {
+      const c = toCanonical(s.sample_type, s.value, s.unit);
+      return { ...s, value: c.value, unit: c.unit };
+    });
     let inserted = 0;
 
     const tx = this.db.transaction((rows: HealthSample[]) => {
@@ -82,6 +84,14 @@ export class HealthSamplesRepo {
           s.source_name ?? null,
           importedAt,
           s.raw ?? null,
+          // Instant identity: text comparison misses the same moment written
+          // with a different UTC offset.
+          Math.floor(Date.parse(s.start_time) / 1000),
+          Math.floor(Date.parse(s.end_time) / 1000),
+          // The day the source asserted. date(start_time) would convert to
+          // UTC first and push a 00:30 meal onto the previous day.
+          s.start_time.slice(0, 10),
+          s.start_time.slice(11, 19),
         );
         if (info.changes > 0) inserted += 1;
       }

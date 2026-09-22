@@ -547,6 +547,96 @@ const MIGRATIONS: readonly Migration[] = [
          AND value <= 1.0;
     `,
   },
+  {
+    version: 13,
+    name: 'v0.8.1: health_samples integrity — units, instants, local days',
+    sql: `
+      -- Three defects, one table, all invisible to anything reading it.
+      --
+      -- 1. MIXED UNITS. Dietary energy arrived as both kcal and J, sodium and
+      --    cholesterol as both mg and g. SUM(value) mixed them silently: one
+      --    day read as 6,682,560 "kcal". Verified before converting — all 31
+      --    joule rows had a kcal twin at the same instant, and value/4184
+      --    matched it exactly.
+      -- 2. DUPLICATE INSTANTS. The UNIQUE key compares start_time as TEXT, so
+      --    the same moment written with different UTC offsets (Shortcut at
+      --    +01:00 in Oxford, export re-stamped at +02:00 in Vienna) was stored
+      --    twice. June intake was inflated up to 3x. Same class of bug as
+      --    migration 11 fixed for external_workouts.
+      -- 3. WRONG DAY. Consumers group by date(start_time), which converts to
+      --    UTC first, so a 00:30 meal lands on the previous day and the
+      --    boundary moves with DST. local_day is the day the source asserted.
+      --
+      -- ORDER MATTERS: duplicates are collapsed BEFORE units are converted.
+      -- Converting first makes a joule row equal its kcal twin and the
+      -- pre-existing UNIQUE(sample_type, start_time, source_name, value)
+      -- rejects the UPDATE. So the comparison below converts inline instead.
+
+      ALTER TABLE health_samples ADD COLUMN start_epoch INTEGER;
+      ALTER TABLE health_samples ADD COLUMN end_epoch INTEGER;
+      ALTER TABLE health_samples ADD COLUMN local_day TEXT;
+      ALTER TABLE health_samples ADD COLUMN local_time TEXT;
+
+      UPDATE health_samples
+         SET start_epoch = CAST(strftime('%s', start_time) AS INTEGER),
+             end_epoch   = CAST(strftime('%s', end_time) AS INTEGER),
+             -- The literal local date the source wrote, NOT date(start_time):
+             -- the latter converts to UTC and moves the boundary.
+             local_day   = substr(start_time, 1, 10),
+             local_time  = substr(start_time, 12, 8);
+
+      -- Collapse duplicates, comparing canonical values at one decimal. The
+      -- key is already one sample type from one source at one instant, so two
+      -- readings that close are the same reading; distinct items logged in the
+      -- same second differ by far more (3.4, 205.4 and 300 kcal at 18:20 on
+      -- one observed day). Rounding to one decimal also absorbs conversion
+      -- drift: 1969859.4 J becomes 470.81 kcal where its twin says 470.8.
+      DELETE FROM health_samples
+       WHERE id NOT IN (
+         SELECT id FROM (
+           SELECT id, ROW_NUMBER() OVER (
+             PARTITION BY sample_type, source_name, start_epoch,
+               ROUND(CASE
+                 WHEN sample_type = 'dietary_energy_consumed' AND unit = 'J'  THEN value / 4184.0
+                 WHEN sample_type = 'dietary_energy_consumed' AND unit = 'kJ' THEN value / 4.184
+                 WHEN sample_type IN ('dietary_sodium', 'dietary_potassium', 'dietary_cholesterol')
+                      AND unit = 'g' THEN value * 1000.0
+                 WHEN sample_type = 'dietary_water' AND unit = 'L' THEN value * 1000.0
+                 ELSE value END, 1)
+             -- Keep the row already in the canonical unit; then the earliest.
+             ORDER BY CASE
+               WHEN unit IN ('J', 'kJ') THEN 1
+               WHEN sample_type IN ('dietary_sodium', 'dietary_potassium', 'dietary_cholesterol')
+                    AND unit = 'g' THEN 1
+               WHEN sample_type = 'dietary_water' AND unit = 'L' THEN 1
+               ELSE 0 END, id
+           ) AS rn
+           FROM health_samples
+         )
+         WHERE rn = 1
+       );
+
+      -- Now convert whatever rogue-unit rows had no canonical twin.
+      UPDATE health_samples
+         SET value = ROUND(value / 4184.0, 2), unit = 'kcal'
+       WHERE sample_type = 'dietary_energy_consumed' AND unit = 'J';
+      UPDATE health_samples
+         SET value = ROUND(value / 4.184, 2), unit = 'kcal'
+       WHERE sample_type = 'dietary_energy_consumed' AND unit = 'kJ';
+      UPDATE health_samples
+         SET value = ROUND(value * 1000.0, 2), unit = 'mg'
+       WHERE sample_type IN ('dietary_sodium', 'dietary_potassium', 'dietary_cholesterol')
+         AND unit = 'g';
+      UPDATE health_samples
+         SET value = ROUND(value * 1000.0, 2), unit = 'mL'
+       WHERE sample_type = 'dietary_water' AND unit = 'L';
+
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_health_samples_instant
+        ON health_samples(sample_type, source_name, start_epoch, ROUND(value, 1));
+      CREATE INDEX IF NOT EXISTS idx_health_samples_local_day
+        ON health_samples(sample_type, local_day);
+    `,
+  },
 ];
 
 export function currentSchemaVersion(db: Database): number {
