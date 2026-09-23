@@ -804,3 +804,44 @@ pre-existing UNIQUE constraint rejects the update. The collapse compares
 canonical values at one decimal, coarser than the two decimals stored,
 because conversion drift (470.81 vs 470.8) would otherwise leave the pair
 intact.
+
+## v0.9: Telegram inbound, and what an acknowledgement costs
+
+Long polling rather than a webhook. A webhook needs a public HTTPS endpoint;
+polling makes only outbound calls, so this process opens no port on a machine
+holding years of personal health data. Only `getUpdates` is single-consumer,
+so the existing briefing sender that merely calls `sendMessage` needed no
+change.
+
+The ordering is the design. `getUpdates(offset=N)` is not a cursor read — it
+_acknowledges_ every update below N, and Telegram then discards them
+permanently. So the batch is inserted and committed before the offset moves,
+and the offset itself is derived from committed rows rather than stored
+separately, because a stored cursor can drift ahead of durable state and the
+messages it skipped are unrecoverable.
+
+Deriving it introduced the opposite failure, which an external review caught
+before implementation: rejected updates are never inserted, so they cannot
+raise `MAX(update_id)`, and the next poll would request the same rejected
+update forever — one message from any stranger pinning the queue until a
+legitimate one arrived with a higher id. The fix is a high-water mark written
+in the same transaction as the batch. The alternative, a minimal row per
+rejected update, fixes the livelock too but turns a flood of spam into a
+flood of rows in a health database and stores a third party's chat id.
+Nothing about a rejected sender is persisted beyond a number and a counter.
+
+Media is fetched after the commit rather than inside it, because
+better-sqlite3 transactions are synchronous and cannot await; `pending` names
+the gap between a row existing and its file arriving. Filenames are derived
+from a content hash, never from the name the remote side supplied, and the
+extension is allowlisted — a remote-controlled filename is how a download
+becomes an arbitrary file write.
+
+Two smaller decisions worth recording. `document` is a first-class kind
+because a photo sent from iOS at full size arrives as a document, and
+silently dropping those would lose exactly the high-quality meal photos this
+feature exists to capture. And an edited message is stored as a second row
+whose predecessor points at it: Telegram delivers an edit as a new update
+carrying the same `message_id`, so replacing in place loses the audit trail
+while ignoring the relationship double-counts a corrected meal — the failure
+class migrations 11 and 13 already paid for twice.
