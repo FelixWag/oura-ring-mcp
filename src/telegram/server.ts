@@ -33,6 +33,7 @@ import {
   processPhoto,
   readConfirmation,
   resolvePendingTarget,
+  applyCorrection,
   formatEstimate,
   type PendingMeal,
 } from './meal_flow.js';
@@ -385,6 +386,69 @@ async function drainPhotos(
 }
 
 /**
+ * Handle text messages: confirmations, rejections, corrections, notes.
+ *
+ * Drained rather than handled in the batch loop, because a correction runs a
+ * model. `extracted_at` marks the attempt whatever the outcome, so a restart
+ * mid-correction cannot apply the same amendment twice — an append-only chain
+ * would keep both, and if the two model runs differ they disagree forever.
+ */
+async function drainText(
+  db: Db,
+  client: TelegramClient,
+  config: TelegramConfig,
+  log: (line: string) => Promise<void>,
+): Promise<void> {
+  const rows = db
+    .prepare<[], { id: number; text: string | null; raw: string; is_forwarded: number }>(
+      `SELECT id, text, raw, is_forwarded FROM telegram_updates
+        WHERE kind = 'text' AND extracted_at IS NULL AND superseded_by IS NULL
+        ORDER BY id LIMIT 5`,
+    )
+    .all();
+
+  for (const row of rows) {
+    const replyTo = (
+      JSON.parse(row.raw) as { message?: { reply_to_message?: { message_id?: number } } }
+    ).message?.reply_to_message?.message_id;
+    const intent = readConfirmation(row.text, replyTo);
+
+    let reply: string;
+    try {
+      if (intent.kind === 'confirm' || intent.kind === 'reject') {
+        reply = applyConfirmation(db, intent.kind, intent.replyToMessageId);
+      } else if (intent.kind === 'correct') {
+        const result = await applyCorrection(
+          db,
+          {
+            text: intent.text,
+            ...(intent.replyToMessageId !== undefined
+              ? { replyToMessageId: intent.replyToMessageId }
+              : {}),
+            isForwarded: row.is_forwarded === 1,
+          },
+          config.mediaDir,
+        );
+        await log(`text ${row.id}: correction ${result.status}`);
+        reply = result.reply;
+      } else {
+        reply = 'Got it — noted.';
+      }
+    } catch (err) {
+      // Left unmarked so a transient fault gets another attempt.
+      await log(`text ${row.id}: failed: ${(err as Error).message}`);
+      continue;
+    }
+
+    db.prepare('UPDATE telegram_updates SET extracted_at = ? WHERE id = ?').run(
+      new Date().toISOString(),
+      row.id,
+    );
+    await client.sendMessage(config.allowedChatId, reply);
+  }
+}
+
+/**
  * Ask again about meals whose original question never made it.
  *
  * Normally a no-op. It matters on a flaky connection: the estimate is stored
@@ -464,28 +528,10 @@ async function main(): Promise<void> {
           );
         }
 
-        // A text reply may be confirming a meal we already estimated. Only
-        // the allowed chat is answered: replying to a stranger confirms the
-        // bot exists and answers to them.
-        for (const update of updates) {
-          if (!isAllowed(update, config.allowedChatId)) continue;
-          if (update.edited_message) continue; // an edit does not need a second ack
-          const message = update.message!;
-          if (classifyMessage(message).kind !== 'text') continue;
-
-          const intent = readConfirmation(
-            message.text ?? null,
-            message.reply_to_message?.message_id,
-          );
-          if (intent.kind === 'none') {
-            await client.sendMessage(message.chat.id, 'Got it — saved.');
-            continue;
-          }
-          await client.sendMessage(
-            message.chat.id,
-            applyConfirmation(db, intent.kind, intent.replyToMessageId),
-          );
-        }
+        // Text is NOT handled here. A correction is a model call: slow, and
+        // on a flaky connection frequently failing. Handled inline it would
+        // block polling and have no retry path — the same lesson the photo
+        // drain already learned one message type earlier.
       }
 
       // Outside the batch check on purpose: work can be left over from an
@@ -496,6 +542,7 @@ async function main(): Promise<void> {
       const stored = await drainMedia(repo, client, config, log);
       if (stored > 0) await log(`media: stored=${stored}`);
       await drainPhotos(db, repo, client, config, log);
+      await drainText(db, client, config, log);
       await drainPrompts(db, client, config, log);
       consecutiveFailures = 0;
     } catch (err) {

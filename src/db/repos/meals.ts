@@ -112,6 +112,14 @@ export class MealsRepo {
    * storing it would mean every future reader has to remember to check.
    */
   addExtraction(mealId: number, extraction: NewExtraction): number {
+    const existing = this.get(mealId);
+    if (existing?.status === 'voided') {
+      // Otherwise the extraction attaches, the meal stays unprojected because
+      // its status is not 'confirmed', and the user is told it was updated
+      // while it still counts for nothing.
+      throw new Error(`meal ${mealId} is voided and cannot be amended`);
+    }
+
     const canonicalTotals: Record<string, number> = {};
     for (const [nutrient, rawValue] of Object.entries(extraction.totals)) {
       const unit = extraction.units?.[nutrient] ?? CANONICAL_UNITS[nutrient] ?? '';
@@ -180,16 +188,18 @@ export class MealsRepo {
         .prepare('UPDATE meals SET current_extraction_id = ? WHERE id = ?')
         .run(extractionId, mealId);
 
+      // Inside the transaction, deliberately. Committing the new extraction
+      // and projecting it separately leaves a window where
+      // current_extraction_id points at corrected totals while health_samples
+      // still holds the old ones — the user is told "900 → 780" and the
+      // database says 900, with nothing to detect it afterwards. project() is
+      // synchronous SQL, so better-sqlite3 nests it as a savepoint.
+      if (existing?.status === 'confirmed') this.project(mealId);
+
       return extractionId;
     });
 
-    const extractionId = tx();
-
-    // A confirmed meal that gets re-extracted keeps its projection in step.
-    const meal = this.get(mealId);
-    if (meal?.status === 'confirmed') this.project(mealId);
-
-    return extractionId;
+    return tx();
   }
 
   linkMedia(mealId: number, sourceKind: SourceKind, sourceId: number): void {
@@ -202,13 +212,18 @@ export class MealsRepo {
 
   /** Confirm a meal and project its current extraction into `health_samples`. */
   confirm(mealId: number, via: string): void {
-    this.db
-      .prepare(
-        `UPDATE meals SET status = 'confirmed', confirmed_at = ?, confirmed_via = ?
-          WHERE id = ? AND status <> 'voided'`,
-      )
-      .run(nowIso(), via, mealId);
-    this.project(mealId);
+    // One transaction: a fault between the status change and the projection
+    // would leave a meal marked confirmed that counts for nothing.
+    const tx = this.db.transaction(() => {
+      this.db
+        .prepare(
+          `UPDATE meals SET status = 'confirmed', confirmed_at = ?, confirmed_via = ?
+            WHERE id = ? AND status <> 'voided'`,
+        )
+        .run(nowIso(), via, mealId);
+      this.project(mealId);
+    });
+    tx();
   }
 
   /**
@@ -325,6 +340,66 @@ export class MealsRepo {
           ORDER BY m.id LIMIT ?`,
       )
       .all(limit);
+  }
+
+  /**
+   * Meals a free-text correction could refer to.
+   *
+   * Deliberately not the pending-prompt set: that one selects meals nobody
+   * has been told about, which auto-confirm keeps empty. "Correctable" means
+   * recent, not voided, and already described — a different question.
+   */
+  correctableMeals(
+    withinHours = 24,
+    limit = 10,
+  ): Array<{
+    meal_id: number;
+    source_id: number;
+    prompt_message_id: number | null;
+    description: string | null;
+    totals: string;
+    depth: number;
+  }> {
+    const cutoff = Math.floor(Date.now() / 1000) - withinHours * 3600;
+    return this.db
+      .prepare<
+        [number, number],
+        {
+          meal_id: number;
+          source_id: number;
+          prompt_message_id: number | null;
+          description: string | null;
+          totals: string;
+          depth: number;
+        }
+      >(
+        `SELECT m.id AS meal_id,
+                COALESCE(t.message_id, 0) AS source_id,
+                m.prompt_message_id AS prompt_message_id,
+                e.description AS description,
+                e.totals AS totals,
+                (SELECT COUNT(*) FROM meal_extractions x WHERE x.meal_id = m.id) - 1 AS depth
+           FROM meals m
+           JOIN meal_extractions e ON e.id = m.current_extraction_id
+           LEFT JOIN meal_media mm ON mm.meal_id = m.id AND mm.source_kind = 'telegram'
+           LEFT JOIN telegram_updates t ON t.id = mm.source_id
+          WHERE m.status <> 'voided' AND m.eaten_epoch >= ?
+          ORDER BY m.eaten_epoch DESC LIMIT ?`,
+      )
+      .all(cutoff, limit);
+  }
+
+  /** What this meal currently contributes, read back from the projection. */
+  projectedTotals(mealId: number): Record<string, number> {
+    const rows = this.db
+      .prepare<
+        [number],
+        { sample_type: string; value: number }
+      >('SELECT sample_type, value FROM health_samples WHERE meal_id = ?')
+      .all(mealId);
+    const totals: Record<string, number> = {};
+    for (const row of rows) totals[row.sample_type] = row.value;
+    return totals;
   }
 
   get(mealId: number): MealRow | undefined {

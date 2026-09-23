@@ -6,6 +6,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 For the architectural rationale behind each change, see [DECISIONS.md](DECISIONS.md).
 
+## [0.12.0] — 2026-09-23
+
+### Added
+
+- **Corrections in chat.** "closer to 800 kcal" amends a stored meal: the model
+  is given the previous estimate and the correction and returns an amended
+  object, which supersedes and re-projects. No schema change — the append-only
+  extraction chain already supported it.
+- **The reply reports every nutrient that moved**, read back from what was
+  actually written rather than what was computed. A correction rewrites the
+  whole object, so "closer to 800 kcal" is licence to re-estimate sodium too,
+  and reporting only the mentioned nutrient would let a tripling pass unseen.
+- **Guards:** forwarded corrections refused, a 24-hour window, a cap of three
+  amendments before suggesting a fresh photo, and a refusal to amend a voided
+  meal — which previously attached an extraction that silently never projected.
+
+### Fixed
+
+- **Projection is now inside the transaction** in `addExtraction()` and
+  `confirm()`. A fault between committing an extraction and projecting it left
+  `current_extraction_id` pointing at corrected totals while `health_samples`
+  held the old ones — the user told "900 → 780" while the database said 900,
+  with nothing to detect it. Same shape as the stranded-meal bug: a multi-step
+  operation where a fault between steps leaves something that looks complete.
+- **Text messages are drained, not handled inline.** A correction is a model
+  call: slow, and frequently failing on this machine's connection. Handled in
+  the poll loop it blocked polling and had no retry path. `extracted_at` marks
+  the attempt whatever the outcome, so a restart mid-correction cannot apply
+  the same amendment twice.
+
 ## [0.11.0] — 2026-09-23
 
 ### Added
