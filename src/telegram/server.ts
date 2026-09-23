@@ -28,6 +28,14 @@ import {
 } from '../db/repos/telegram_updates.js';
 import { TelegramClient, type TelegramMessage, type TelegramUpdate } from './client.js';
 import { downloadMedia } from './media.js';
+import { MealsRepo } from '../db/repos/meals.js';
+import {
+  processPhoto,
+  readConfirmation,
+  resolvePendingTarget,
+  formatEstimate,
+  type PendingMeal,
+} from './meal_flow.js';
 
 export interface ClassifiedMessage {
   kind: TelegramKind;
@@ -271,6 +279,140 @@ export async function drainMedia(
   return stored;
 }
 
+/**
+ * Meals awaiting confirmation, newest first, with the message that produced
+ * each one so an explicit reply can be matched to it.
+ */
+function pendingMeals(db: Db): PendingMeal[] {
+  return db
+    .prepare<[], PendingMeal>(
+      `SELECT m.id AS meal_id, t.message_id AS source_id,
+              m.prompt_message_id AS prompt_message_id, e.description AS description
+         FROM meals m
+         JOIN meal_media mm ON mm.meal_id = m.id AND mm.source_kind = 'telegram'
+         JOIN telegram_updates t ON t.id = mm.source_id
+         LEFT JOIN meal_extractions e ON e.id = m.current_extraction_id
+        WHERE m.status = 'unconfirmed'
+        ORDER BY m.id DESC`,
+    )
+    .all();
+}
+
+/**
+ * Apply a confirmation or rejection, and say what happened.
+ *
+ * Ambiguity is reported rather than guessed: two photos followed by one "ok"
+ * is the common case, and confirming the wrong meal is worse than asking.
+ */
+function applyConfirmation(
+  db: Db,
+  kind: 'confirm' | 'reject',
+  replyToMessageId: number | undefined,
+): string {
+  const pending = pendingMeals(db);
+  if (pending.length === 0) return "There's nothing waiting to be confirmed.";
+
+  const { target, ambiguous } = resolvePendingTarget(pending, replyToMessageId);
+  if (ambiguous || !target) {
+    const names = pending.map((p) => p.description ?? 'a meal').join(', ');
+    return `I have ${pending.length} meals waiting (${names}). Reply to the one you mean.`;
+  }
+
+  const repo = new MealsRepo(db);
+  if (kind === 'confirm') {
+    repo.confirm(target.meal_id, 'telegram');
+    return `Saved: ${target.description ?? 'meal'}.`;
+  }
+  repo.void(target.meal_id, 'rejected in chat');
+  return `Dropped: ${target.description ?? 'meal'}. It won't count towards anything.`;
+}
+
+/**
+ * Analyse photos whose file has landed. One extraction per message, and the
+ * reply always says what happened — a photo silently left unanalysed is
+ * believed to have been logged.
+ */
+async function drainPhotos(
+  db: Db,
+  repo: TelegramUpdatesRepo,
+  client: TelegramClient,
+  config: TelegramConfig,
+  log: (line: string) => Promise<void>,
+): Promise<void> {
+  const rows = db
+    .prepare<[], { id: number }>(
+      `SELECT t.id FROM telegram_updates t
+        WHERE t.status = 'stored' AND t.kind IN ('photo', 'document')
+          AND t.media_path IS NOT NULL AND t.superseded_by IS NULL
+          AND t.extracted_at IS NULL
+        ORDER BY t.id LIMIT 5`,
+    )
+    .all();
+
+  for (const { id } of rows) {
+    const row = db
+      .prepare<
+        [number],
+        Parameters<typeof processPhoto>[1]
+      >('SELECT * FROM telegram_updates WHERE id = ?')
+      .get(id);
+    if (!row) continue;
+
+    try {
+      const result = await processPhoto(db, row, config.mediaDir);
+      // Marked whatever the outcome: a photo that produced no meal must not
+      // be retried on every cycle, spending money and repeating the reply.
+      db.prepare('UPDATE telegram_updates SET extracted_at = ? WHERE id = ?').run(
+        new Date().toISOString(),
+        id,
+      );
+      await log(`photo ${id}: ${result.status}`);
+
+      const promptId = await client.sendMessage(config.allowedChatId, result.reply);
+      // Remember which message asked, so the reply can be matched to this
+      // meal. If the send failed, prompt_message_id stays NULL and
+      // drainPrompts asks again — a meal nobody was told about is the silent
+      // failure this flow exists to prevent.
+      if (result.meal_id !== undefined && promptId !== null) {
+        new MealsRepo(db).setPromptMessageId(result.meal_id, promptId);
+      }
+    } catch (err) {
+      // A crash is different from a refusal: leave extracted_at unset so a
+      // transient fault (a model hiccup, a full disk) gets another chance.
+      await log(`photo ${id}: extraction crashed: ${(err as Error).message}`);
+    }
+  }
+}
+
+/**
+ * Ask again about meals whose original question never made it.
+ *
+ * Normally a no-op. It matters on a flaky connection: the estimate is stored
+ * but the message telling the user was lost, leaving a meal that counts for
+ * nothing and a user who thinks nothing was logged.
+ */
+async function drainPrompts(
+  db: Db,
+  client: TelegramClient,
+  config: TelegramConfig,
+  log: (line: string) => Promise<void>,
+): Promise<void> {
+  const repo = new MealsRepo(db);
+  for (const pending of repo.awaitingPrompt()) {
+    const totals = JSON.parse(pending.totals) as Record<string, number>;
+    const text = formatEstimate({
+      description: pending.description ?? 'Meal',
+      totals,
+      confidence: pending.confidence,
+    });
+    const promptId = await client.sendMessage(config.allowedChatId, text);
+    if (promptId !== null) {
+      repo.setPromptMessageId(pending.meal_id, promptId);
+      await log(`meal ${pending.meal_id}: asked for confirmation`);
+    }
+  }
+}
+
 /** Consecutive poll failures before the server says so in the chat itself. */
 const ALERT_AFTER_FAILURES = 5;
 
@@ -322,23 +464,39 @@ async function main(): Promise<void> {
           );
         }
 
-        // Acknowledge receipt, but only to the allowed chat: replying to a
-        // stranger confirms the bot exists and answers to them.
+        // A text reply may be confirming a meal we already estimated. Only
+        // the allowed chat is answered: replying to a stranger confirms the
+        // bot exists and answers to them.
         for (const update of updates) {
           if (!isAllowed(update, config.allowedChatId)) continue;
-          const message = (update.message ?? update.edited_message)!;
           if (update.edited_message) continue; // an edit does not need a second ack
-          const kind = classifyMessage(message).kind;
-          const ack =
-            kind === 'text'
-              ? 'Got it — saved.'
-              : `Got it — ${kind} saved. (Nothing reads it yet; that comes next.)`;
-          await client.sendMessage(message.chat.id, ack);
-        }
+          const message = update.message!;
+          if (classifyMessage(message).kind !== 'text') continue;
 
-        const stored = await drainMedia(repo, client, config, log);
-        if (stored > 0) await log(`media: stored=${stored}`);
+          const intent = readConfirmation(
+            message.text ?? null,
+            message.reply_to_message?.message_id,
+          );
+          if (intent.kind === 'none') {
+            await client.sendMessage(message.chat.id, 'Got it — saved.');
+            continue;
+          }
+          await client.sendMessage(
+            message.chat.id,
+            applyConfirmation(db, intent.kind, intent.replyToMessageId),
+          );
+        }
       }
+
+      // Outside the batch check on purpose: work can be left over from an
+      // earlier cycle — a download that failed, a photo stored just before a
+      // restart — and tying the drain to "a new message arrived" would leave
+      // it waiting for unrelated traffic. Found by running it: two photos sat
+      // analysed-never because nothing new had been sent since.
+      const stored = await drainMedia(repo, client, config, log);
+      if (stored > 0) await log(`media: stored=${stored}`);
+      await drainPhotos(db, repo, client, config, log);
+      await drainPrompts(db, client, config, log);
       consecutiveFailures = 0;
     } catch (err) {
       // Never let one bad cycle kill the process: launchd would restart it,

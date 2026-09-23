@@ -6,6 +6,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 For the architectural rationale behind each change, see [DECISIONS.md](DECISIONS.md).
 
+## [0.11.0] — 2026-09-23
+
+### Added
+
+- **Photo → nutrition, end to end.** A photo sent to Telegram is analysed by a
+  vision model, saved as a meal with items, portions and a confidence score,
+  and projected into `health_samples`. The bot reports what it saved; only a
+  correction needs a reply. Verified on real meals.
+- **The model gets no write tools at all** (`src/telegram/extractor.ts`). It
+  may read exactly one file — the photo the server names — and returns JSON
+  the server validates and stores. Tighter than an insert-only allowlist: a
+  successful prompt injection has nothing to reach.
+- **Captions are fenced and labelled untrusted**, and the system prompt states
+  that text _inside_ the photograph is part of the picture rather than a
+  request. Prompt wording is the first defence, not the only one: plausibility
+  bounds reject the output regardless.
+- **Forwarded messages are refused.** The `is_forwarded` flag, added before
+  anything could use it, now has its consumer.
+- **A daily extraction cap**, reported in chat when reached, because a photo
+  silently left unanalysed is believed to have been logged.
+
+### Changed
+
+- **Meals are saved on arrival rather than waiting for confirmation.** The
+  gate was correct in principle and wrong in practice: it taxed every meal to
+  guard against the rare bad estimate, and a tool that asks for six replies a
+  day stops being used — which loses far more data than a wrong number. What
+  makes it safe is that correction stays cheap: an amendment supersedes the
+  extraction, and "no" voids the meal, removing the numbers while keeping the
+  record.
+
+### Fixed
+
+- **Confirmation replies never matched** (schema v17). A reply answers the
+  _bot's_ message, not the user's photo, and only the photo's id was checked —
+  so every confirmation fell through to "which meal do you mean?".
+  `meals.prompt_message_id` records what was actually asked.
+- **A meal whose notification failed was stranded.** The estimate stored, the
+  `sendMessage` hit a network blip, and nothing retried: the meal existed and
+  the user was never told. A NULL `prompt_message_id` now means "not yet told",
+  and the server asks again.
+- **Photo analysis only ran when a new message arrived** (schema v16), so
+  photos stored just before a quiet spell waited on unrelated traffic. The
+  drain now runs every cycle, and `telegram_updates.extracted_at` stops a
+  photo that produced no meal from being re-analysed forever.
+
 ## [0.10.0] — 2026-09-23
 
 ### Added

@@ -880,6 +880,40 @@ const MIGRATIONS: readonly Migration[] = [
       CREATE INDEX IF NOT EXISTS idx_meal_media_meal ON meal_media(meal_id);
     `,
   },
+  {
+    version: 16,
+    name: 'v0.10: telegram_updates.extracted_at',
+    sql: `
+      -- When meal extraction last ran for this message, whatever the outcome.
+      -- Without it, a photo that produced no meal (not food, implausible
+      -- numbers, a model failure) has nothing marking it as attempted, and the
+      -- drain picks it up again on every cycle — a retry loop that spends
+      -- money and re-sends the same reply.
+      ALTER TABLE telegram_updates ADD COLUMN extracted_at TEXT;
+      CREATE INDEX IF NOT EXISTS idx_telegram_updates_unextracted
+        ON telegram_updates(id) WHERE extracted_at IS NULL;
+    `,
+  },
+  {
+    version: 17,
+    name: 'v0.10: meals.prompt_message_id',
+    sql: `
+      -- The bot message that asked "reply ok to save this".
+      --
+      -- Two failures made this necessary, both seen in production within a
+      -- day. First, a reply is matched against the message it answers — and
+      -- the user replies to the BOT's estimate, not to their own photo, so
+      -- matching on the photo's id never hit and every confirmation fell
+      -- through to "which meal do you mean?". Second, the send is a network
+      -- call on a flaky connection: when it failed, the meal existed and
+      -- nothing had told the user, which is the silent failure this whole
+      -- flow exists to avoid. A NULL here means "not yet asked", so the
+      -- drain re-sends rather than leaving a meal stranded.
+      ALTER TABLE meals ADD COLUMN prompt_message_id INTEGER;
+      CREATE INDEX IF NOT EXISTS idx_meals_unprompted
+        ON meals(id) WHERE status = 'unconfirmed' AND prompt_message_id IS NULL;
+    `,
+  },
 ];
 
 export function currentSchemaVersion(db: Database): number {

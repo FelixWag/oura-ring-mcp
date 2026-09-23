@@ -99,8 +99,13 @@ export class TelegramClient {
     });
   }
 
-  async sendMessage(chatId: number, text: string): Promise<void> {
-    await this.call('sendMessage', { chat_id: chatId, text });
+  /** Returns the sent message's id, so a later reply can be matched to it. */
+  async sendMessage(chatId: number, text: string): Promise<number | null> {
+    const sent = await this.call<{ message_id?: number }>('sendMessage', {
+      chat_id: chatId,
+      text,
+    });
+    return sent.message_id ?? null;
   }
 
   /**
