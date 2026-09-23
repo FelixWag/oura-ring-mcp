@@ -887,3 +887,37 @@ without the constraint, and identity is now expressed by two partial indexes —
 the old rule for device rows, the real one for meals. A test that projects two
 identical meals is what surfaced it; neither of the two design reviews caught
 it, because both were reading the schema rather than running it.
+
+## v0.11: the extractor, and why confirmation stopped being a gate
+
+The model that estimates a meal has no tool that can write anything. It may
+read one file — the photo the server names — and it returns JSON which the
+server validates and stores. The plan called for an insert-only MCP tool
+allowlist; this is tighter, and for the same reason: an allowlist bounds what
+a hijacked agent can do, while having no write tool means a successful
+injection has nothing to reach. The agent is a function from an image to an
+object, so it is given the powers of one.
+
+Confirmation was designed as a gate: nothing counted until the user replied
+"ok". That is correct in principle and wrong in practice. It taxes every meal
+to protect against the occasional bad estimate, and a logging tool that
+demands six replies a day stops being used — which loses far more data than a
+wrong number does. Meals are now saved on arrival and the bot reports what it
+saved; only a correction needs a reply. What makes that safe is that undo is
+cheap and complete: an amendment supersedes the extraction, "no" voids the
+meal and deletes its projected rows, and the record survives either way.
+Reversible auto-saving beats an abandoned tool.
+
+Two failures in the first day of real use were worth more than the design
+review that preceded them. A confirmation reply never matched, because a
+reply answers the _bot's_ message and only the user's photo id was being
+checked. And a meal whose notification failed — the estimate stored, the
+`sendMessage` lost to a flaky connection — sat counting nothing while the user
+believed nothing had been logged. Both had the same root: nothing recorded
+whether the user had actually been told. `meals.prompt_message_id` answers
+that, and a NULL means "ask again".
+
+The pattern worth keeping: each of these was found by running the thing on
+real photos, after two thorough reviews had read the design and approved it.
+Reviews catch what is wrong in an argument; only use catches what is missing
+from one.

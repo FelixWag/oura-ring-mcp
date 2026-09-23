@@ -70,6 +70,7 @@ export interface MealRow {
   voided_at: string | null;
   void_reason: string | null;
   created_at: string;
+  prompt_message_id: number | null;
 }
 
 export class MealValidationError extends Error {
@@ -290,6 +291,40 @@ export class MealsRepo {
     tx();
 
     return written;
+  }
+
+  /** Remember which bot message asked about this meal, so a reply can match it. */
+  setPromptMessageId(mealId: number, messageId: number): void {
+    this.db.prepare('UPDATE meals SET prompt_message_id = ? WHERE id = ?').run(messageId, mealId);
+  }
+
+  /**
+   * Meals the user was never told about.
+   *
+   * Normally empty. It fills when the message itself failed — a dropped
+   * network call on a flaky connection — and those meals would otherwise
+   * count silently, with the user never having seen the estimate and so
+   * never having had the chance to correct it.
+   */
+  awaitingPrompt(limit = 5): Array<{
+    meal_id: number;
+    totals: string;
+    description: string | null;
+    confidence: number | null;
+  }> {
+    return this.db
+      .prepare<
+        [number],
+        { meal_id: number; totals: string; description: string | null; confidence: number | null }
+      >(
+        `SELECT m.id AS meal_id, e.totals AS totals, e.description AS description,
+                e.confidence AS confidence
+           FROM meals m
+           JOIN meal_extractions e ON e.id = m.current_extraction_id
+          WHERE m.status <> 'voided' AND m.prompt_message_id IS NULL
+          ORDER BY m.id LIMIT ?`,
+      )
+      .all(limit);
   }
 
   get(mealId: number): MealRow | undefined {
