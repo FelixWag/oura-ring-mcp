@@ -6,6 +6,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 For the architectural rationale behind each change, see [DECISIONS.md](DECISIONS.md).
 
+## [0.10.0] — 2026-09-23
+
+### Added
+
+- **Meals storage** (schema v15): `meals` (the eating event), `meal_extractions`
+  (append-only attempts, each with model, prompt version and confidence),
+  `meal_items` (child of an extraction — re-extracting produces new items) and
+  `meal_media` (one meal, many source messages: an album is several updates and
+  one breakfast). Nutrition projects into `health_samples` carrying `meal_id`.
+- **Plausibility bounds for model-estimated nutrition**
+  (`src/health/nutrition_bounds.ts`). `toCanonical()` fixes a wrong _label_; it
+  cannot fix a wrong _number_, and the numbers now come from a vision model. A
+  meal whose totals are negative, implausibly large, or inconsistent with their
+  own macros is rejected rather than stored flagged.
+- **A void path.** Superseding an extraction means "that description was
+  wrong"; `voided_at` means "that meal never happened" — a hallucinated item,
+  someone else's plate, a test photo. Set by the confirmation flow, never by a
+  model tool.
+- **Pending-meal visibility.** An unconfirmed meal writes no nutrition rows, but
+  a pending count per day ships with it: silence would otherwise read as "did
+  not eat" and earn an "eat more" recommendation.
+- **A double-logging audit** (`overlappingSources`) flagging any day whose
+  nutrition came from two estimators — nothing filters `health_samples` by
+  `source_name`, so a meal logged in two places is simply counted twice.
+
+### Fixed
+
+- **`health_samples` was rebuilt to drop a table-level constraint SQLite cannot
+  remove in place:** `UNIQUE(sample_type, start_time, source_name, value)`, which
+  compares timestamps as TEXT — the defect migration 13 replaced with epoch
+  identity, surviving because a migration can add an index but not remove a
+  constraint. It was actively wrong: two _different_ meals with the same
+  nutrient value at the same instant collided, and one was dropped silently.
+  Identity is now expressed by two partial indexes — epoch-based for device
+  rows, `(meal_id, sample_type)` for projected ones. All 2,523 rows preserved.
+
 ## [0.9.0] — 2026-09-22
 
 ### Added

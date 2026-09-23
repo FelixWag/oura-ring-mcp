@@ -845,3 +845,45 @@ whose predecessor points at it: Telegram delivers an edit as a new update
 carrying the same `message_id`, so replacing in place loses the audit trail
 while ignoring the relationship double-counts a corrected meal — the failure
 class migrations 11 and 13 already paid for twice.
+
+## v0.10: meals, and the constraint that outlived its own correction
+
+Photo-estimated nutrition needs somewhere to live. Four tables rather than
+one, and each split was forced by something already certain rather than
+imagined.
+
+`meals` (the eating event) is separate from `meal_extractions` (attempts to
+describe it) because they have different lifetimes: an event is stable and
+correctable, an attempt is append-only. Conflating them means re-running a
+better model later either mutates history or silently overrides a correction
+made by hand. `meal_items` hangs off the extraction, not the meal, since
+re-extracting produces different items — and it is a child table rather than
+JSON so that a future food-composition mirror is an additive `UPDATE` of
+`food_id` instead of parsing and rewriting every blob. `meal_media` is a
+junction because an album arrives as several messages describing one meal.
+
+Totals live in exactly one queryable place. An earlier draft had the eleven
+nutrients as columns on `meals` _and_ projected into `health_samples`: two
+homes for one number with nothing enforcing agreement, so a correction would
+leave one stale forever. The extraction's own totals are kept as an immutable
+record of what each run said, which is provenance rather than duplication.
+
+Confirmation gates projection: an unconfirmed meal writes no nutrition rows at
+all, rather than flagged rows every consumer must remember to filter. But
+silence is not neutral — a day with an unconfirmed dinner looks like a deficit
+— so a pending count per day ships alongside, and a void path exists from the
+start, because supersession only covers "that was wrong", never "that never
+happened".
+
+The deepest fix was elsewhere. `health_samples` still carried
+`UNIQUE(sample_type, start_time, source_name, value)` from v0.7 — a key that
+compares timestamps as text, which is precisely the defect migration 13
+replaced with epoch identity. It survived because a migration can add an index
+but cannot remove a table constraint, and by v0.10 it was actively wrong: two
+_different_ meals with the same nutrient value at the same instant collided,
+and `INSERT OR IGNORE` dropped one silently. A projected row's identity was
+never the instant; it is `(meal_id, sample_type)`. So the table was rebuilt
+without the constraint, and identity is now expressed by two partial indexes —
+the old rule for device rows, the real one for meals. A test that projects two
+identical meals is what surfaced it; neither of the two design reviews caught
+it, because both were reading the schema rather than running it.

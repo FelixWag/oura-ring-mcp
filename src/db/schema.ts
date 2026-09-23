@@ -723,6 +723,163 @@ const MIGRATIONS: readonly Migration[] = [
         ON telegram_updates(sent_epoch);
     `,
   },
+  {
+    version: 15,
+    name: 'v0.10: meals, extractions, items, media + projection link',
+    sql: `
+      -- Photo -> nutrition storage. Four tables, because two different things
+      -- were trying to share one row: an EATING EVENT (stable, correctable,
+      -- has a confirmation state) and an EXTRACTION ATTEMPT (append-only, one
+      -- per model run). Conflating them means re-running a better model either
+      -- mutates history or silently overrides a correction made by hand.
+
+      CREATE TABLE IF NOT EXISTS meals (
+        id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+        eaten_epoch           INTEGER NOT NULL,
+        -- The day the meal belongs to. NOT date(eaten_epoch): that converts to
+        -- UTC and pushes a 00:30 meal onto the previous day (migration 13).
+        local_day             TEXT NOT NULL,
+        local_time            TEXT NOT NULL,
+        -- Telegram carries no timezone, and its compressed photos carry no
+        -- EXIF either (verified on real messages), so for that path this is
+        -- the server's assumption. tz_source says which rule produced it, so
+        -- nothing downstream mistakes an assumption for an assertion.
+        tz                    TEXT NOT NULL,
+        tz_source             TEXT NOT NULL,
+        status                TEXT NOT NULL DEFAULT 'unconfirmed',
+        -- Which extraction currently describes this meal. Projection reads
+        -- this one; the others stay as history.
+        current_extraction_id INTEGER REFERENCES meal_extractions(id),
+        confirmed_at          TEXT,
+        confirmed_via         TEXT,
+        -- Supersession covers "that was wrong"; this covers "that never
+        -- happened" — a hallucinated item, someone else's plate, a test photo.
+        -- Set by the confirmation flow, never by a model tool.
+        voided_at             TEXT,
+        void_reason           TEXT,
+        created_at            TEXT NOT NULL,
+
+        CHECK (status IN ('unconfirmed', 'confirmed', 'voided')),
+        CHECK (tz_source IN ('exif', 'configured', 'user'))
+      );
+
+      -- Append-only. Re-extracting with a better model adds a row and points
+      -- the old one at it, mirroring how an edited Telegram message is stored.
+      CREATE TABLE IF NOT EXISTS meal_extractions (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        meal_id         INTEGER NOT NULL REFERENCES meals(id),
+        model           TEXT NOT NULL,
+        prompt_version  TEXT NOT NULL,
+        confidence      REAL,
+        description     TEXT,
+        -- The model's totals, verbatim and immutable. This is not a second
+        -- home for the numbers: health_samples holds the projection of the
+        -- CURRENT extraction, this holds what each run actually said. An
+        -- immutable record and a queryable surface are different things.
+        totals          TEXT NOT NULL,
+        raw_response    TEXT,
+        extracted_at    TEXT NOT NULL,
+        superseded_by   INTEGER REFERENCES meal_extractions(id),
+
+        CHECK (confidence IS NULL OR (confidence >= 0 AND confidence <= 1))
+      );
+
+      -- Items belong to an EXTRACTION, not to the meal: re-extracting
+      -- produces different items. A child table rather than JSON so a future
+      -- food-composition mirror is an additive UPDATE of food_id instead of
+      -- parsing and rewriting every blob in a live database.
+      CREATE TABLE IF NOT EXISTS meal_items (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        extraction_id   INTEGER NOT NULL REFERENCES meal_extractions(id),
+        position        INTEGER NOT NULL,
+        name            TEXT NOT NULL,
+        -- Verbatim from the model ("1 cup", "2 slices", "150 g"). Never
+        -- summed: mixed portion units are the joules bug one level down.
+        portion_text    TEXT,
+        grams           REAL,
+        food_id         TEXT,
+        confidence      REAL
+      );
+
+      -- One meal, many source artefacts: a Telegram album arrives as several
+      -- updates sharing a media_group_id, and a plate shot from two angles is
+      -- still one breakfast.
+      CREATE TABLE IF NOT EXISTS meal_media (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        meal_id         INTEGER NOT NULL REFERENCES meals(id),
+        source_kind     TEXT NOT NULL,
+        source_id       INTEGER NOT NULL,
+
+        UNIQUE(meal_id, source_kind, source_id),
+        CHECK (source_kind IN ('telegram', 'voice', 'manual', 'healthkit'))
+      );
+
+      -- health_samples is REBUILT rather than altered, to drop a table-level
+      -- constraint SQLite cannot remove in place:
+      --
+      --   UNIQUE(sample_type, start_time, source_name, value)
+      --
+      -- That key compares start_time as TEXT — the very defect migration 13
+      -- replaced with epoch identity. It survived because migration 13 could
+      -- only add an index, not remove a constraint, and it is now actively
+      -- wrong: two DIFFERENT meals with the same nutrient value at the same
+      -- instant collide on it, and one is dropped silently. Identity is now
+      -- expressed entirely by the two partial indexes below — epoch-based for
+      -- device rows, (meal_id, sample_type) for projected ones.
+      CREATE TABLE health_samples_rebuilt (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        sample_type     TEXT NOT NULL,
+        start_time      TEXT NOT NULL,
+        end_time        TEXT NOT NULL,
+        value           REAL NOT NULL,
+        unit            TEXT NOT NULL,
+        source_name     TEXT,
+        imported_at     TEXT NOT NULL,
+        raw             TEXT,
+        start_epoch     INTEGER,
+        end_epoch       INTEGER,
+        local_day       TEXT,
+        local_time      TEXT,
+        meal_id         INTEGER REFERENCES meals(id)
+      );
+
+      INSERT INTO health_samples_rebuilt
+        (id, sample_type, start_time, end_time, value, unit, source_name,
+         imported_at, raw, start_epoch, end_epoch, local_day, local_time)
+      SELECT id, sample_type, start_time, end_time, value, unit, source_name,
+             imported_at, raw, start_epoch, end_epoch, local_day, local_time
+        FROM health_samples;
+
+      DROP TABLE health_samples;
+      ALTER TABLE health_samples_rebuilt RENAME TO health_samples;
+
+      CREATE INDEX IF NOT EXISTS idx_health_samples_type_time
+        ON health_samples(sample_type, start_time);
+      CREATE INDEX IF NOT EXISTS idx_health_samples_imported
+        ON health_samples(imported_at);
+      CREATE INDEX IF NOT EXISTS idx_health_samples_local_day
+        ON health_samples(sample_type, local_day);
+
+      -- "One source cannot emit the same value at the same instant twice" is
+      -- true of a device and false of a meal, so it now applies only to
+      -- device rows.
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_health_samples_instant
+        ON health_samples(sample_type, source_name, start_epoch, ROUND(value, 1))
+        WHERE meal_id IS NULL;
+      -- A meal contributes exactly one row per nutrient. This is the real key
+      -- for projected rows, and what makes delete-and-reinsert safe.
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_health_samples_meal
+        ON health_samples(meal_id, sample_type) WHERE meal_id IS NOT NULL;
+
+      CREATE INDEX IF NOT EXISTS idx_meals_local_day ON meals(local_day);
+      -- The confirmation queue is a recurring query; keep it off the full table.
+      CREATE INDEX IF NOT EXISTS idx_meals_pending
+        ON meals(local_day) WHERE status = 'unconfirmed';
+      CREATE INDEX IF NOT EXISTS idx_meal_extractions_meal ON meal_extractions(meal_id);
+      CREATE INDEX IF NOT EXISTS idx_meal_items_extraction ON meal_items(extraction_id);
+      CREATE INDEX IF NOT EXISTS idx_meal_media_meal ON meal_media(meal_id);
+    `,
+  },
 ];
 
 export function currentSchemaVersion(db: Database): number {
