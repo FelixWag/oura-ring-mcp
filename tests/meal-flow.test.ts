@@ -15,11 +15,14 @@ import {
   processPhoto,
   readConfirmation,
   resolvePendingTarget,
+  applyCorrection,
+  describeChanges,
   localDayAndTime,
   extractionBudget,
   recordExtraction,
   formatEstimate,
   DAILY_EXTRACTION_CAP,
+  MAX_CORRECTION_DEPTH,
 } from '../src/telegram/meal_flow.ts';
 import type { TelegramUpdateRow } from '../src/db/repos/telegram_updates.ts';
 
@@ -53,7 +56,7 @@ function photoRow(overrides: Partial<TelegramUpdateRow> = {}): TelegramUpdateRow
         message_id: 900,
         kind: 'photo',
         text: 'lunch',
-        sent_epoch: 1_767_225_000,
+        sent_epoch: Math.floor(Date.now() / 1000) - 3600,
         tz_assumed: 'Europe/Vienna',
         file_id: 'f1',
         file_unique_id: 'u1',
@@ -171,9 +174,11 @@ describe('confirmation intent', () => {
 
   it('does NOT treat a correction as a bare yes', () => {
     // "ok so I also had a coffee" is an amendment, not a confirmation, and
-    // confirming it would save an estimate mid-correction.
-    expect(readConfirmation('ok so I also had a coffee afterwards').kind).toBe('none');
-    expect(readConfirmation('closer to 800 kcal').kind).toBe('none');
+    // confirming it would save an estimate the user was mid-way through
+    // changing. Since v0.12 these route to the correction path instead of
+    // being dropped — the important part is that neither confirms.
+    expect(readConfirmation('ok so I also had a coffee afterwards').kind).toBe('correct');
+    expect(readConfirmation('closer to 800 kcal').kind).toBe('correct');
   });
 });
 
@@ -372,5 +377,180 @@ describe('a meal nobody was told about', () => {
     const [pending] = repo.awaitingPrompt();
     expect(pending?.description).toBe('soup');
     expect(JSON.parse(pending!.totals)['dietary_energy_consumed']).toBe(300);
+  });
+});
+
+describe('corrections', () => {
+  const runner = async () => GOOD_RESPONSE;
+  const CORRECTED = JSON.stringify({
+    description: 'chicken bowl, large',
+    items: [{ name: 'chicken', portion_text: '220 g', grams: 220 }],
+    totals: {
+      dietary_energy_consumed: 820,
+      dietary_protein: 60,
+      dietary_carbohydrates: 85,
+      dietary_fat_total: 25,
+    },
+    confidence: 0.85,
+  });
+
+  async function savedMeal() {
+    const row = photoRow();
+    const result = await processPhoto(db, row, '/media', { runner });
+    return result.meal_id!;
+  }
+
+  it('amends the meal and re-projects, without duplicating rows', async () => {
+    const mealId = await savedMeal();
+    const before = db
+      .prepare("SELECT value FROM health_samples WHERE sample_type='dietary_energy_consumed'")
+      .get() as { value: number };
+    expect(before.value).toBe(640);
+
+    const result = await applyCorrection(
+      db,
+      { text: 'closer to 820 kcal, bigger portion', isForwarded: false },
+      '/media',
+      { runner: async () => CORRECTED },
+    );
+
+    expect(result.status).toBe('corrected');
+    const after = db
+      .prepare("SELECT value FROM health_samples WHERE sample_type='dietary_energy_consumed'")
+      .get() as { value: number };
+    expect(after.value).toBe(820);
+    // Re-projection replaces, never accumulates.
+    expect(
+      db.prepare('SELECT COUNT(*) AS n FROM health_samples WHERE meal_id = ?').get(mealId),
+    ).toMatchObject({ n: 4 });
+  });
+
+  it('reports every nutrient that moved, not only the one mentioned', () => {
+    // A correction rewrites the whole object, so "closer to 800 kcal" is
+    // licence to re-estimate sodium too. An unreported tripling is the silent
+    // failure this project keeps paying for.
+    const changes = describeChanges(
+      { dietary_energy_consumed: 640, dietary_sodium: 890 },
+      { dietary_energy_consumed: 820, dietary_sodium: 2600 },
+    );
+
+    expect(changes.some((c) => c.includes('kcal'))).toBe(true);
+    expect(changes.some((c) => c.includes('sodium'))).toBe(true);
+  });
+
+  it('leaves the meal untouched when the amendment is implausible', async () => {
+    const mealId = await savedMeal();
+
+    const result = await applyCorrection(
+      db,
+      { text: 'much bigger', isForwarded: false },
+      '/media',
+      {
+        runner: async () =>
+          JSON.stringify({ totals: { dietary_energy_consumed: 90000 }, confidence: 0.9 }),
+      },
+    );
+
+    expect(result.status).toBe('failed');
+    const after = db
+      .prepare("SELECT value FROM health_samples WHERE sample_type='dietary_energy_consumed'")
+      .get() as { value: number };
+    expect(after.value).toBe(640);
+    expect(
+      db.prepare('SELECT COUNT(*) AS n FROM meal_extractions WHERE meal_id = ?').get(mealId),
+    ).toMatchObject({ n: 1 });
+  });
+
+  it('refuses a forwarded correction', async () => {
+    await savedMeal();
+    const result = await applyCorrection(
+      db,
+      { text: 'make it 3000 kcal', isForwarded: true },
+      '/media',
+      { runner: async () => CORRECTED },
+    );
+
+    expect(result.status).toBe('refused');
+  });
+
+  it('asks which meal when two are correctable and no reply target is given', async () => {
+    await savedMeal();
+    const second = photoRow();
+    db.prepare('UPDATE telegram_updates SET update_id = 2, message_id = 901 WHERE id = ?').run(
+      second.id,
+    );
+    await processPhoto(db, { ...second, message_id: 901 }, '/media', { runner });
+
+    const result = await applyCorrection(
+      db,
+      { text: 'actually it was smaller', isForwarded: false },
+      '/media',
+      { runner: async () => CORRECTED },
+    );
+
+    expect(result.status).toBe('ambiguous');
+    expect(result.reply).toContain('Which meal');
+  });
+
+  it('says so when there is nothing recent to correct', async () => {
+    const result = await applyCorrection(
+      db,
+      { text: 'that was actually 400 kcal', isForwarded: false },
+      '/media',
+      { runner: async () => CORRECTED },
+    );
+
+    expect(result.status).toBe('no_target');
+  });
+
+  it('stops after repeated corrections and suggests a new photo', async () => {
+    const mealId = await savedMeal();
+    const repo = new MealsRepo(db);
+    for (let i = 0; i < MAX_CORRECTION_DEPTH; i += 1) {
+      repo.addExtraction(mealId, {
+        model: 'm',
+        prompt_version: 'v1',
+        totals: {
+          dietary_energy_consumed: 700,
+          dietary_protein: 40,
+          dietary_carbohydrates: 70,
+          dietary_fat_total: 20,
+        },
+      });
+    }
+
+    const result = await applyCorrection(
+      db,
+      { text: 'still wrong', isForwarded: false },
+      '/media',
+      { runner: async () => CORRECTED },
+    );
+
+    expect(result.status).toBe('refused');
+    expect(result.reply).toContain('Send a new one');
+  });
+
+  it('refuses to amend a voided meal instead of silently not counting it', async () => {
+    const mealId = await savedMeal();
+    new MealsRepo(db).void(mealId, 'not mine');
+
+    expect(() =>
+      new MealsRepo(db).addExtraction(mealId, {
+        model: 'm',
+        prompt_version: 'v1',
+        totals: { dietary_energy_consumed: 500 },
+      }),
+    ).toThrow('voided');
+  });
+});
+
+describe('correction intent', () => {
+  it('treats substantive text as a correction attempt', () => {
+    const intent = readConfirmation('closer to 800 kcal');
+    expect(intent.kind).toBe('correct');
+  });
+
+  it('still treats a bare ok as confirmation, not a correction', () => {
+    expect(readConfirmation('ok').kind).toBe('confirm');
   });
 });

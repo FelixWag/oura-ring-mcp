@@ -16,7 +16,10 @@ import { query, type PermissionResult } from '@anthropic-ai/claude-agent-sdk';
 import {
   buildMealSystemPrompt,
   buildMealUserPrompt,
+  buildCorrectionSystemPrompt,
+  buildCorrectionUserPrompt,
   PROMPT_VERSION,
+  CORRECTION_PROMPT_VERSION,
   type MealPromptContext,
 } from './prompts.js';
 
@@ -129,6 +132,43 @@ export async function extractMeal(
       error: (err as Error).message,
       model,
       prompt_version: PROMPT_VERSION,
+    };
+  }
+}
+
+/**
+ * Amend an existing estimate. Same posture as extraction — one readable file,
+ * no write tools — with the previous object supplied so the model corrects
+ * rather than starts over.
+ */
+export async function correctMeal(
+  ctx: MealPromptContext & { previous: Record<string, unknown> },
+  options: { model?: string; runner?: QueryRunner } = {},
+): Promise<ExtractionResult> {
+  const model = options.model ?? DEFAULT_MODEL;
+  const systemPrompt = buildCorrectionSystemPrompt();
+  const userPrompt = buildCorrectionUserPrompt({
+    ...ctx,
+    previous: JSON.stringify(ctx.previous, null, 2),
+  });
+
+  try {
+    const runner = options.runner ?? defaultRunner;
+    const raw = await runner({ systemPrompt, userPrompt, photoPath: ctx.photoPath, model });
+    const meal = parseExtraction(raw);
+    return {
+      ok: true,
+      meal,
+      model,
+      prompt_version: CORRECTION_PROMPT_VERSION,
+      raw_response: raw,
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      error: (err as Error).message,
+      model,
+      prompt_version: CORRECTION_PROMPT_VERSION,
     };
   }
 }

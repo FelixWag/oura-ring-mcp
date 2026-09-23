@@ -921,3 +921,32 @@ The pattern worth keeping: each of these was found by running the thing on
 real photos, after two thorough reviews had read the design and approved it.
 Reviews catch what is wrong in an argument; only use catches what is missing
 from one.
+
+## v0.12: corrections, and a family of bug that keeps recurring
+
+Correcting a meal needed almost no new machinery: extractions were already
+append-only with supersession, re-projection already deleted by `meal_id`
+first, and plausibility bounds already ran before storage. The work was
+delivery, not storage — and delivery is where the review found everything.
+
+Three findings shared one shape, and it is the same shape as the stranded
+meal from v0.11: a multi-step operation where a fault between the steps leaves
+something that looks complete. `addExtraction()` committed the new extraction
+and then projected it separately, so a crash in between left the meal pointing
+at corrected totals while the database still held the old ones — and the user
+had been told the correction landed. `confirm()` had the same gap. Both now
+project inside the transaction, which works because `project()` is synchronous
+SQL and better-sqlite3 nests it as a savepoint.
+
+The third was handling corrections inline in the poll loop. Photos are drained
+outside it, with a comment explaining why; text was not, and a correction is a
+model call — slow, and frequently failing on a flaky connection. Inline, a
+failure had no retry path and a success blocked polling. The same lesson, one
+message type later, which is worth noticing: a rule learned about photos was
+not carried to text because nothing stated it as a rule.
+
+One judgement worth recording. A correction returns a complete object, so
+"closer to 800 kcal" lets the model re-estimate sodium at the same time. Rather
+than constrain the model, the reply reports every nutrient that moved by more
+than a threshold, read back from the rows actually written. Constraining output
+is a promise; reading back what was stored is a fact.
