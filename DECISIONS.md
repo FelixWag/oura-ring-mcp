@@ -950,3 +950,63 @@ One judgement worth recording. A correction returns a complete object, so
 than constrain the model, the reply reports every nutrient that moved by more
 than a threshold, read back from the rows actually written. Constraining output
 is a promise; reading back what was stored is a fact.
+
+## v0.12.1: canUseTool was never the whole boundary
+
+Both headless agents described their sandbox as a `canUseTool` allowlist: the
+voice agent may call the oura MCP tools, the meal extractor may read one photo.
+Probing the SDK (0.3.144) showed two ways around that callback, and both
+agents were exposed to each.
+
+First, when `settingSources` is omitted the session loads the user, project
+and local settings files, and their permission allow-rules are evaluated
+before `canUseTool`. An allow-rule written for interactive work runs a command
+the callback would deny. This was already known — the sibling agent project
+had made the same fix — and the voice agent was still waiting for it when the
+extractor was added without it. A rule that lives only in notes did not stop a
+new call site from repeating the omission; a test now does, and it counts any
+value import from the SDK as a call site, pinned to a known list.
+
+Second, and not known before: even with settings isolated, reads inside the
+session's working directory — `Read`, and read-only shell commands such as
+`cat` — are approved without `canUseTool` being consulted at all. Both agents
+ran with the repo root as their working directory, beside `.env`. So the
+boundary needs three parts, not one: no settings, an explicit list of built-in
+tools (anything not listed is removed from the model's view rather than
+refused), and a working directory with nothing in it. The directory is checked
+for emptiness on every call rather than at startup, because a file appearing
+there later would be readable without a check, and refusing to run is the
+failure that gets noticed.
+
+A security review of the first draft found three more ways out, all outside
+the working directory. The CLI approves reads in its own directories —
+session transcripts, auto-memory — without consulting `canUseTool` either, and
+auto-memory is writable and loaded into later sessions; sessions now write no
+transcript and run with auto-memory disabled, which also stops transcripts
+copying voice notes and photos out of the database into plaintext. Not quite
+nothing: a probe showed the CLI still spills a large tool result to a file in
+the same user-only directory. The follow-up that leaves every agent with no
+built-in tools removes the last way an agent could read one back. MCP servers now
+come only from `mcpServers` (`strictMcpConfig`): with settings loaded, the
+operator's account-level connectors had been visible to a model reading an
+untrusted caption. And the voice agent had passed `process.env` as its MCP
+server's `env`, which the SDK serialises onto the CLI's command line — every
+secret in `.env`, readable by any local user in a process listing. The server
+inherits the environment regardless, so the field is gone. All three were
+checked, not assumed: by listing the tools a session actually sees, and by
+capturing the CLI's arguments with a stand-in executable.
+
+The isolation options are spread last in every call, and typed as required,
+so a later `cwd:` or `settingSources:` cannot silently override them.
+
+Isolation had side effects worth recording. The operator's settings had also
+been choosing the model and the effort level, so the security fix would have
+silently changed both. They are now pinned in code at what the sessions had
+inherited, with one deliberate exception: the voice agent's model alias had
+been resolving to an older Opus, and it now names `claude-opus-5`, the same
+model the extractor already used. And both agents stopped loading the repo's
+`CLAUDE.md`, which they had picked up by running at the repo root — if
+extraction quality shifts, that is a place to look.
+
+The next step removes the extractor's last built-in tool by sending the photo
+inside the prompt as an image block, so the model has nothing to read at all.
