@@ -6,6 +6,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 For the architectural rationale behind each change, see [DECISIONS.md](DECISIONS.md).
 
+## [0.12.1] — 2026-09-24
+
+### Security
+
+- **Headless agent sessions are isolated.** The voice agent and the meal
+  extractor now pass `settingSources: []`, an explicit `tools` list and an
+  empty working directory. Before, both loaded the operator's settings — whose
+  allow-rules are evaluated before `canUseTool` — and ran with the repo root as
+  cwd, where reads are auto-approved without `canUseTool` being consulted, next
+  to `.env`. The voice agent has no built-in tools at all; the extractor keeps
+  only `Read`, narrowed to the one photo, which now lives outside the cwd.
+- **The agent cwd must be empty.** `ensureEmptyAgentCwd()` creates it `0700`
+  beside the database and refuses to start a session if anything is in it.
+- **A test fails if any `query()` call skips the isolation**, so a future
+  call site cannot repeat the omission the extractor made in v0.11.
+
+### Changed
+
+- **Model and effort are pinned, not inherited.** Isolation stops the
+  operator's `~/.claude/settings.json` from applying, which had been choosing
+  both. The voice agent now defaults to `claude-opus-5` (it had resolved the
+  `opus` alias to Opus 4.7); both agents pin effort at `medium`, which is what
+  they inherited. `OURA_VOICE_MODEL` still overrides the voice model.
+
 ## [0.12.0] — 2026-09-23
 
 ### Added

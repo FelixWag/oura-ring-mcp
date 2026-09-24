@@ -950,3 +950,39 @@ One judgement worth recording. A correction returns a complete object, so
 than constrain the model, the reply reports every nutrient that moved by more
 than a threshold, read back from the rows actually written. Constraining output
 is a promise; reading back what was stored is a fact.
+
+## v0.12.1: canUseTool was never the whole boundary
+
+Both headless agents described their sandbox as a `canUseTool` allowlist: the
+voice agent may call the oura MCP tools, the meal extractor may read one photo.
+Probing the SDK (0.3.144) showed two ways around that callback, and both
+agents were exposed to each.
+
+First, when `settingSources` is omitted the session loads the user, project
+and local settings files, and their permission allow-rules are evaluated
+before `canUseTool`. An allow-rule written for interactive work runs a command
+the callback would deny. This was already known and recorded as a decision,
+and the voice agent was still waiting for the fix when the extractor was added
+without it. A rule that lives only in a decisions log did not stop a new call
+site from repeating the omission; a test now does.
+
+Second, and not known before: even with settings isolated, reads inside the
+session's working directory — `Read`, and read-only shell commands such as
+`cat` — are approved without `canUseTool` being consulted at all. Both agents
+ran with the repo root as their working directory, beside `.env`. So the
+boundary needs three parts, not one: no settings, an explicit list of built-in
+tools (anything not listed is removed from the model's view rather than
+refused), and a working directory with nothing in it. The directory is checked
+for emptiness on every call rather than at startup, because a file appearing
+there later would be readable without a check, and refusing to run is the
+failure that gets noticed.
+
+Isolation had a side effect worth recording. The operator's settings had also
+been choosing the model and the effort level, so the security fix would have
+silently changed both. They are now pinned in code at what the sessions had
+inherited, with one deliberate exception: the voice agent's model alias had
+been resolving to an older Opus, and it now names `claude-opus-5`, the same
+model the extractor already used.
+
+The next step removes the extractor's last built-in tool by sending the photo
+inside the prompt as an image block, so the model has nothing to read at all.

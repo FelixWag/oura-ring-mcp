@@ -6,8 +6,10 @@
  *   - MCP transport: a child process running this project's MCP server
  *     (dist/index.js), giving the agent access to `oura_add_annotation`
  *     and the read-only `oura_get_*` tools.
- *   - canUseTool allowlist: deny everything except the MCP oura tools.
- *     No Bash, no Edit, no Read, no nothing.
+ *   - No built-in tools at all (`tools: []`), no filesystem settings, and an
+ *     empty cwd — see src/agent/sandbox.ts for why `canUseTool` alone is not
+ *     a boundary.
+ *   - canUseTool allowlist over what remains: the MCP oura tools only.
  *
  * Authentication: the SDK reads the user's Claude Code credentials from
  * `~/.claude/` — no ANTHROPIC_API_KEY required. Invocations count against
@@ -20,7 +22,18 @@
 
 import { query, type PermissionResult } from '@anthropic-ai/claude-agent-sdk';
 import type { Db } from '../db/index.js';
+import { isolatedSessionOptions } from '../agent/sandbox.js';
 import { buildSystemPrompt, type PromptContext } from './prompts.js';
+
+/**
+ * Pinned, not inherited. Before isolation the model came from the operator's
+ * `~/.claude/settings.json` ("opus", which the SDK's bundled CLI resolved to
+ * Opus 4.7) and so did the effort. A security fix that silently changed the
+ * model would be two changes; this makes the choice visible.
+ */
+export const DEFAULT_MODEL = 'claude-opus-5';
+/** What the session inherited before isolation, kept deliberately. */
+export const EFFORT = 'medium';
 
 export interface RunAgentInput {
   text: string;
@@ -28,7 +41,7 @@ export interface RunAgentInput {
   user_timezone: string;
   /** Absolute path to the compiled MCP entry (typically dist/index.js). */
   mcpEntryPath: string;
-  /** Optional model override. Defaults to Claude Code's current default. */
+  /** Optional model override (OURA_VOICE_MODEL). Defaults to DEFAULT_MODEL. */
   model?: string;
 }
 
@@ -99,6 +112,12 @@ export async function runExtractionAgent(_db: Db, input: RunAgentInput): Promise
     const iterator = query({
       prompt: input.text,
       options: {
+        ...isolatedSessionOptions(),
+        // No built-ins: the job needs only the MCP tools below, which `tools`
+        // does not affect.
+        tools: [],
+        model: input.model ?? DEFAULT_MODEL,
+        effort: EFFORT,
         systemPrompt: { type: 'preset', preset: 'claude_code', append: systemPrompt },
         // Spawn this project's MCP server so we get oura_* tools.
         mcpServers: {
@@ -110,9 +129,8 @@ export async function runExtractionAgent(_db: Db, input: RunAgentInput): Promise
           },
         },
         // Hard-deny everything except the MCP oura tools (read + write
-        // to annotations). No Bash, no Read, no Edit, no Web, nothing.
+        // to annotations).
         canUseTool,
-        ...(input.model ? { model: input.model } : {}),
       },
     });
 

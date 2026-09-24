@@ -349,7 +349,7 @@ Read preference for local-first tools:
 | `OURA_VOICE_PORT`      | `8770`                                | Port the voice server listens on.                                                   |
 | `OURA_VOICE_LOG_PATH`  | `<repo>/logs/voice.log`               | Append-only activity log for voice ingestion.                                       |
 | `OURA_MCP_ENTRY_PATH`  | `<repo>/dist/index.js`                | MCP server entry the voice agent spawns.                                            |
-| `OURA_VOICE_MODEL`     | unset (SDK default)                   | Optional model override for the voice agent.                                        |
+| `OURA_VOICE_MODEL`     | `claude-opus-5`                       | Optional model override for the voice agent.                                        |
 | `HEALTH_IMPORT_TOKEN`  | -                                     | Required for `npm run health-server`. Bearer token the Apple Health Shortcut sends. |
 | `OURA_HEALTH_PORT`     | `8771`                                | Port the health server listens on.                                                  |
 | `OURA_HEALTH_LOG_PATH` | `<repo>/logs/health.log`              | Append-only activity log for health imports.                                        |

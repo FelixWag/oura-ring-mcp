@@ -13,6 +13,7 @@
  */
 
 import { query, type PermissionResult } from '@anthropic-ai/claude-agent-sdk';
+import { isolatedSessionOptions } from '../agent/sandbox.js';
 import {
   buildMealSystemPrompt,
   buildMealUserPrompt,
@@ -57,6 +58,12 @@ export type QueryRunner = (args: {
 }) => Promise<string>;
 
 export const DEFAULT_MODEL = 'claude-opus-5';
+/**
+ * Pinned at what the session inherited from the operator's settings before
+ * isolation. Unpinned, an isolated session sends no effort at all and the
+ * model's default applies — a cost and latency change nobody chose.
+ */
+export const EFFORT = 'medium';
 
 /**
  * Parse the model's reply.
@@ -175,8 +182,10 @@ export async function correctMeal(
 
 /** The real agent call. Isolated so tests can replace it wholesale. */
 const defaultRunner: QueryRunner = async ({ systemPrompt, userPrompt, photoPath, model }) => {
-  // Read, and only for this one file. Everything else — Bash, Edit, Write,
-  // Web, every MCP tool — is denied. A hijacked agent has nothing to reach.
+  // Read, and only for this one file. `tools` removes every other built-in
+  // from the session; `canUseTool` narrows Read to the photo. That check only
+  // holds because the cwd is empty and the photo lives outside it: reads
+  // inside the cwd would be approved without consulting it.
   const canUseTool = async (
     toolName: string,
     input: Record<string, unknown>,
@@ -193,6 +202,9 @@ const defaultRunner: QueryRunner = async ({ systemPrompt, userPrompt, photoPath,
   const iterator = query({
     prompt: userPrompt,
     options: {
+      ...isolatedSessionOptions(),
+      tools: ['Read'],
+      effort: EFFORT,
       systemPrompt: { type: 'preset', preset: 'claude_code', append: systemPrompt },
       canUseTool,
       ...(model ? { model } : {}),
