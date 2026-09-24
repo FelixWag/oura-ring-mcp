@@ -13,7 +13,7 @@
  */
 
 import { query, type PermissionResult } from '@anthropic-ai/claude-agent-sdk';
-import { isolatedSessionOptions } from '../agent/sandbox.js';
+import { isolatedSessionOptions } from '../agent/session.js';
 import {
   buildMealSystemPrompt,
   buildMealUserPrompt,
@@ -53,16 +53,17 @@ export interface ExtractionResult {
 export type QueryRunner = (args: {
   systemPrompt: string;
   userPrompt: string;
+  /** Empty for a text-only correction of a meal with no stored photo. */
   photoPath: string;
-  model?: string;
+  model: string;
 }) => Promise<string>;
 
-export const DEFAULT_MODEL = 'claude-opus-5';
 /**
- * Pinned at what the session inherited from the operator's settings before
- * isolation. Unpinned, an isolated session sends no effort at all and the
- * model's default applies — a cost and latency change nobody chose.
+ * Pinned: sessions load no settings (src/agent/session.ts), so anything left
+ * unset falls to the SDK's bundled default, which moves on `npm update`.
+ * `medium` is what these sessions ran at before v0.12.1.
  */
+export const DEFAULT_MODEL = 'claude-opus-5';
 export const EFFORT = 'medium';
 
 /**
@@ -202,12 +203,14 @@ const defaultRunner: QueryRunner = async ({ systemPrompt, userPrompt, photoPath,
   const iterator = query({
     prompt: userPrompt,
     options: {
-      ...isolatedSessionOptions(),
-      tools: ['Read'],
+      // No photo (a text-only correction): nothing to read, so no Read tool.
+      tools: photoPath ? ['Read'] : [],
+      model,
       effort: EFFORT,
       systemPrompt: { type: 'preset', preset: 'claude_code', append: systemPrompt },
       canUseTool,
-      ...(model ? { model } : {}),
+      // Last: nothing above may override isolation.
+      ...isolatedSessionOptions(),
     },
   });
 

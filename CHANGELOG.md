@@ -16,11 +16,24 @@ For the architectural rationale behind each change, see [DECISIONS.md](DECISIONS
   allow-rules are evaluated before `canUseTool` — and ran with the repo root as
   cwd, where reads are auto-approved without `canUseTool` being consulted, next
   to `.env`. The voice agent has no built-in tools at all; the extractor keeps
-  only `Read`, narrowed to the one photo, which now lives outside the cwd.
-- **The agent cwd must be empty.** `ensureEmptyAgentCwd()` creates it `0700`
+  only `Read`, narrowed to the one photo, which lies outside the new cwd (and
+  gets no `Read` when a text-only correction has no photo).
+- **The agent cwd must be empty.** `requireEmptyAgentCwd()` creates it `0700`
   beside the database and refuses to start a session if anything is in it.
-- **A test fails if any `query()` call skips the isolation**, so a future
-  call site cannot repeat the omission the extractor made in v0.11.
+- **Only the MCP servers passed in, no transcript, no auto-memory.**
+  `strictMcpConfig`, `persistSession: false` and
+  `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`. The CLI also approves reads in its own
+  directories (transcripts, auto-memory) without a check, and a transcript
+  copies voice notes and photos out of the database into plaintext. Large tool
+  results are still spilled to files in that user-only directory.
+- **No secrets on the command line.** The voice agent passed `process.env` —
+  every value from `.env` — as its MCP server's `env`, which the SDK serialises
+  onto the CLI's argv, readable by any local user. The server inherits the
+  environment anyway and loads `.env` itself.
+- **A test fails if any SDK caller skips the isolation** or leaves model and
+  effort unpinned, so a future call site cannot repeat the omission the
+  extractor made in v0.11. Isolation is spread last, so no option above it can
+  override it.
 
 ### Changed
 
@@ -29,6 +42,8 @@ For the architectural rationale behind each change, see [DECISIONS.md](DECISIONS
   both. The voice agent now defaults to `claude-opus-5` (it had resolved the
   `opus` alias to Opus 4.7); both agents pin effort at `medium`, which is what
   they inherited. `OURA_VOICE_MODEL` still overrides the voice model.
+- **The agents no longer load the repo's `CLAUDE.md`**, which they did while
+  running at the repo root. Worth knowing if extraction quality shifts.
 
 ## [0.12.0] — 2026-09-23
 

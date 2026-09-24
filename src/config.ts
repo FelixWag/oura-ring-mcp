@@ -143,7 +143,7 @@ export function defaultTelegramMediaDir(): string {
 /**
  * Working directory for headless agent sessions: an empty directory beside
  * the database in use. Never the repo root — reads inside a session's cwd skip
- * the tool allowlist, and the repo root holds `.env`. See src/agent/sandbox.ts.
+ * the tool allowlist, and the repo root holds `.env`. See src/agent/session.ts.
  */
 export function defaultAgentCwd(): string {
   const dbPath = process.env.OURA_DB_PATH?.trim() || defaultDbPath();

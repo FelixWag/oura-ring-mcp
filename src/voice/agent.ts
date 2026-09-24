@@ -7,7 +7,7 @@
  *     (dist/index.js), giving the agent access to `oura_add_annotation`
  *     and the read-only `oura_get_*` tools.
  *   - No built-in tools at all (`tools: []`), no filesystem settings, and an
- *     empty cwd — see src/agent/sandbox.ts for why `canUseTool` alone is not
+ *     empty cwd — see src/agent/session.ts for why `canUseTool` alone is not
  *     a boundary.
  *   - canUseTool allowlist over what remains: the MCP oura tools only.
  *
@@ -22,17 +22,15 @@
 
 import { query, type PermissionResult } from '@anthropic-ai/claude-agent-sdk';
 import type { Db } from '../db/index.js';
-import { isolatedSessionOptions } from '../agent/sandbox.js';
+import { isolatedSessionOptions } from '../agent/session.js';
 import { buildSystemPrompt, type PromptContext } from './prompts.js';
 
 /**
- * Pinned, not inherited. Before isolation the model came from the operator's
- * `~/.claude/settings.json` ("opus", which the SDK's bundled CLI resolved to
- * Opus 4.7) and so did the effort. A security fix that silently changed the
- * model would be two changes; this makes the choice visible.
+ * Pinned: sessions load no settings (src/agent/session.ts), so anything left
+ * unset falls to the SDK's bundled default, which moves on `npm update`.
+ * `medium` is what these sessions ran at before v0.12.1.
  */
 export const DEFAULT_MODEL = 'claude-opus-5';
-/** What the session inherited before isolation, kept deliberately. */
 export const EFFORT = 'medium';
 
 export interface RunAgentInput {
@@ -112,25 +110,29 @@ export async function runExtractionAgent(_db: Db, input: RunAgentInput): Promise
     const iterator = query({
       prompt: input.text,
       options: {
-        ...isolatedSessionOptions(),
         // No built-ins: the job needs only the MCP tools below, which `tools`
         // does not affect.
         tools: [],
         model: input.model ?? DEFAULT_MODEL,
         effort: EFFORT,
         systemPrompt: { type: 'preset', preset: 'claude_code', append: systemPrompt },
-        // Spawn this project's MCP server so we get oura_* tools.
+        // Spawn this project's MCP server so we get oura_* tools. No `env`:
+        // the SDK serialises this config onto the CLI's command line, where any
+        // local user can read it, and `process.env` holds every secret from
+        // `.env`. The child inherits the CLI's environment anyway, and the
+        // server resolves `.env` relative to its own binary.
         mcpServers: {
           oura: {
             type: 'stdio',
             command: 'node',
             args: [input.mcpEntryPath],
-            env: { ...process.env } as Record<string, string>,
           },
         },
         // Hard-deny everything except the MCP oura tools (read + write
         // to annotations).
         canUseTool,
+        // Last: nothing above may override isolation.
+        ...isolatedSessionOptions(),
       },
     });
 

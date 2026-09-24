@@ -1,10 +1,11 @@
 /**
- * Every headless agent session is isolated: no filesystem settings, an empty
+ * Every headless agent session is isolated: no filesystem settings, only the
+ * MCP servers it is given, no persisted transcript or auto-memory, an empty
  * cwd, an explicit list of built-in tools, and a pinned model and effort.
  *
- * The SDK is mocked, so no test calls a model. What these options defend
- * against was probed by hand against the real SDK — see src/agent/sandbox.ts.
- * Synthetic fixtures only.
+ * The SDK is mocked, so no test calls a model — and so no test here can notice
+ * the SDK changing what these options mean. That was probed by hand; see
+ * src/agent/session.ts. Synthetic fixtures only.
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -24,6 +25,8 @@ import { fileURLToPath } from 'node:url';
 
 const { captured } = vi.hoisted(() => ({ captured: [] as Record<string, unknown>[] }));
 
+// One canned reply for every session. It is a meal estimate so the extractor
+// can parse it; the voice agent ignores the text.
 vi.mock('@anthropic-ai/claude-agent-sdk', () => ({
   query: ({ options }: { options: Record<string, unknown> }) => {
     captured.push(options);
@@ -45,10 +48,10 @@ vi.mock('@anthropic-ai/claude-agent-sdk', () => ({
 }));
 
 import type { Db } from '../src/db/index.js';
-import { ensureEmptyAgentCwd } from '../src/agent/sandbox.js';
+import { requireEmptyAgentCwd } from '../src/agent/session.js';
 import { defaultAgentCwd } from '../src/config.js';
 import { runExtractionAgent } from '../src/voice/agent.js';
-import { extractMeal } from '../src/telegram/extractor.js';
+import { correctMeal, extractMeal } from '../src/telegram/extractor.js';
 
 type CanUseTool = (name: string, input: Record<string, unknown>) => Promise<{ behavior: string }>;
 
@@ -92,10 +95,19 @@ const mealContext = () => ({
   timezone: 'UTC',
 });
 
-describe('ensureEmptyAgentCwd', () => {
+/** What isolatedSessionOptions() must have contributed, whoever the caller. */
+function expectIsolated(options: Record<string, unknown>): void {
+  expect(options.settingSources).toEqual([]);
+  expect(options.strictMcpConfig).toBe(true);
+  expect(options.persistSession).toBe(false);
+  expect((options.env as Record<string, string>).CLAUDE_CODE_DISABLE_AUTO_MEMORY).toBe('1');
+  expect(options.cwd).toBe(defaultAgentCwd());
+}
+
+describe('requireEmptyAgentCwd', () => {
   it('creates the directory 0700 when it is absent', () => {
     const dir = join(tmp, 'agent-cwd');
-    expect(ensureEmptyAgentCwd(dir)).toBe(dir);
+    expect(requireEmptyAgentCwd(dir)).toBe(dir);
     expect(statSync(dir).mode & 0o777).toBe(0o700);
   });
 
@@ -103,7 +115,7 @@ describe('ensureEmptyAgentCwd', () => {
     const dir = join(tmp, 'agent-cwd');
     mkdirSync(dir);
     chmodSync(dir, 0o755);
-    ensureEmptyAgentCwd(dir);
+    requireEmptyAgentCwd(dir);
     expect(statSync(dir).mode & 0o777).toBe(0o700);
   });
 
@@ -111,30 +123,44 @@ describe('ensureEmptyAgentCwd', () => {
     const dir = join(tmp, 'agent-cwd');
     mkdirSync(dir);
     writeFileSync(join(dir, '.env'), 'SECRET=synthetic');
-    expect(() => ensureEmptyAgentCwd(dir)).toThrow(/not empty/);
+    expect(() => requireEmptyAgentCwd(dir)).toThrow(/not empty/);
   });
 
   it('ignores the .DS_Store Finder leaves behind', () => {
     const dir = join(tmp, 'agent-cwd');
     mkdirSync(dir);
     writeFileSync(join(dir, '.DS_Store'), '');
-    expect(() => ensureEmptyAgentCwd(dir)).not.toThrow();
+    expect(() => requireEmptyAgentCwd(dir)).not.toThrow();
+  });
+
+  it('lives outside the repo, so the repo .env is not inside the auto-approved cwd', () => {
+    // Uses the real default resolution, not the test's temporary one.
+    delete process.env.OURA_DB_PATH;
+    expect(relative(REPO_ROOT, defaultAgentCwd()).startsWith('..')).toBe(true);
   });
 });
 
 describe('voice agent session', () => {
-  it('loads no settings, has no built-in tools, and runs in the empty agent cwd', async () => {
+  it('is isolated and has no built-in tools', async () => {
     const result = await runExtractionAgent(null as unknown as Db, voiceInput);
     expect(result.ok).toBe(true);
 
     const options = lastOptions();
-    expect(options.settingSources).toEqual([]);
+    expectIsolated(options);
     expect(options.tools).toEqual([]);
-    expect(options.cwd).toBe(defaultAgentCwd());
     expect(readdirSync(options.cwd as string)).toEqual([]);
   });
 
-  it('pins Opus 5 at medium effort rather than inheriting the operator settings', async () => {
+  it('passes no env to its MCP server, since that config lands on the command line', async () => {
+    await runExtractionAgent(null as unknown as Db, voiceInput);
+    const servers = lastOptions().mcpServers as Record<string, Record<string, unknown>>;
+    expect(servers.oura).toBeDefined();
+    expect(servers.oura.env).toBeUndefined();
+  });
+
+  // Literal on purpose: changing the model or effort should be a decision
+  // someone makes here too, not a side effect of editing a constant.
+  it('pins Opus 5 at medium effort rather than inheriting operator settings', async () => {
     await runExtractionAgent(null as unknown as Db, voiceInput);
     expect(lastOptions().model).toBe('claude-opus-5');
     expect(lastOptions().effort).toBe('medium');
@@ -157,22 +183,20 @@ describe('voice agent session', () => {
 });
 
 describe('meal extractor session', () => {
-  it('loads no settings, keeps only Read, and runs in the empty agent cwd', async () => {
+  it('is isolated and keeps only Read', async () => {
     const result = await extractMeal(mealContext());
     expect(result.ok).toBe(true);
 
     const options = lastOptions();
-    expect(options.settingSources).toEqual([]);
+    expectIsolated(options);
     expect(options.tools).toEqual(['Read']);
-    expect(options.cwd).toBe(defaultAgentCwd());
     expect(options.model).toBe('claude-opus-5');
     expect(options.effort).toBe('medium');
   });
 
-  it('runs outside the repo, so the repo .env is not inside the auto-approved cwd', async () => {
-    await extractMeal(mealContext());
-    const cwd = lastOptions().cwd as string;
-    expect(relative(REPO_ROOT, cwd).startsWith('..')).toBe(true);
+  it('gets no Read tool for a text-only correction with no stored photo', async () => {
+    await correctMeal({ ...mealContext(), photoPath: '', previous: {} });
+    expect(lastOptions().tools).toEqual([]);
   });
 
   it('allows Read of the named photo and nothing else', async () => {
@@ -197,22 +221,44 @@ describe('every SDK call site', () => {
     });
   }
 
+  // Any value import counts, not just `query`: an alias (`query as run`) or a
+  // namespace import would otherwise slip past the counts below unexamined.
+  const importsSdkValue = /^import\s+(?!type\b)[^;]*from\s*'@anthropic-ai\/claude-agent-sdk'/m;
+  const callers = () =>
+    tsFiles(SRC)
+      .filter((file) => importsSdkValue.test(readFileSync(file, 'utf8')))
+      .map((file) => relative(SRC, file))
+      .sort();
+
   // The v0.11 extractor was a second call site that repeated the omission the
   // voice agent already had. A rule written down elsewhere did not stop it;
-  // this does.
-  it('spreads isolatedSessionOptions() and names its tools in every query() call', () => {
-    const importsQuery =
-      /import\s*\{[^}]*\bquery\b[^}]*\}\s*from\s*'@anthropic-ai\/claude-agent-sdk'/;
-    const callers = tsFiles(SRC).filter((file) => importsQuery.test(readFileSync(file, 'utf8')));
-    expect(callers.length).toBeGreaterThan(0);
+  // this does. A new caller must be added here on purpose, and then pass the
+  // checks below.
+  it('is one of the known callers', () => {
+    expect(callers()).toEqual(['telegram/extractor.ts', 'voice/agent.ts']);
+  });
 
-    for (const file of callers) {
-      const source = readFileSync(file, 'utf8');
-      const calls = source.match(/\bquery\(\{/g)?.length ?? 0;
-      const isolated = source.match(/\.\.\.isolatedSessionOptions\(\)/g)?.length ?? 0;
-      const toolLists = source.match(/^\s*tools: \[/gm)?.length ?? 0;
-      const name = relative(SRC, file);
-      expect({ name, isolated, toolLists }).toEqual({ name, isolated: calls, toolLists: calls });
+  it('isolates last, lists tools, and pins model and effort in every query() call', () => {
+    for (const name of callers()) {
+      const source = readFileSync(join(SRC, name), 'utf8');
+      // The text of each `query({ ... })` call, so a `model` elsewhere in the
+      // file cannot stand in for one missing from the call.
+      const calls = [...source.matchAll(/\bquery\(\{([\s\S]*?)\n\s*\}\);/g)].map((m) => m[1] ?? '');
+      expect(
+        calls.length,
+        `${name}: every query( call is a query({ ... }); call (prose "query()" excluded)`,
+      ).toBe(source.match(/\bquery\((?!\))/g)?.length);
+
+      for (const call of calls) {
+        // `name` is on both sides so a failure says which file.
+        expect({
+          name,
+          isolatedLast: /\.\.\.isolatedSessionOptions\(\),\s*\},?\s*$/.test(call),
+          tools: /^\s*tools: /m.test(call),
+          model: /^\s*model[,:]/m.test(call),
+          effort: /^\s*effort: /m.test(call),
+        }).toEqual({ name, isolatedLast: true, tools: true, model: true, effort: true });
+      }
     }
   });
 });
