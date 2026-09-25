@@ -1073,10 +1073,12 @@ in the chat.
 `no` had the mirror-image problem. It looked only at meals waiting for
 confirmation, and since v0.11 saves meals on arrival there are none, so the
 one undo every estimate advertises answered "nothing waiting" and changed
-nothing. It now voids the saved meal it replies to. It is deliberately stricter
-than a correction about guessing: a reply to something that is not a meal never
-falls back to "the only recent meal", because a wrong removal is worse than
-asking again.
+nothing. It now voids the saved meal it replies to, and only as a reply. The
+first draft also removed "the only recent meal" on a bare "no"; review caught
+that a bare "no" is as likely to answer the bot's last message ("that doesn't
+seem to be about …") as to mean "delete", and that chat cannot undo a removal.
+Stricter than a correction about guessing which meal, because it removes
+something: a wrong removal is worse than asking again.
 
 Deferred: keeping a failed correction's raw model answer somewhere durable. It
 is returned now, but it has no home. It doesn't belong in `meal_extractions`

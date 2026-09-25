@@ -21,14 +21,15 @@ For the architectural rationale behind each change, see [DECISIONS.md](DECISIONS
   photo used to leave the model two bad options: invent the food in order to
   subtract it, or change nothing and hide the objection in `notes`. It can now
   answer `{"mismatch": true, "reason": …}`, which writes nothing and says so.
-  Verified on real meals before release: the wrong meal answered "mismatch"
-  in 2 of 2 runs, the right one was amended in 2 of 2.
+  Verified on real meals before release, across two checks: the wrong meal
+  answered "mismatch" in 5 of 5 runs, the right one was amended in 4 of 4.
 - **`no` removes a saved meal.** It only looked at meals waiting for
   confirmation, of which there have been none since meals started saving on
   arrival, so it answered "There's nothing waiting to be confirmed." and the
-  meal kept counting. It now voids the meal whose estimate or photo it replies
-  to. A reply to a message that is not a meal never falls back to "the only
-  recent one", because removing is destructive.
+  meal kept counting. It now voids the meal whose estimate or photo it
+  **replies to**, and only then: chat cannot undo a removal, and a bare "no" is
+  as likely to mean "you're wrong" to the bot's last message. A second "no"
+  says the meal was already removed; every removal is logged with its meal.
 - **Every reply names its meal**, from the stored description and time:
   `"Chicken bowl" (Mon 5 Jan, 12:30)`. Failures are plain words ("I couldn't
   apply that to …, so nothing changed"), with the technical reason in the log

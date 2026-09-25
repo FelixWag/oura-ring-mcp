@@ -36,7 +36,7 @@ import {
   applyCorrection,
   formatEstimate,
   mealLabel,
-  CORRECTION_WINDOW_HOURS,
+  rejectMeal,
   type PendingMeal,
 } from './meal_flow.js';
 
@@ -332,20 +332,14 @@ function pendingMeals(db: Db): PendingMeal[] {
 }
 
 /**
- * Apply a confirmation or rejection, and say what happened.
+ * "ok": confirm a meal still waiting for it, and say what happened.
  *
- * Ambiguity is reported rather than guessed: two photos followed by one "ok"
- * is the common case, and confirming the wrong meal is worse than asking.
+ * Meals are saved on arrival, so usually nothing waits; a meal is left
+ * unconfirmed only when its estimate failed the plausibility bounds. With two
+ * waiting, a bare "ok" asks which rather than confirming the wrong one.
  */
-export function applyConfirmation(
-  db: Db,
-  kind: 'confirm' | 'reject',
-  replyToMessageId: number | undefined,
-): string {
-  if (kind === 'reject') return rejectMeal(db, replyToMessageId);
-
+export function confirmPending(db: Db, replyToMessageId: number | undefined): string {
   const pending = pendingMeals(db);
-  // Meals are saved on arrival, so an "ok" usually has nothing left to do.
   if (pending.length === 0) return 'Already saved — meals count as soon as they arrive.';
 
   const { target, ambiguous } = resolvePendingTarget(pending, replyToMessageId);
@@ -354,56 +348,15 @@ export function applyConfirmation(
     return `I have ${pending.length} meals waiting (${names}). Reply to the one you mean.`;
   }
 
-  new MealsRepo(db).confirm(target.meal_id, 'telegram');
-  return `Saved: ${target.description ?? 'meal'}.`;
+  const repo = new MealsRepo(db);
+  repo.confirm(target.meal_id, 'telegram');
+  const meal = repo.get(target.meal_id);
+  return `Saved ${meal ? mealLabel(target.description, meal) : `"${target.description ?? 'meal'}"`}.`;
 }
 
-/**
- * "no": remove a saved meal from the totals, keeping its record.
- *
- * Reads saved meals, not unconfirmed ones. It used to share the "waiting for
- * confirmation" list, which has been empty since meals started saving on
- * arrival — so the undo every estimate advertises answered "nothing waiting"
- * and the meal kept counting.
- *
- * Stricter than a correction about what it will guess, because it removes
- * something: a reply to a message that is not one of the meals never falls
- * back to "the only recent meal".
- */
-function rejectMeal(db: Db, replyToMessageId: number | undefined): string {
-  const repo = new MealsRepo(db);
-  const candidates: PendingMeal[] = repo.correctableMeals(CORRECTION_WINDOW_HOURS);
-  if (candidates.length === 0) {
-    return `I don't have a meal from the last ${CORRECTION_WINDOW_HOURS}h to remove.`;
-  }
-
-  const replied =
-    replyToMessageId === undefined
-      ? undefined
-      : candidates.find(
-          (c) => c.prompt_message_id === replyToMessageId || c.source_id === replyToMessageId,
-        );
-  if (replyToMessageId !== undefined && !replied) {
-    return (
-      `That message isn't one of your meals from the last ${CORRECTION_WINDOW_HOURS}h, so ` +
-      `nothing was removed. Reply "no" to the meal's "Saved:" message.`
-    );
-  }
-
-  const target = replied ?? (candidates.length === 1 ? candidates[0] : undefined);
-  if (!target) {
-    return (
-      `You have ${candidates.length} meals from the last ${CORRECTION_WINDOW_HOURS}h, so ` +
-      `nothing was removed. Reply "no" to the "Saved:" message of the one to remove.`
-    );
-  }
-
-  const meal = repo.get(target.meal_id);
-  repo.void(target.meal_id, 'rejected in chat');
-  const label = meal
-    ? mealLabel(target.description, meal.local_day, meal.local_time)
-    : `"${target.description ?? 'meal'}"`;
-  return `Removed ${label}. It no longer counts towards anything; the record is kept.`;
+/** A log line, with the log-only technical reason when there is one. */
+function withDetail(line: string, detail: string | undefined): string {
+  return detail ? `${line} (${detail})` : line;
 }
 
 /**
@@ -445,7 +398,7 @@ async function drainPhotos(
         new Date().toISOString(),
         id,
       );
-      await log(`photo ${id}: ${result.status}${result.detail ? ` (${result.detail})` : ''}`);
+      await log(withDetail(`photo ${id}: ${result.status}`, result.detail));
 
       const promptId = await client.sendMessage(config.allowedChatId, result.reply);
       // Remember which message asked, so the reply can be matched to this
@@ -490,8 +443,17 @@ async function drainText(
 
     let reply: string;
     try {
-      if (intent.kind === 'confirm' || intent.kind === 'reject') {
-        reply = applyConfirmation(db, intent.kind, intent.replyToMessageId);
+      if (intent.kind === 'confirm') {
+        reply = confirmPending(db, intent.replyToMessageId);
+      } else if (intent.kind === 'reject') {
+        // Logged, with the meal: a removal cannot be undone from chat, so the
+        // log is what links a voided meal to the message that asked for it.
+        const result = rejectMeal(db, intent.replyToMessageId);
+        await log(
+          `text ${row.id}: no ${result.status}` +
+            (result.meal_id !== undefined ? ` (meal ${result.meal_id})` : ''),
+        );
+        reply = result.reply;
       } else if (intent.kind === 'correct') {
         const result = await applyCorrection(
           db,
@@ -504,9 +466,7 @@ async function drainText(
           },
           config.mediaDir,
         );
-        await log(
-          `text ${row.id}: correction ${result.status}${result.detail ? ` (${result.detail})` : ''}`,
-        );
+        await log(withDetail(`text ${row.id}: correction ${result.status}`, result.detail));
         reply = result.reply;
       } else {
         reply = 'Got it — noted.';

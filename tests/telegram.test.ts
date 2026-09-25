@@ -14,10 +14,15 @@ import {
   isAllowed,
   processBatch,
   replyTargetOf,
-  applyConfirmation,
+  confirmPending,
   type ClassifiedMessage,
 } from '../src/telegram/server.ts';
-import { applyCorrection, processPhoto, readConfirmation } from '../src/telegram/meal_flow.ts';
+import {
+  applyCorrection,
+  processPhoto,
+  readConfirmation,
+  rejectMeal,
+} from '../src/telegram/meal_flow.ts';
 import { normalizeExtension } from '../src/telegram/media.ts';
 import type { TelegramConfig } from '../src/config.ts';
 import type { TelegramMessage, TelegramUpdate } from '../src/telegram/client.ts';
@@ -564,36 +569,51 @@ describe('replies', () => {
       const intent = readConfirmation(stored.text, replyTargetOf(stored.raw));
       expect(intent.kind).toBe('reject');
 
-      const reply = applyConfirmation(db, 'reject', replyTargetOf(stored.raw));
+      const result = rejectMeal(db, replyTargetOf(stored.raw));
 
-      expect(reply).toContain('Removed "bread with spread"');
+      expect(result.status).toBe('removed');
+      expect(result.meal_id).toBe(second);
+      expect(result.reply).toContain('Removed "bread with spread"');
       expect(status(second)).toBe('voided');
       expect(samples(second)).toBe(0);
       expect(status(first)).toBe('confirmed');
       expect(samples(first)).toBeGreaterThan(0);
     });
 
-    it('removes nothing when a bare "no" could mean either of two meals', async () => {
+    // Found in security review: a bare "no" — often meant as "you're wrong" to
+    // whatever the bot said last — removed the only recent meal, and chat
+    // cannot undo a removal.
+    it('never removes on a bare "no", even with a single recent meal', async () => {
       const { first, second } = await albumOfTwoMeals();
-      const reply = applyConfirmation(db, 'reject', undefined);
-      expect(reply).toContain('nothing was removed');
-      expect([status(first), status(second)]).toEqual(['confirmed', 'confirmed']);
+      new MealsRepo(db).void(first, 'test setup: leave one meal');
+
+      const result = rejectMeal(db, undefined);
+      expect(result.status).toBe('needs_reply');
+      expect(result.reply).toContain('Nothing was removed');
+      expect(status(second)).toBe('confirmed');
     });
 
-    // Removing is destructive, so a reply to something that is not a meal must
-    // not fall back to "the only recent one".
     it('removes nothing when it replies to a message that is not a meal', async () => {
       const { first, second } = await albumOfTwoMeals();
       new MealsRepo(db).void(first, 'test setup: leave one meal');
 
-      const reply = applyConfirmation(db, 'reject', 999);
-      expect(reply).toContain('nothing was removed');
+      const result = rejectMeal(db, 999);
+      expect(result.status).toBe('not_a_meal');
       expect(status(second)).toBe('confirmed');
+    });
+
+    it('says a meal was already removed when "no" is sent to it twice', async () => {
+      const { second } = await albumOfTwoMeals();
+      rejectMeal(db, 903);
+
+      const again = rejectMeal(db, 903);
+      expect(again.status).toBe('already_removed');
+      expect(again.meal_id).toBe(second);
     });
 
     it('says an "ok" has nothing to do, rather than "nothing waiting"', async () => {
       await albumOfTwoMeals();
-      expect(applyConfirmation(db, 'confirm', 903)).toContain('Already saved');
+      expect(confirmPending(db, 903)).toContain('Already saved');
     });
   });
 

@@ -120,8 +120,8 @@ hint about what the food is.`;
  * exit, a reply to the wrong photo (swap a spread, on a meal with no spread)
  * had two outcomes, both bad: the model invented the spread in order to
  * subtract it, or it changed nothing and hid the objection in "notes". Probed on
- * the real meals before shipping: the wrong meal answered "mismatch" three
- * times out of three, the right one was amended correctly twice out of two.
+ * real meals before shipping, across two checks: the wrong meal answered
+ * "mismatch" 5 times out of 5, the right one was amended correctly 4 out of 4.
  */
 export function buildCorrectionSystemPrompt(): string {
   return `You are amending an existing nutrition estimate for a meal.
@@ -169,6 +169,8 @@ export interface CorrectionPromptContext extends MealPromptContext {
 export function buildCorrectionUserPrompt(ctx: CorrectionPromptContext): string {
   const correction = ctx.caption?.trim() ?? '';
   const photo = ctx.photoPath || '(no photo stored: amend from the previous estimate alone)';
+  // The meal's time lets the model weigh a correction against the occasion
+  // ("that was breakfast") without re-reading the whole chat.
   return `Photo: ${photo}
 
 Meal logged at ${ctx.localTime} on ${ctx.localDay} (${ctx.timezone}).

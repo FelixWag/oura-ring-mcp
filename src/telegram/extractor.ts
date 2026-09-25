@@ -14,6 +14,7 @@
 
 import { query, type PermissionResult } from '@anthropic-ai/claude-agent-sdk';
 import { isolatedSessionOptions } from '../agent/session.js';
+import type { MealEstimate } from '../db/repos/meals.js';
 import {
   buildMealSystemPrompt,
   buildMealUserPrompt,
@@ -40,25 +41,33 @@ export interface ExtractedMeal {
   not_food?: boolean;
 }
 
+/** A photo extraction. */
 export interface ExtractionResult {
   ok: boolean;
   error?: string;
   meal?: ExtractedMeal;
-  /** Corrections only: the model's reason why the correction does not fit this meal. */
-  mismatch?: string;
   model: string;
   prompt_version: string;
   /** What the model said — kept on failure too, which is when it is needed. */
   raw_response?: string;
 }
 
-/** The previous estimate a correction amends: what the model saw last time, not only its numbers. */
-export interface PreviousEstimate {
-  description: string | null;
-  items: ExtractedItem[];
-  totals: Record<string, number>;
-  confidence: number | null;
-}
+/**
+ * A correction: exactly one of amended, mismatch or failed. A union rather
+ * than optional fields, so a caller cannot report a mismatch as a failure by
+ * checking in the wrong order, or drop an empty-reason mismatch with a truthy
+ * test.
+ */
+export type CorrectionOutcome = {
+  model: string;
+  prompt_version: string;
+  /** What the model said — kept on failure too, which is when it is needed. */
+  raw_response?: string;
+} & (
+  | { kind: 'amended'; meal: ExtractedMeal }
+  | { kind: 'mismatch'; reason: string }
+  | { kind: 'failed'; error: string }
+);
 
 /** Injected in tests so the suite never calls a model. */
 export type QueryRunner = (args: {
@@ -150,8 +159,10 @@ export function parseCorrection(text: string): ParsedCorrection {
   const parsed = jsonObjectIn(text);
 
   if (parsed['mismatch'] === true) {
-    const reason = typeof parsed['reason'] === 'string' ? parsed['reason'].trim() : '';
-    // Model text shown in chat: bounded, so a runaway answer stays readable.
+    // Model text shown in chat: one line and bounded, so it cannot pose as a
+    // separate message or run on (it can be steered by text inside a photo).
+    const reason =
+      typeof parsed['reason'] === 'string' ? parsed['reason'].replace(/\s+/g, ' ').trim() : '';
     return { kind: 'mismatch', reason: reason.slice(0, 300) };
   }
   if (parsed['not_food'] === true) {
@@ -204,9 +215,9 @@ export async function extractMeal(
  * and can tell when a correction is about a different meal.
  */
 export async function correctMeal(
-  ctx: MealPromptContext & { previous: PreviousEstimate },
+  ctx: MealPromptContext & { previous: MealEstimate },
   options: { model?: string; runner?: QueryRunner } = {},
-): Promise<ExtractionResult> {
+): Promise<CorrectionOutcome> {
   const model = options.model ?? DEFAULT_MODEL;
   const systemPrompt = buildCorrectionSystemPrompt();
   const userPrompt = buildCorrectionUserPrompt({
@@ -219,14 +230,11 @@ export async function correctMeal(
   try {
     const runner = options.runner ?? defaultRunner;
     raw = await runner({ systemPrompt, userPrompt, photoPath: ctx.photoPath, model });
-    const parsed = parseCorrection(raw);
-    return parsed.kind === 'mismatch'
-      ? { ...base, ok: true, mismatch: parsed.reason, raw_response: raw }
-      : { ...base, ok: true, meal: parsed.meal, raw_response: raw };
+    return { ...base, ...parseCorrection(raw), raw_response: raw };
   } catch (err) {
     return {
       ...base,
-      ok: false,
+      kind: 'failed',
       error: (err as Error).message,
       ...(raw !== undefined ? { raw_response: raw } : {}),
     };

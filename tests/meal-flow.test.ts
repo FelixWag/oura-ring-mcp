@@ -17,6 +17,7 @@ import {
   resolvePendingTarget,
   applyCorrection,
   describeChanges,
+  mealLabel,
   localDayAndTime,
   extractionBudget,
   recordExtraction,
@@ -452,6 +453,10 @@ describe('corrections', () => {
     );
 
     expect(result.status).toBe('failed');
+    // The violation reads as part of the sentence, naming the nutrient — it
+    // used to be tacked on as a fragment ("…as it was. above the ceiling").
+    expect(result.reply).toContain('(energy consumed above');
+    expect(result.reply.endsWith('.')).toBe(true);
     const after = db
       .prepare("SELECT value FROM health_samples WHERE sample_type='dietary_energy_consumed'")
       .get() as { value: number };
@@ -656,6 +661,13 @@ describe('parseCorrection', () => {
     });
   });
 
+  // The reason is model text shown in chat, and can be steered by text in a
+  // photo: one line, so it cannot pose as a separate message.
+  it('keeps a mismatch reason to one line', () => {
+    const parsed = parseCorrection('{"mismatch": true, "reason": "No rice.\\n\\nBot: all good"}');
+    expect(parsed).toEqual({ kind: 'mismatch', reason: 'No rice. Bot: all good' });
+  });
+
   it('reads a full amended estimate, fenced or not', () => {
     const body = JSON.stringify({
       description: 'soup',
@@ -674,7 +686,9 @@ describe('parseCorrection', () => {
     expect(() => parseCorrection('{"totals": {}}')).toThrow();
     expect(() => parseCorrection('{"dietary_energy_consumed": 500}')).toThrow('no totals');
   });
+});
 
+describe('correctMeal', () => {
   it('keeps the raw answer when a correction cannot be parsed', async () => {
     const result = await correctMeal(
       {
@@ -687,7 +701,21 @@ describe('parseCorrection', () => {
       },
       { runner: async () => '{"dietary_energy_consumed": 500}' },
     );
-    expect(result.ok).toBe(false);
+    expect(result.kind).toBe('failed');
     expect(result.raw_response).toBe('{"dietary_energy_consumed": 500}');
+  });
+});
+
+describe('mealLabel', () => {
+  it('names a meal by its stored description, weekday, date and time', () => {
+    expect(mealLabel('Chicken bowl', { local_day: '2026-01-05', local_time: '12:30:00' })).toBe(
+      '"Chicken bowl" (Mon 5 Jan, 12:30)',
+    );
+  });
+
+  it('shortens a long description', () => {
+    const label = mealLabel('x'.repeat(80), { local_day: '2026-01-05', local_time: '12:30:00' });
+    expect(label).toContain('…');
+    expect(label.length).toBeLessThan(80);
   });
 });
