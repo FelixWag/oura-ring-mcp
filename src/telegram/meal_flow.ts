@@ -199,13 +199,15 @@ export async function applyCorrection(
   const { target, ambiguous } = resolveCorrectionTarget(correctable, correction.replyToMessageId);
 
   if (ambiguous) {
-    const names = correctable
-      .slice(0, 4)
-      .map((m) => m.description ?? 'a meal')
-      .join('; ');
+    // Say that nothing changed and exactly how to retry. Listing the meals by
+    // name invited an answer by name — which nothing reads, so the answer was
+    // taken as a new correction and got this same question back.
     return {
       status: 'ambiguous',
-      reply: `Which meal do you mean? Reply to one of: ${names}`,
+      reply:
+        `I haven't changed anything: there are ${correctable.length} meals from the last ` +
+        `${CORRECTION_WINDOW_HOURS}h and I can't tell which one you mean. Swipe to reply to ` +
+        `that meal's "Saved:" message and send the correction again.`,
     };
   }
   if (!target) {

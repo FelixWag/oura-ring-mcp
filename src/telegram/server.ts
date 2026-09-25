@@ -76,10 +76,28 @@ export function redactNested(update: TelegramUpdate): TelegramUpdate {
   const clean = JSON.parse(JSON.stringify(update)) as TelegramUpdate;
   for (const message of [clean.message, clean.edited_message]) {
     if (!message) continue;
+    // Keep the id, drop the message. The id is the only thing that binds a
+    // reply to a meal, and it carries no one's name or words. Deleting it too
+    // made every reply arrive as a bare message: from v0.11 to v0.12.1 no
+    // correction or "no" could name its meal, and each asked "which meal?".
+    const replyTo = message.reply_to_message?.message_id;
     delete message.reply_to_message;
     delete message.quote;
+    if (replyTo !== undefined) {
+      message.reply_to_message = { message_id: replyTo } as TelegramMessage;
+    }
   }
   return clean;
+}
+
+/**
+ * The message a stored text replied to, if any — read from the redacted `raw`
+ * that `redactNested` produced. One reader, shared with the tests, so the id
+ * the matcher sees is the id that storage actually kept.
+ */
+export function replyTargetOf(raw: string): number | undefined {
+  const parsed = JSON.parse(raw) as { message?: { reply_to_message?: { message_id?: number } } };
+  return parsed.message?.reply_to_message?.message_id;
 }
 
 export function classifyMessage(message: TelegramMessage): ClassifiedMessage {
@@ -408,10 +426,7 @@ async function drainText(
     .all();
 
   for (const row of rows) {
-    const replyTo = (
-      JSON.parse(row.raw) as { message?: { reply_to_message?: { message_id?: number } } }
-    ).message?.reply_to_message?.message_id;
-    const intent = readConfirmation(row.text, replyTo);
+    const intent = readConfirmation(row.text, replyTargetOf(row.raw));
 
     let reply: string;
     try {

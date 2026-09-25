@@ -7,13 +7,16 @@
 
 import { beforeEach, describe, expect, it } from 'vitest';
 import { openDatabase, type Db } from '../src/db/index.js';
-import { TelegramUpdatesRepo } from '../src/db/repos/telegram_updates.ts';
+import { TelegramUpdatesRepo, type TelegramUpdateRow } from '../src/db/repos/telegram_updates.ts';
+import { MealsRepo } from '../src/db/repos/meals.ts';
 import {
   classifyMessage,
   isAllowed,
   processBatch,
+  replyTargetOf,
   type ClassifiedMessage,
 } from '../src/telegram/server.ts';
+import { applyCorrection, processPhoto, readConfirmation } from '../src/telegram/meal_flow.ts';
 import { normalizeExtension } from '../src/telegram/media.ts';
 import type { TelegramConfig } from '../src/config.ts';
 import type { TelegramMessage, TelegramUpdate } from '../src/telegram/client.ts';
@@ -383,5 +386,136 @@ describe('third-party content wearing the owner envelope', () => {
       is_forwarded: number;
     };
     expect(row.is_forwarded).toBe(0);
+  });
+});
+
+describe('replies', () => {
+  const BOT_ID = CONFIG.botId;
+
+  // Macros that add up to the stated energy, or the plausibility bounds
+  // refuse the estimate and no meal is saved.
+  const ESTIMATE = JSON.stringify({
+    description: 'bread with spread',
+    items: [{ name: 'bread', grams: 80 }],
+    totals: {
+      dietary_energy_consumed: 400,
+      dietary_protein: 12,
+      dietary_carbohydrates: 50,
+      dietary_fat_total: 15,
+    },
+    confidence: 0.7,
+  });
+  const CORRECTED = JSON.stringify({
+    description: 'bread with a different spread',
+    items: [{ name: 'bread', grams: 80 }],
+    totals: {
+      dietary_energy_consumed: 330,
+      dietary_protein: 11,
+      dietary_carbohydrates: 52,
+      dietary_fat_total: 9,
+    },
+    confidence: 0.75,
+  });
+
+  /** The bot's own estimate, as Telegram embeds it in a reply. */
+  const botEstimate = (message_id: number): TelegramMessage =>
+    message({ message_id, from: { id: BOT_ID, is_bot: true }, text: 'Saved: a meal' });
+
+  const storedRow = (update_id: number) =>
+    db.prepare('SELECT * FROM telegram_updates WHERE update_id = ?').get(update_id) as
+      | TelegramUpdateRow
+      | undefined;
+
+  /**
+   * Two photos sent as one album: one meal each, each answered by its own bot
+   * message (902, 903) — the way drainPhotos records prompt_message_id.
+   */
+  async function albumOfTwoMeals(): Promise<{ first: number; second: number }> {
+    const photo = (update_id: number, message_id: number, unique: string): TelegramUpdate =>
+      update(update_id, {
+        message_id,
+        // Recent, or the meals fall outside the 24h correction window.
+        date: Math.floor(Date.now() / 1000) - 600,
+        text: undefined,
+        media_group_id: 'album-1',
+        photo: [{ file_id: unique, file_unique_id: unique, width: 10, height: 10 }],
+      });
+    processBatch([photo(1, 900, 'u1'), photo(2, 901, 'u2')], repo, CONFIG);
+    db.prepare("UPDATE telegram_updates SET status = 'stored', media_path = 'x.jpg'").run();
+
+    const meals = new MealsRepo(db);
+    const a = await processPhoto(db, storedRow(1)!, '/media', { runner: async () => ESTIMATE });
+    meals.setPromptMessageId(a.meal_id!, 902);
+    const b = await processPhoto(db, storedRow(2)!, '/media', { runner: async () => ESTIMATE });
+    meals.setPromptMessageId(b.meal_id!, 903);
+    return { first: a.meal_id!, second: b.meal_id! };
+  }
+
+  // From v0.11 to v0.12.1, redaction deleted the reply target along with the
+  // quoted message, so every reply was stored as a bare message and a
+  // correction after an album asked "which meal?" however it was sent.
+  it('keeps the id of the replied-to message through storage', () => {
+    processBatch(
+      [
+        update(10, {
+          message_id: 905,
+          text: 'a different spread',
+          reply_to_message: botEstimate(903),
+        }),
+      ],
+      repo,
+      CONFIG,
+    );
+    expect(replyTargetOf(storedRow(10)!.raw)).toBe(903);
+  });
+
+  it('keeps only the id: nothing of the replied-to message itself', () => {
+    processBatch(
+      [update(10, { message_id: 905, text: 'my reply', reply_to_message: botEstimate(903) })],
+      repo,
+      CONFIG,
+    );
+    const stored = JSON.parse(storedRow(10)!.raw) as { message: Record<string, unknown> };
+    expect(stored.message.reply_to_message).toEqual({ message_id: 903 });
+    expect(storedRow(10)!.raw).not.toContain('Saved: a meal');
+  });
+
+  it('applies a replied correction to the album meal whose estimate was replied to', async () => {
+    const { first, second } = await albumOfTwoMeals();
+    processBatch(
+      [
+        update(10, {
+          message_id: 905,
+          text: 'a different spread',
+          reply_to_message: botEstimate(903),
+        }),
+      ],
+      repo,
+      CONFIG,
+    );
+
+    const stored = storedRow(10)!;
+    const replyTo = replyTargetOf(stored.raw);
+    const intent = readConfirmation(stored.text, replyTo);
+    expect(intent.kind).toBe('correct');
+
+    const result = await applyCorrection(
+      db,
+      {
+        text: stored.text!,
+        ...(replyTo !== undefined ? { replyToMessageId: replyTo } : {}),
+        isForwarded: false,
+      },
+      '/media',
+      { runner: async () => CORRECTED },
+    );
+    expect(result.status).toBe('corrected');
+    expect(result.meal_id).toBe(second);
+    expect(result.meal_id).not.toBe(first);
+  });
+
+  it('a plain message has no reply target', () => {
+    processBatch([update(10, { text: 'a different spread' })], repo, CONFIG);
+    expect(replyTargetOf(storedRow(10)!.raw)).toBeUndefined();
   });
 });

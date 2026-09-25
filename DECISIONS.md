@@ -1010,3 +1010,36 @@ extraction quality shifts, that is a place to look.
 
 The next step removes the extractor's last built-in tool by sending the photo
 inside the prompt as an image block, so the model has nothing to read at all.
+
+## v0.12.2: the reply id that privacy redaction took with it
+
+Every correction sent as a Telegram reply after two photos answered "which
+meal do you mean?", and answering that got the same question back. The cause
+was two correct-looking changes that never met in a test. Storage redacts
+`reply_to_message` before writing the raw update, because a reply embeds the
+quoted message wholesale — a third party's name and words under the owner's
+envelope. The correction path, added a day later, reads the reply target back
+out of that same stored JSON. So the id was always missing, and from v0.11 on
+no reply in production ever reached the matcher: every correction, `ok` and
+`no` arrived as a bare message, and with more than one recent meal there was
+nothing to choose by.
+
+The v0.11 entry above explains "confirmation replies never matched" by the bot's
+message id not being checked. That was real, and fixing it was necessary. It
+was not sufficient, and it looked sufficient because its tests handed the
+matcher a reply id directly instead of storing a message and reading the id
+back. The new tests go through storage.
+
+The fix keeps exactly one field of the quoted message: its `message_id`. In a
+one-to-one chat it points at the bot's message or the owner's own, and carries
+no name and no text; everything else is still deleted. The id is read through
+one exported function, `replyTargetOf()`, which the tests use too, so what the
+matcher reads is what storage kept.
+
+The "which meal" reply changed as well. It listed meals by name and asked for a
+reply, which invited an answer by name that nothing reads. It now says that
+nothing was changed and how to retry: reply to that meal's "Saved:" message.
+Answering the question by name would need the bot to remember what it asked
+and which correction is waiting. That is a storage decision, left for its own
+change. Replies lost before this fix cannot be recovered: the ids were never
+written.

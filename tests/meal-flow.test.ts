@@ -489,7 +489,10 @@ describe('corrections', () => {
     );
 
     expect(result.status).toBe('ambiguous');
-    expect(result.reply).toContain('Which meal');
+    // Says nothing changed and how to retry — not a list of names, which
+    // invited an answer by name that nothing reads.
+    expect(result.reply).toContain("haven't changed anything");
+    expect(result.reply).toContain('reply to');
   });
 
   it('says so when there is nothing recent to correct', async () => {
