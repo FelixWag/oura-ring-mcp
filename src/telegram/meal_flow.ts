@@ -101,8 +101,22 @@ export interface CorrectableMeal {
   source_id: number;
   prompt_message_id: number | null;
   description: string | null;
-  totals: string;
   depth: number;
+}
+
+/**
+ * The meal a Telegram reply points at: the bot's estimate first, then the
+ * user's photo. One matcher for corrections, confirmations and removals, so
+ * the three cannot disagree about which meal a reply means.
+ */
+export function mealRepliedTo<T extends { prompt_message_id: number | null; source_id: number }>(
+  meals: T[],
+  replyToMessageId: number,
+): T | undefined {
+  return (
+    meals.find((m) => m.prompt_message_id === replyToMessageId) ??
+    meals.find((m) => m.source_id === replyToMessageId)
+  );
 }
 
 /**
@@ -120,9 +134,7 @@ export function resolveCorrectionTarget(
   if (correctable.length === 0) return { ambiguous: false };
 
   if (replyToMessageId !== undefined) {
-    const match =
-      correctable.find((m) => m.prompt_message_id === replyToMessageId) ??
-      correctable.find((m) => m.source_id === replyToMessageId);
+    const match = mealRepliedTo(correctable, replyToMessageId);
     if (match) return { target: match, ambiguous: false };
   }
 
@@ -170,9 +182,38 @@ export function describeChanges(
 }
 
 export interface CorrectionResult {
-  status: 'corrected' | 'ambiguous' | 'refused' | 'capped' | 'failed' | 'no_target';
+  status: 'corrected' | 'mismatch' | 'ambiguous' | 'refused' | 'capped' | 'failed' | 'no_target';
   meal_id?: number;
   reply: string;
+  /**
+   * Log-only. Comes from the extractor's error, whose throw sites keep model
+   * text out (see `jsonObjectIn`); keep it so when adding one.
+   */
+  detail?: string;
+}
+
+const WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+/**
+ * How a reply names a meal: `"Chicken bowl" (Mon 5 Jan, 12:30)`.
+ *
+ * Every reply about a stored meal says which one, from the STORED description
+ * and time, not the model's new wording. A correction sent in reply to the
+ * wrong photo was otherwise invisible: the user saw "couldn't apply that"
+ * with no hint that the bot had been looking at a different meal.
+ */
+export function mealLabel(
+  description: string | null,
+  meal: { local_day: string; local_time: string },
+): string {
+  const text = (description ?? 'meal').trim() || 'meal';
+  const short = text.length > 50 ? `${text.slice(0, 49).trimEnd()}…` : text;
+  const [year, month, day] = meal.local_day.split('-').map(Number) as [number, number, number];
+  // local_day is already the meal's calendar date in its own zone. Read it as
+  // a UTC date so the server's zone cannot shift the weekday.
+  const weekday = WEEKDAYS[new Date(Date.UTC(year, month - 1, day)).getUTCDay()];
+  return `"${short}" (${weekday} ${day} ${MONTHS[month - 1]}, ${meal.local_time.slice(0, 5)})`;
 }
 
 /**
@@ -217,25 +258,27 @@ export async function applyCorrection(
     };
   }
 
+  const meal = repo.get(target.meal_id);
+  const previous = repo.currentEstimate(target.meal_id);
+  if (!meal || !previous) return { status: 'failed', reply: "I couldn't find that meal any more." };
+  const label = mealLabel(target.description, meal);
+
   if (target.depth >= MAX_CORRECTION_DEPTH) {
     return {
       status: 'refused',
       meal_id: target.meal_id,
       reply:
-        `That meal has already been corrected ${target.depth} times — the photo may not be ` +
+        `${label} has already been corrected ${target.depth} times — the photo may not be ` +
         `readable. Send a new one and I'll start fresh.`,
     };
   }
-
-  const meal = repo.get(target.meal_id);
-  if (!meal) return { status: 'failed', reply: "I couldn't find that meal any more." };
 
   const budget = extractionBudget(db, meal.local_day);
   if (budget.remaining <= 0) {
     return {
       status: 'capped',
       meal_id: target.meal_id,
-      reply: `I've hit today's analysis limit, so I haven't applied that correction.`,
+      reply: `I've hit today's analysis limit, so I haven't changed ${label}.`,
     };
   }
 
@@ -249,24 +292,40 @@ export async function applyCorrection(
     .get(target.meal_id);
 
   const before = repo.projectedTotals(target.meal_id);
-  const result: ExtractionResult = await correctMeal(
+  const result = await correctMeal(
     {
       photoPath: photo?.media_path ? `${mediaRoot}/${photo.media_path}` : '',
       caption: correction.text,
       localTime: meal.local_time,
       localDay: meal.local_day,
       timezone: meal.tz,
-      previous: JSON.parse(target.totals) as Record<string, unknown>,
+      previous,
     },
     options,
   );
   recordExtraction(db, meal.local_day);
 
-  if (!result.ok || !result.meal) {
+  if (result.kind === 'mismatch') {
+    // The model says the correction is about a different meal. Nothing is
+    // written: storing an unchanged extraction would spend one of the meal's
+    // corrections and report "nothing changed" as if it had been applied.
+    const reason = result.reason ? ` (${result.reason.replace(/\.$/, '')})` : '';
+    return {
+      status: 'mismatch',
+      meal_id: target.meal_id,
+      reply:
+        `That doesn't seem to be about ${label}${reason}, so nothing changed. If you meant ` +
+        `another meal, swipe to reply to its "Saved:" message and send it again.`,
+    };
+  }
+  if (result.kind === 'failed') {
+    // Plain words: the parser's reason ("model response has no totals") means
+    // nothing to the person reading this in a chat.
     return {
       status: 'failed',
       meal_id: target.meal_id,
-      reply: `I couldn't apply that: ${result.error}. The meal is unchanged.`,
+      reply: `I couldn't apply that to ${label}, so nothing changed. Try rephrasing it.`,
+      detail: result.error,
     };
   }
 
@@ -286,13 +345,20 @@ export async function applyCorrection(
       })),
     });
   } catch (err) {
-    // Bounds rejected the amendment, so the original stands untouched.
+    // The amendment was not stored, so the original stands untouched. A
+    // violation's `reason` is written to follow "<nutrient> <value> — ", so it
+    // needs its nutrient to read as a sentence.
+    const violation = err instanceof MealValidationError ? err.violations[0] : undefined;
+    const why = violation
+      ? ` (${violation.nutrient.replace(/^dietary_/, '').replace(/_/g, ' ')} ${violation.reason})`
+      : '';
     return {
       status: 'failed',
       meal_id: target.meal_id,
-      reply: `That correction gave numbers I don't believe, so I've left the meal as it was. ${
-        (err as Error).message
-      }`,
+      reply: `That correction gave numbers I don't believe for ${label}, so I've left it as it was${why}.`,
+      detail: violation
+        ? 'amendment failed plausibility bounds'
+        : `amendment not stored: ${(err as Error).name}`,
     };
   }
 
@@ -308,8 +374,80 @@ export async function applyCorrection(
     meal_id: target.meal_id,
     reply:
       changes.length > 0
-        ? `Updated: ${result.meal.description || target.description}\n${changes.join('\n')}${depthNote}`
-        : `Noted — nothing changed materially.${depthNote}`,
+        ? `Updated ${label}:\n${changes.join('\n')}${depthNote}`
+        : `Noted for ${label} — nothing changed materially.${depthNote}`,
+  };
+}
+
+export interface RemovalResult {
+  status: 'removed' | 'needs_reply' | 'already_removed' | 'too_old' | 'not_counted' | 'not_a_meal';
+  meal_id?: number;
+  reply: string;
+}
+
+/**
+ * "no": remove a saved meal from the totals, keeping its record.
+ *
+ * Reads saved meals. It used to share the "waiting for confirmation" list,
+ * which has been empty since meals started saving on arrival, so the undo
+ * every estimate advertises answered "nothing waiting" and the meal kept
+ * counting.
+ *
+ * Only as a reply to the meal. Stricter than a correction about guessing
+ * which meal, because it removes something and chat cannot undo that: a bare
+ * "no" is as likely to mean "you're wrong" to the last bot message as "delete
+ * the meal", and a reply to anything that is not a meal never falls back to
+ * "the only recent one".
+ */
+export function rejectMeal(db: Db, replyToMessageId: number | undefined): RemovalResult {
+  if (replyToMessageId === undefined) {
+    return {
+      status: 'needs_reply',
+      reply: 'Nothing was removed. To remove a meal, swipe to reply "no" to its "Saved:" message.',
+    };
+  }
+
+  const repo = new MealsRepo(db);
+  const target = mealRepliedTo(repo.correctableMeals(CORRECTION_WINDOW_HOURS), replyToMessageId);
+  if (!target) {
+    const known = repo.findByTelegramMessage(replyToMessageId);
+    const cutoff = Math.floor(Date.now() / 1000) - CORRECTION_WINDOW_HOURS * 3600;
+    if (known?.status === 'voided') {
+      return {
+        status: 'already_removed',
+        meal_id: known.meal_id,
+        reply: 'That meal was already removed.',
+      };
+    }
+    if (known && known.eaten_epoch < cutoff) {
+      return {
+        status: 'too_old',
+        meal_id: known.meal_id,
+        reply: `That meal is older than ${CORRECTION_WINDOW_HOURS}h, so I can't remove it from here. Nothing was removed.`,
+      };
+    }
+    if (known) {
+      return {
+        status: 'not_counted',
+        meal_id: known.meal_id,
+        reply: "That meal isn't counted towards anything, so there's nothing to remove.",
+      };
+    }
+    return {
+      status: 'not_a_meal',
+      reply:
+        'That message isn\'t one of your meals, so nothing was removed. Reply "no" to the ' +
+        'meal\'s "Saved:" message.',
+    };
+  }
+
+  const meal = repo.get(target.meal_id);
+  repo.void(target.meal_id, 'rejected in chat');
+  const label = meal ? mealLabel(target.description, meal) : `"${target.description ?? 'meal'}"`;
+  return {
+    status: 'removed',
+    meal_id: target.meal_id,
+    reply: `Removed ${label}. It no longer counts towards anything; the record is kept.`,
   };
 }
 
@@ -336,12 +474,7 @@ export function resolvePendingTarget(
   if (pending.length === 0) return { ambiguous: false };
 
   if (replyToMessageId !== undefined) {
-    // The bot's own question first: that is what a user actually replies to.
-    // Matching only the photo's id was the original bug — every reply fell
-    // through to "which meal do you mean?".
-    const match =
-      pending.find((p) => p.prompt_message_id === replyToMessageId) ??
-      pending.find((p) => p.source_id === replyToMessageId);
+    const match = mealRepliedTo(pending, replyToMessageId);
     if (match) return { target: match, ambiguous: false };
   }
 
@@ -398,6 +531,11 @@ export interface ProcessPhotoResult {
   status: 'extracted' | 'refused' | 'capped' | 'not_food' | 'failed';
   meal_id?: number;
   reply: string;
+  /**
+   * Log-only. Comes from the extractor's error, whose throw sites keep model
+   * text out (see `jsonObjectIn`); keep it so when adding one.
+   */
+  detail?: string;
 }
 
 /**
@@ -452,7 +590,12 @@ export async function processPhoto(
   recordExtraction(db, localDay);
 
   if (!extraction.ok || !extraction.meal) {
-    return { status: 'failed', reply: `I couldn't read that one: ${extraction.error}` };
+    return {
+      status: 'failed',
+      reply:
+        "I couldn't get an estimate out of that photo, so nothing was saved. Try sending it again.",
+      ...(extraction.error ? { detail: extraction.error } : {}),
+    };
   }
   if (extraction.meal.not_food) {
     return { status: 'not_food', reply: "That doesn't look like food, so I haven't logged it." };

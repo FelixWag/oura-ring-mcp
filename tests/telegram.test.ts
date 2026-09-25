@@ -14,9 +14,15 @@ import {
   isAllowed,
   processBatch,
   replyTargetOf,
+  confirmPending,
   type ClassifiedMessage,
 } from '../src/telegram/server.ts';
-import { applyCorrection, processPhoto, readConfirmation } from '../src/telegram/meal_flow.ts';
+import {
+  applyCorrection,
+  processPhoto,
+  readConfirmation,
+  rejectMeal,
+} from '../src/telegram/meal_flow.ts';
 import { normalizeExtension } from '../src/telegram/media.ts';
 import type { TelegramConfig } from '../src/config.ts';
 import type { TelegramMessage, TelegramUpdate } from '../src/telegram/client.ts';
@@ -537,6 +543,78 @@ describe('replies', () => {
       CONFIG,
     );
     expect(replyTargetOf(storedRow(11)!.raw)).toBe(903);
+  });
+
+  describe('"no"', () => {
+    const status = (id: number) =>
+      (db.prepare('SELECT status FROM meals WHERE id = ?').get(id) as { status: string }).status;
+    const samples = (id: number) =>
+      (
+        db.prepare('SELECT COUNT(*) AS n FROM health_samples WHERE meal_id = ?').get(id) as {
+          n: number;
+        }
+      ).n;
+
+    // Meals are saved on arrival, and "no" only looked at meals waiting for
+    // confirmation — of which there are none. Every estimate says "Reply 'no'
+    // to remove it", and it answered "nothing waiting" and kept counting.
+    it('removes the saved meal whose estimate it replies to, and only that one', async () => {
+      const { first, second } = await albumOfTwoMeals();
+      processBatch(
+        [update(12, { message_id: 906, text: 'no', reply_to_message: botEstimate(903) })],
+        repo,
+        CONFIG,
+      );
+      const stored = storedRow(12)!;
+      const intent = readConfirmation(stored.text, replyTargetOf(stored.raw));
+      expect(intent.kind).toBe('reject');
+
+      const result = rejectMeal(db, replyTargetOf(stored.raw));
+
+      expect(result.status).toBe('removed');
+      expect(result.meal_id).toBe(second);
+      expect(result.reply).toContain('Removed "bread with spread"');
+      expect(status(second)).toBe('voided');
+      expect(samples(second)).toBe(0);
+      expect(status(first)).toBe('confirmed');
+      expect(samples(first)).toBeGreaterThan(0);
+    });
+
+    // Found in security review: a bare "no" — often meant as "you're wrong" to
+    // whatever the bot said last — removed the only recent meal, and chat
+    // cannot undo a removal.
+    it('never removes on a bare "no", even with a single recent meal', async () => {
+      const { first, second } = await albumOfTwoMeals();
+      new MealsRepo(db).void(first, 'test setup: leave one meal');
+
+      const result = rejectMeal(db, undefined);
+      expect(result.status).toBe('needs_reply');
+      expect(result.reply).toContain('Nothing was removed');
+      expect(status(second)).toBe('confirmed');
+    });
+
+    it('removes nothing when it replies to a message that is not a meal', async () => {
+      const { first, second } = await albumOfTwoMeals();
+      new MealsRepo(db).void(first, 'test setup: leave one meal');
+
+      const result = rejectMeal(db, 999);
+      expect(result.status).toBe('not_a_meal');
+      expect(status(second)).toBe('confirmed');
+    });
+
+    it('says a meal was already removed when "no" is sent to it twice', async () => {
+      const { second } = await albumOfTwoMeals();
+      rejectMeal(db, 903);
+
+      const again = rejectMeal(db, 903);
+      expect(again.status).toBe('already_removed');
+      expect(again.meal_id).toBe(second);
+    });
+
+    it('says an "ok" has nothing to do, rather than "nothing waiting"', async () => {
+      await albumOfTwoMeals();
+      expect(confirmPending(db, 903)).toContain('Already saved');
+    });
   });
 
   it('treats anything but a positive integer id as no target', () => {

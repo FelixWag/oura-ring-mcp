@@ -73,6 +73,21 @@ export interface MealRow {
   prompt_message_id: number | null;
 }
 
+export interface MealEstimateItem {
+  name: string;
+  portion_text: string | null;
+  grams: number | null;
+  confidence: number | null;
+}
+
+/** A meal's current estimate as a whole: what a correction amends. */
+export interface MealEstimate {
+  description: string | null;
+  items: MealEstimateItem[];
+  totals: Record<string, number>;
+  confidence: number | null;
+}
+
 export class MealValidationError extends Error {
   constructor(readonly violations: BoundsViolation[]) {
     super(
@@ -357,7 +372,6 @@ export class MealsRepo {
     source_id: number;
     prompt_message_id: number | null;
     description: string | null;
-    totals: string;
     depth: number;
   }> {
     const cutoff = Math.floor(Date.now() / 1000) - withinHours * 3600;
@@ -369,7 +383,6 @@ export class MealsRepo {
           source_id: number;
           prompt_message_id: number | null;
           description: string | null;
-          totals: string;
           depth: number;
         }
       >(
@@ -377,7 +390,6 @@ export class MealsRepo {
                 COALESCE(t.message_id, 0) AS source_id,
                 m.prompt_message_id AS prompt_message_id,
                 e.description AS description,
-                e.totals AS totals,
                 (SELECT COUNT(*) FROM meal_extractions x WHERE x.meal_id = m.id) - 1 AS depth
            FROM meals m
            JOIN meal_extractions e ON e.id = m.current_extraction_id
@@ -387,6 +399,26 @@ export class MealsRepo {
           ORDER BY m.eaten_epoch DESC LIMIT ?`,
       )
       .all(cutoff, limit);
+  }
+
+  /**
+   * The meal a Telegram message belongs to — as the bot's estimate or as the
+   * user's photo — whatever its status or age. For telling "already removed"
+   * and "too old" apart from "not a meal at all".
+   */
+  findByTelegramMessage(
+    messageId: number,
+  ): { meal_id: number; status: MealStatus; eaten_epoch: number } | undefined {
+    return this.db
+      .prepare<[number, number], { meal_id: number; status: MealStatus; eaten_epoch: number }>(
+        `SELECT m.id AS meal_id, m.status, m.eaten_epoch
+           FROM meals m
+           LEFT JOIN meal_media mm ON mm.meal_id = m.id AND mm.source_kind = 'telegram'
+           LEFT JOIN telegram_updates t ON t.id = mm.source_id
+          WHERE m.prompt_message_id = ? OR t.message_id = ?
+          ORDER BY m.id DESC LIMIT 1`,
+      )
+      .get(messageId, messageId);
   }
 
   /** What this meal currently contributes, read back from the projection. */
@@ -404,6 +436,42 @@ export class MealsRepo {
 
   get(mealId: number): MealRow | undefined {
     return this.db.prepare<[number], MealRow>('SELECT * FROM meals WHERE id = ?').get(mealId);
+  }
+
+  /**
+   * The meal's current estimate as a whole — what a correction amends.
+   *
+   * Not only the totals: given just the nutrient map, the correction model
+   * answered in that shape (no `totals` key, so every correction failed), and
+   * it could not tell a correction about a different meal from one about this
+   * one, because it had nothing to compare the food against.
+   */
+  currentEstimate(mealId: number): MealEstimate | undefined {
+    const extraction = this.db
+      .prepare<
+        [number],
+        { id: number; description: string | null; totals: string; confidence: number | null }
+      >(
+        `SELECT e.id, e.description, e.totals, e.confidence
+           FROM meals m JOIN meal_extractions e ON e.id = m.current_extraction_id
+          WHERE m.id = ?`,
+      )
+      .get(mealId);
+    if (!extraction) return undefined;
+
+    const items = this.db
+      .prepare<[number], MealEstimateItem>(
+        `SELECT name, portion_text, grams, confidence FROM meal_items
+          WHERE extraction_id = ? ORDER BY position`,
+      )
+      .all(extraction.id);
+
+    return {
+      description: extraction.description,
+      items,
+      totals: JSON.parse(extraction.totals) as Record<string, number>,
+      confidence: extraction.confidence,
+    };
   }
 
   /**

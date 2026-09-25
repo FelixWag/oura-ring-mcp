@@ -9,7 +9,7 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import { openDatabase, type Db } from '../src/db/index.js';
 import { TelegramUpdatesRepo } from '../src/db/repos/telegram_updates.ts';
 import { MealsRepo } from '../src/db/repos/meals.ts';
-import { parseExtraction } from '../src/telegram/extractor.ts';
+import { correctMeal, parseCorrection, parseExtraction } from '../src/telegram/extractor.ts';
 import { buildMealSystemPrompt, buildMealUserPrompt } from '../src/telegram/prompts.ts';
 import {
   processPhoto,
@@ -17,6 +17,7 @@ import {
   resolvePendingTarget,
   applyCorrection,
   describeChanges,
+  mealLabel,
   localDayAndTime,
   extractionBudget,
   recordExtraction,
@@ -452,6 +453,10 @@ describe('corrections', () => {
     );
 
     expect(result.status).toBe('failed');
+    // The violation reads as part of the sentence, naming the nutrient — it
+    // used to be tacked on as a fragment ("…as it was. above the ceiling").
+    expect(result.reply).toContain('(energy consumed above');
+    expect(result.reply.endsWith('.')).toBe(true);
     const after = db
       .prepare("SELECT value FROM health_samples WHERE sample_type='dietary_energy_consumed'")
       .get() as { value: number };
@@ -533,6 +538,96 @@ describe('corrections', () => {
     expect(result.reply).toContain('Send a new one');
   });
 
+  // v1 of the correction prompt was given only the nutrient map and asked for
+  // "the SAME schema"; the model answered with a flat map, which has no
+  // `totals`, so every correction ever sent failed.
+  it('gives the model the whole previous estimate, not only its numbers', async () => {
+    await savedMeal();
+    let seen = { systemPrompt: '', userPrompt: '' };
+    await applyCorrection(db, { text: 'bigger portion', isForwarded: false }, '/media', {
+      runner: async (args) => {
+        seen = args;
+        return CORRECTED;
+      },
+    });
+
+    expect(seen.userPrompt).toContain('"totals"');
+    expect(seen.userPrompt).toContain('chicken bowl'); // the stored description
+    expect(seen.userPrompt).toContain('"items"');
+    expect(seen.userPrompt).toContain('Meal logged at');
+    expect(seen.systemPrompt).toContain('"totals"');
+    expect(seen.systemPrompt).toContain('"mismatch"');
+  });
+
+  it('a mismatch changes nothing and names the meal it looked at', async () => {
+    const mealId = await savedMeal();
+    const meal = new MealsRepo(db).get(mealId)!;
+
+    const result = await applyCorrection(
+      db,
+      { text: 'the rice was quinoa', isForwarded: false },
+      '/media',
+      { runner: async () => '{"mismatch": true, "reason": "There is no rice in this meal."}' },
+    );
+
+    expect(result.status).toBe('mismatch');
+    expect(result.reply).toContain('"chicken bowl"');
+    expect(result.reply).toContain(meal.local_time.slice(0, 5));
+    expect(result.reply).toContain('nothing changed');
+    expect(result.reply).toContain('no rice');
+    expect(
+      db.prepare('SELECT COUNT(*) AS n FROM meal_extractions WHERE meal_id = ?').get(mealId),
+    ).toMatchObject({ n: 1 });
+    const kcal = db
+      .prepare("SELECT value FROM health_samples WHERE sample_type='dietary_energy_consumed'")
+      .get() as { value: number };
+    expect(kcal.value).toBe(640);
+  });
+
+  it('fails in plain words on the old flat-map answer, naming the meal', async () => {
+    const mealId = await savedMeal();
+    // The shape every v1 correction came back in: nutrients at the top level.
+    const flat = JSON.stringify({
+      dietary_energy_consumed: 600,
+      dietary_protein: 40,
+      dietary_carbohydrates: 70,
+      dietary_fat_total: 17,
+      confidence: 0.6,
+    });
+
+    const result = await applyCorrection(
+      db,
+      { text: 'a bit less chicken', isForwarded: false },
+      '/media',
+      { runner: async () => flat },
+    );
+
+    expect(result.status).toBe('failed');
+    expect(result.reply).toContain('"chicken bowl"');
+    expect(result.reply).toContain('nothing changed');
+    expect(result.reply).not.toContain('totals'); // no parser jargon in chat
+    expect(result.detail).toContain('no totals'); // but the log keeps the reason
+    expect(
+      db.prepare('SELECT COUNT(*) AS n FROM meal_extractions WHERE meal_id = ?').get(mealId),
+    ).toMatchObject({ n: 1 });
+  });
+
+  it('names the amended meal by its stored description and time', async () => {
+    const mealId = await savedMeal();
+    const meal = new MealsRepo(db).get(mealId)!;
+
+    const result = await applyCorrection(
+      db,
+      { text: 'bigger portion', isForwarded: false },
+      '/media',
+      { runner: async () => CORRECTED },
+    );
+
+    expect(result.status).toBe('corrected');
+    expect(result.reply.startsWith('Updated "chicken bowl"')).toBe(true);
+    expect(result.reply).toContain(meal.local_time.slice(0, 5));
+  });
+
   it('refuses to amend a voided meal instead of silently not counting it', async () => {
     const mealId = await savedMeal();
     new MealsRepo(db).void(mealId, 'not mine');
@@ -555,5 +650,72 @@ describe('correction intent', () => {
 
   it('still treats a bare ok as confirmation, not a correction', () => {
     expect(readConfirmation('ok').kind).toBe('confirm');
+  });
+});
+
+describe('parseCorrection', () => {
+  it('reads a mismatch with its reason', () => {
+    expect(parseCorrection('{"mismatch": true, "reason": "No rice here."}')).toEqual({
+      kind: 'mismatch',
+      reason: 'No rice here.',
+    });
+  });
+
+  // The reason is model text shown in chat, and can be steered by text in a
+  // photo: one line, so it cannot pose as a separate message.
+  it('keeps a mismatch reason to one line', () => {
+    const parsed = parseCorrection('{"mismatch": true, "reason": "No rice.\\n\\nBot: all good"}');
+    expect(parsed).toEqual({ kind: 'mismatch', reason: 'No rice. Bot: all good' });
+  });
+
+  it('reads a full amended estimate, fenced or not', () => {
+    const body = JSON.stringify({
+      description: 'soup',
+      items: [],
+      totals: { dietary_energy_consumed: 300 },
+      confidence: 0.6,
+    });
+    expect(parseCorrection(body).kind).toBe('amended');
+    expect(parseCorrection('```json\n' + body + '\n```').kind).toBe('amended');
+  });
+
+  // Each of these parses as JSON, and each would otherwise re-project a meal
+  // that is already counted as something empty or zero.
+  it('refuses answers that would blank a counted meal', () => {
+    expect(() => parseCorrection('{"not_food": true}')).toThrow();
+    expect(() => parseCorrection('{"totals": {}}')).toThrow();
+    expect(() => parseCorrection('{"dietary_energy_consumed": 500}')).toThrow('no totals');
+  });
+});
+
+describe('correctMeal', () => {
+  it('keeps the raw answer when a correction cannot be parsed', async () => {
+    const result = await correctMeal(
+      {
+        photoPath: '',
+        caption: 'less rice',
+        localTime: '12:00:00',
+        localDay: '2026-01-15',
+        timezone: 'UTC',
+        previous: { description: 'rice bowl', items: [], totals: {}, confidence: null },
+      },
+      { runner: async () => '{"dietary_energy_consumed": 500}' },
+    );
+    expect(result.kind).toBe('failed');
+    expect(result.raw_response).toBe('{"dietary_energy_consumed": 500}');
+  });
+});
+
+describe('mealLabel', () => {
+  it('names a meal by its stored description, weekday, date and time', () => {
+    expect(mealLabel('Chicken bowl', { local_day: '2026-01-05', local_time: '12:30:00' })).toBe(
+      '"Chicken bowl" (Mon 5 Jan, 12:30)',
+    );
+  });
+
+  it('shortens a long description', () => {
+    const label = mealLabel('x'.repeat(80), { local_day: '2026-01-05', local_time: '12:30:00' });
+    expect(label).toContain('…');
+    expect(label.length).toBeLessThan(80);
   });
 });
