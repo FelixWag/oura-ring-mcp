@@ -407,6 +407,62 @@ export class MealsRepo {
   }
 
   /**
+   * The meal's current estimate as a whole — what a correction amends.
+   *
+   * Not only the totals: given just the nutrient map, the correction model
+   * answered in that shape (no `totals` key, so every correction failed), and
+   * it could not tell a correction about a different meal from one about this
+   * one, because it had nothing to compare the food against.
+   */
+  currentEstimate(mealId: number):
+    | {
+        description: string | null;
+        items: Array<{
+          name: string;
+          portion_text: string | null;
+          grams: number | null;
+          confidence: number | null;
+        }>;
+        totals: Record<string, number>;
+        confidence: number | null;
+      }
+    | undefined {
+    const extraction = this.db
+      .prepare<
+        [number],
+        { id: number; description: string | null; totals: string; confidence: number | null }
+      >(
+        `SELECT e.id, e.description, e.totals, e.confidence
+           FROM meals m JOIN meal_extractions e ON e.id = m.current_extraction_id
+          WHERE m.id = ?`,
+      )
+      .get(mealId);
+    if (!extraction) return undefined;
+
+    const items = this.db
+      .prepare<
+        [number],
+        {
+          name: string;
+          portion_text: string | null;
+          grams: number | null;
+          confidence: number | null;
+        }
+      >(
+        `SELECT name, portion_text, grams, confidence FROM meal_items
+          WHERE extraction_id = ? ORDER BY position`,
+      )
+      .all(extraction.id);
+
+    return {
+      description: extraction.description,
+      items,
+      totals: JSON.parse(extraction.totals) as Record<string, number>,
+      confidence: extraction.confidence,
+    };
+  }
+
+  /**
    * Meals awaiting confirmation, grouped by day.
    *
    * This exists so that "no data" and "not yet confirmed" are distinguishable.

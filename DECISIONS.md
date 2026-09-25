@@ -1043,3 +1043,42 @@ Answering the question by name would need the bot to remember what it asked
 and which correction is waiting. That is a storage decision, left for its own
 change. Replies lost before this fix cannot be recovered: the ids were never
 written.
+
+## v0.12.3: the correction that could never succeed, and the undo that could never undo
+
+With replies reaching the matcher at last (v0.12.2), the first correction to
+arrive at the model failed with "model response has no totals". So did the
+second, on the right meal. A reproduction with the real model showed why, five
+times out of five: the correction prompt asked for "the SAME schema" as the
+previous estimate but showed only the previous nutrient map, and the model
+answered in that shape. No correction had ever succeeded. The tests had passed
+because their stand-in model returned the full schema whatever it was shown.
+A stand-in that ignores its input cannot catch a prompt that misleads the model.
+The new tests assert what the model is shown, and the release was checked
+against the real model on real meals.
+
+Fixing the shape alone would have made things worse. With only numbers to go
+on and a rule that "the correction wins", the model asked to swap one spread
+for another in a meal that had neither invented the spread and subtracted it:
+a silent wrong edit where there had been a loud failure. Given the full
+previous estimate, it noticed the mismatch but could say so only in `notes`
+while returning the numbers unchanged, and the server would have stored a
+do-nothing extraction. So the prompt now has an explicit second answer,
+`{"mismatch": true, "reason": …}`, which writes nothing, and "the correction
+wins" is narrowed to what a food on the plate was and how much of it there was.
+Every reply now names the meal it acted on, from the stored description and
+time. A correction bound to the wrong photo is then visible where it happens:
+in the chat.
+
+`no` had the mirror-image problem. It looked only at meals waiting for
+confirmation, and since v0.11 saves meals on arrival there are none, so the
+one undo every estimate advertises answered "nothing waiting" and changed
+nothing. It now voids the saved meal it replies to. It is deliberately stricter
+than a correction about guessing: a reply to something that is not a meal never
+falls back to "the only recent meal", because a wrong removal is worse than
+asking again.
+
+Deferred: keeping a failed correction's raw model answer somewhere durable. It
+is returned now, but it has no home. It doesn't belong in `meal_extractions`
+(an extraction counts towards the correction cap), nor in the log (a plaintext
+copy of meal data). It needs its own table, and so a storage review first.

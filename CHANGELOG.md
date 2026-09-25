@@ -6,6 +6,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 For the architectural rationale behind each change, see [DECISIONS.md](DECISIONS.md).
 
+## [0.12.3] — 2026-09-25
+
+### Fixed
+
+- **Corrections work.** None ever had: the correction prompt showed the model
+  only the previous nutrient map and asked for "the SAME schema", so it
+  answered with a flat map, which has no `totals`, and every correction failed
+  with "model response has no totals". The model now gets the whole previous
+  estimate (description, items, totals, confidence) and the meal's time, and
+  the correction prompt (`meal-correction-v2`) shares the photo prompt's
+  schema so the two cannot drift.
+- **A correction can say it is about a different meal.** A reply to the wrong
+  photo used to leave the model two bad options: invent the food in order to
+  subtract it, or change nothing and hide the objection in `notes`. It can now
+  answer `{"mismatch": true, "reason": …}`, which writes nothing and says so.
+  Verified on real meals before release: the wrong meal answered "mismatch"
+  in 2 of 2 runs, the right one was amended in 2 of 2.
+- **`no` removes a saved meal.** It only looked at meals waiting for
+  confirmation, of which there have been none since meals started saving on
+  arrival, so it answered "There's nothing waiting to be confirmed." and the
+  meal kept counting. It now voids the meal whose estimate or photo it replies
+  to. A reply to a message that is not a meal never falls back to "the only
+  recent one", because removing is destructive.
+- **Every reply names its meal**, from the stored description and time:
+  `"Chicken bowl" (Mon 5 Jan, 12:30)`. Failures are plain words ("I couldn't
+  apply that to …, so nothing changed"), with the technical reason in the log
+  only.
+- **Stricter correction parsing.** A correction answering `not_food`, empty
+  totals or no energy fails instead of re-projecting a counted meal as zeros.
+  The model's raw answer is kept in the result on failure too.
+- `JSON.parse` errors no longer quote the model's text into the log.
+
 ## [0.12.2] — 2026-09-25
 
 ### Fixed
