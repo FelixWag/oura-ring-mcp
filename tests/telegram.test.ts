@@ -518,4 +518,34 @@ describe('replies', () => {
     processBatch([update(10, { text: 'a different spread' })], repo, CONFIG);
     expect(replyTargetOf(storedRow(10)!.raw)).toBeUndefined();
   });
+
+  // Found in review: an edited reply read back with no target, and with one
+  // other recent meal the "only candidate" fallback would bind to that one.
+  it('keeps the target of an edited reply', () => {
+    processBatch(
+      [
+        {
+          update_id: 11,
+          edited_message: message({
+            message_id: 905,
+            text: 'a different spread',
+            reply_to_message: botEstimate(903),
+          }),
+        },
+      ],
+      repo,
+      CONFIG,
+    );
+    expect(replyTargetOf(storedRow(11)!.raw)).toBe(903);
+  });
+
+  it('treats anything but a positive integer id as no target', () => {
+    const raw = (id: unknown) =>
+      JSON.stringify({ message: { reply_to_message: { message_id: id } } });
+    expect(replyTargetOf(raw(null))).toBeUndefined();
+    expect(replyTargetOf(raw('903'))).toBeUndefined();
+    expect(replyTargetOf(raw(-1))).toBeUndefined();
+    expect(replyTargetOf(raw(1.5))).toBeUndefined();
+    expect(replyTargetOf(raw(903))).toBe(903);
+  });
 });

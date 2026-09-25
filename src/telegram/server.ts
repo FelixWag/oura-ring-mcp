@@ -80,7 +80,7 @@ export function redactNested(update: TelegramUpdate): TelegramUpdate {
     // reply to a meal, and it carries no one's name or words. Deleting it too
     // made every reply arrive as a bare message: from v0.11 to v0.12.1 no
     // correction or "no" could name its meal, and each asked "which meal?".
-    const replyTo = message.reply_to_message?.message_id;
+    const replyTo = asMessageId(message.reply_to_message?.message_id);
     delete message.reply_to_message;
     delete message.quote;
     if (replyTo !== undefined) {
@@ -91,13 +91,25 @@ export function redactNested(update: TelegramUpdate): TelegramUpdate {
 }
 
 /**
+ * A Telegram message id, or undefined. Telegram always sends a positive
+ * integer; anything else (a `null` would match a meal whose prompt was never
+ * sent, since `prompt_message_id` is NULL there) is treated as no target.
+ */
+function asMessageId(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : undefined;
+}
+
+/**
  * The message a stored text replied to, if any — read from the redacted `raw`
  * that `redactNested` produced. One reader, shared with the tests, so the id
- * the matcher sees is the id that storage actually kept.
+ * the matcher sees is the id that storage actually kept. Edits too: an edited
+ * reply without its target would fall back to "the only recent meal", which
+ * can be a different one.
  */
 export function replyTargetOf(raw: string): number | undefined {
-  const parsed = JSON.parse(raw) as { message?: { reply_to_message?: { message_id?: number } } };
-  return parsed.message?.reply_to_message?.message_id;
+  type Stored = { reply_to_message?: { message_id?: unknown } };
+  const parsed = JSON.parse(raw) as { message?: Stored; edited_message?: Stored };
+  return asMessageId((parsed.message ?? parsed.edited_message)?.reply_to_message?.message_id);
 }
 
 export function classifyMessage(message: TelegramMessage): ClassifiedMessage {

@@ -17,7 +17,9 @@ For the architectural rationale behind each change, see [DECISIONS.md](DECISIONS
   reply therefore arrived as a bare message, so after two photos any
   correction asked "which meal do you mean?". Only the numeric `message_id` is
   kept now; the quoted message itself is still dropped. Read through a single
-  exported `replyTargetOf()`.
+  exported `replyTargetOf()`, which also reads edited messages (an edited
+  reply without its target could otherwise fall back to a different meal) and
+  accepts only a positive integer id.
 - **The "which meal" reply says what happened.** It no longer lists meals by
   name — which invited an answer by name that nothing reads — and says instead
   that nothing was changed and to reply to the meal's "Saved:" message.
