@@ -1094,9 +1094,14 @@ from the owner's own chat: a forward (its text and its sender's id and name), a
 reply to a message from another chat (`external_reply`), and a shared contact
 card. Redaction now removes all three. A forward keeps only the kind of its
 origin, so the record still says a message was forwarded, just not by whom.
-This remains a list of known shapes, not a guarantee. A field Telegram adds
-later would pass through, which is why the tests are written as "this
-stranger's name must not appear" rather than "this key is absent".
+For forwards the rule became an allowlist: nothing reads a forward's content,
+so keeping only its id, time, chat, sender and album loses nothing, and the
+names of the dropped keys keep an unknown kind visible. The owner's own
+messages stay a list of known shapes, because their content has to stay
+lossless: stories, pinned messages, giveaways and the user record behind a
+name mention were added after review. A field Telegram adds later would pass
+through, which is why the tests are written as "this stranger's name must not
+appear" rather than "this key is absent".
 
 Edits were the other finding. An edit arrives as a new row for the same message,
 and the loops that act on messages picked it up like a new one. For a
@@ -1105,4 +1110,6 @@ For a photo whose caption was edited, it created a second meal from the same
 photo, and both counted. An edit of a message the bot has already acted on is
 now recorded, marked handled, and answered: the reply says the edit was not
 applied and how to make the change instead. An edit that arrives before the
-original was handled still replaces it, as before.
+original was handled still replaces it, as before. The check is scoped by bot:
+message ids in a private chat are numbered per bot and restart at 1, so without
+it a new bot's messages would be mistaken for edits of the old bot's.

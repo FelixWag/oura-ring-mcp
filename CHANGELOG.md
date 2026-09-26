@@ -14,14 +14,18 @@ For the architectural rationale behind each change, see [DECISIONS.md](DECISIONS
   raw update kept a forward's text and origin (sender's id and name), a reply
   to a message in another chat (`external_reply`, which names that chat's
   sender), and a shared contact card (someone's name and phone number). All
-  are now dropped before storage; a forward keeps only the kind of origin, so
-  "this was forwarded" survives without "from whom".
+  are now dropped before storage, along with shared stories, pinned messages,
+  giveaways and the person behind a name mention. A forward keeps only an
+  allowlist (id, time, chat, sender, album) plus its kind of origin and the
+  names of the keys it dropped, so "this was forwarded" survives without
+  "from whom".
 - **An edit never re-runs a message the bot already acted on.** An edit
   arrives as a new row for the same message, and the drain loops acted on it
   again: an edited correction was applied on top of its own result, and an
   edited photo caption created a second meal from the same photo that counted
   twice. Such edits are now recorded and answered ("I haven't re-run the
-  edit — reply to the meal's Saved: message"), not re-run.
+  edit"), not re-run. Scoped by bot, because message ids restart at 1 for a
+  new bot; the older edit-supersede query gets the same scoping.
 
 ## [0.12.3] — 2026-09-25
 

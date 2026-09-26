@@ -67,49 +67,71 @@ export function isForwarded(message: TelegramMessage): boolean {
 }
 
 /**
+ * What a forward keeps: that it arrived, when, in which chat. Everything else
+ * — text, caption, media names, story, poll, origin — is someone else's, and
+ * nothing reads a forward's content (it is classified 'other' and its media
+ * is never downloaded), so an allowlist loses nothing. The names of dropped
+ * keys are kept, so an unknown kind stays visible rather than silent.
+ */
+const KEPT_FORWARD_KEYS = new Set([
+  'message_id',
+  'date',
+  'edit_date',
+  'chat',
+  'from',
+  'media_group_id',
+]);
+
+/**
+ * Other people carried inside the owner's own messages. A list of known
+ * shapes, not a guarantee: the owner's own content has to stay lossless, so an
+ * allowlist would lose it whenever Telegram adds a field.
+ */
+const THIRD_PARTY_KEYS = [
+  'quote', // the quoted part of a replied-to message
+  'external_reply', // a reply to a message in another chat: names its sender
+  'contact', // a contact card: someone's name, phone number, user id
+  'story', // a shared story: its poster's chat
+  'reply_to_story',
+  'pinned_message', // a whole nested message, forwards included
+  'users_shared',
+  'chat_shared',
+  'giveaway',
+  'giveaway_winners', // a list of users
+  'checklist', // tasks record who completed them
+] as const;
+
+/**
  * Strip a nested third party out of an update before it is stored.
  *
  * `reply_to_message` and `quote` embed another person's message wholesale —
  * their user id, their name, their words — inside an update whose envelope is
  * the owner's. "Nothing about a third party is stored" has to survive the
- * nesting, not just the top level.
+ * nesting, not just the top level — and forwards, contacts, stories and
+ * replies to other chats are nestings too.
  */
-/** Everything that says who a forwarded message came from. */
-const FORWARD_FIELDS = [
-  'forward_origin',
-  'forward_from',
-  'forward_from_chat',
-  'forward_sender_name',
-  'forward_signature',
-  'forward_date',
-  'via_bot',
-] as const;
-
 export function redactNested(update: TelegramUpdate): TelegramUpdate {
   const clean = JSON.parse(JSON.stringify(update)) as TelegramUpdate;
   for (const message of [clean.message, clean.edited_message]) {
     if (!message) continue;
+    const fields = message as unknown as Record<string, unknown>;
 
-    // Other people, carried inside the owner's own message: a reply to a
-    // message in another chat names that chat's sender, and a contact card is
-    // someone else's name and phone number.
-    delete message.external_reply;
-    delete message.contact;
-
-    // A forward's words and origin are someone else's. The indexed `text`
-    // column was already nulled for forwards; `raw` kept both. Keep only the
-    // KIND of origin, which says "forwarded" without saying from whom.
     if (isForwarded(message)) {
       const origin = message.forward_origin as { type?: unknown } | undefined;
       const originType = typeof origin?.type === 'string' ? origin.type : 'unknown';
-      for (const field of FORWARD_FIELDS) delete message[field];
-      delete message.text;
-      delete message.caption;
-      delete message.entities;
-      delete message.caption_entities;
-      (message as TelegramMessage & { forwarded?: unknown }).forwarded = {
-        origin_type: originType,
-      };
+      const dropped = Object.keys(fields).filter((key) => !KEPT_FORWARD_KEYS.has(key));
+      for (const key of dropped) delete fields[key];
+      fields['forwarded'] = { origin_type: originType, dropped_keys: dropped.sort() };
+      continue;
+    }
+
+    for (const key of THIRD_PARTY_KEYS) delete fields[key];
+    // A mention by name (`text_mention`) carries that person's user record;
+    // text pasted from a group can bring one along. Keep where it is, drop who.
+    for (const key of ['entities', 'caption_entities'] as const) {
+      const entities = fields[key];
+      if (!Array.isArray(entities)) continue;
+      for (const entity of entities as Array<Record<string, unknown>>) delete entity['user'];
     }
 
     // Keep the id, drop the message. The id is the only thing that binds a
@@ -118,7 +140,6 @@ export function redactNested(update: TelegramUpdate): TelegramUpdate {
     // correction or "no" could name its meal, and each asked "which meal?".
     const replyTo = asMessageId(message.reply_to_message?.message_id);
     delete message.reply_to_message;
-    delete message.quote;
     if (replyTo !== undefined) {
       message.reply_to_message = { message_id: replyTo } as TelegramMessage;
     }
@@ -404,22 +425,27 @@ function withDetail(line: string, detail: string | undefined): string {
  */
 export function isEditOfHandledMessage(
   db: Db,
-  row: { id: number; chat_id: number; message_id: number },
+  row: { id: number; bot_id: number; chat_id: number; message_id: number },
 ): boolean {
+  // bot_id: message ids are numbered per bot and restart at 1 for a new bot,
+  // so without it a new bot's messages would collide with the old bot's.
   return (
     db
       .prepare(
         `SELECT 1 FROM telegram_updates
-          WHERE chat_id = ? AND message_id = ? AND id <> ? AND extracted_at IS NOT NULL
+          WHERE bot_id = ? AND chat_id = ? AND message_id = ? AND id <> ?
+            AND extracted_at IS NOT NULL
           LIMIT 1`,
       )
-      .get(row.chat_id, row.message_id, row.id) !== undefined
+      .get(row.bot_id, row.chat_id, row.message_id, row.id) !== undefined
   );
 }
 
+// General on purpose: the original may have been a failed photo or a question,
+// so there is not always a "Saved:" message to point at.
 const EDIT_NOT_RERUN =
-  "I've already acted on that message, so I haven't re-run the edit. To change a " +
-  'meal, reply to its "Saved:" message with what to change.';
+  "I've already answered that message, so I haven't re-run the edit. Send the " +
+  'change as a new message, or reply to the meal\'s "Saved:" message.';
 
 /** Mark a row handled without acting on it, and tell the user why. */
 async function skipEdit(
@@ -451,8 +477,8 @@ async function drainPhotos(
   log: (line: string) => Promise<void>,
 ): Promise<void> {
   const rows = db
-    .prepare<[], { id: number; chat_id: number; message_id: number }>(
-      `SELECT t.id, t.chat_id, t.message_id FROM telegram_updates t
+    .prepare<[], { id: number; bot_id: number; chat_id: number; message_id: number }>(
+      `SELECT t.id, t.bot_id, t.chat_id, t.message_id FROM telegram_updates t
         WHERE t.status = 'stored' AND t.kind IN ('photo', 'document')
           AND t.media_path IS NOT NULL AND t.superseded_by IS NULL
           AND t.extracted_at IS NULL
@@ -460,8 +486,8 @@ async function drainPhotos(
     )
     .all();
 
-  for (const { id, chat_id, message_id } of rows) {
-    if (isEditOfHandledMessage(db, { id, chat_id, message_id })) {
+  for (const { id, bot_id, chat_id, message_id } of rows) {
+    if (isEditOfHandledMessage(db, { id, bot_id, chat_id, message_id })) {
       await skipEdit(db, client, config, log, 'photo', id);
       continue;
     }
@@ -518,6 +544,7 @@ export async function drainText(
       [],
       {
         id: number;
+        bot_id: number;
         chat_id: number;
         message_id: number;
         text: string | null;
@@ -525,7 +552,7 @@ export async function drainText(
         is_forwarded: number;
       }
     >(
-      `SELECT id, chat_id, message_id, text, raw, is_forwarded FROM telegram_updates
+      `SELECT id, bot_id, chat_id, message_id, text, raw, is_forwarded FROM telegram_updates
         WHERE kind = 'text' AND extracted_at IS NULL AND superseded_by IS NULL
         ORDER BY id LIMIT 5`,
     )
