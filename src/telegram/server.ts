@@ -29,6 +29,8 @@ import {
 import { TelegramClient, type TelegramMessage, type TelegramUpdate } from './client.js';
 import { downloadMedia } from './media.js';
 import { MealsRepo } from '../db/repos/meals.js';
+import { BotMessagesRepo, type BotMessageKind } from '../db/repos/bot_messages.js';
+import type { QueryRunner } from './extractor.js';
 import {
   processPhoto,
   readConfirmation,
@@ -447,6 +449,44 @@ const EDIT_NOT_RERUN =
   "I've already answered that message, so I haven't re-run the edit. Send the " +
   'change as a new message, or reply to the meal\'s "Saved:" message.';
 
+/**
+ * Send a reply and record it, so a later reply to THIS message can find its
+ * meal. Only the first estimate used to be remembered; a reply to "Updated:"
+ * or "Removed" matched nothing.
+ */
+async function sendAndRecord(
+  db: Db,
+  client: TelegramClient,
+  config: TelegramConfig,
+  text: string,
+  meta: {
+    kind: BotMessageKind;
+    meal_id?: number | undefined;
+    answers_update_id?: number | undefined;
+    model_call_id?: number | undefined;
+  },
+): Promise<number | null> {
+  const messageId = await client.sendMessage(config.allowedChatId, text);
+  if (messageId !== null) {
+    new BotMessagesRepo(db).record({
+      bot_id: config.botId,
+      chat_id: config.allowedChatId,
+      message_id: messageId,
+      kind: meta.kind,
+      meal_id: meta.meal_id ?? null,
+      answers_update_id: meta.answers_update_id ?? null,
+      model_call_id: meta.model_call_id ?? null,
+      text,
+    });
+  }
+  return messageId;
+}
+
+/** A log line naming the model call, when there was one. */
+function withCall(line: string, modelCallId: number | undefined): string {
+  return modelCallId === undefined ? line : `${line} (call ${modelCallId})`;
+}
+
 /** Mark a row handled without acting on it, and tell the user why. */
 async function skipEdit(
   db: Db,
@@ -461,7 +501,7 @@ async function skipEdit(
     id,
   );
   await log(`${kind} ${id}: edit of a handled message, not re-run`);
-  await client.sendMessage(config.allowedChatId, EDIT_NOT_RERUN);
+  await sendAndRecord(db, client, config, EDIT_NOT_RERUN, { kind: 'reply', answers_update_id: id });
 }
 
 /**
@@ -507,9 +547,16 @@ async function drainPhotos(
         new Date().toISOString(),
         id,
       );
-      await log(withDetail(`photo ${id}: ${result.status}`, result.detail));
+      await log(
+        withDetail(withCall(`photo ${id}: ${result.status}`, result.model_call_id), result.detail),
+      );
 
-      const promptId = await client.sendMessage(config.allowedChatId, result.reply);
+      const promptId = await sendAndRecord(db, client, config, result.reply, {
+        kind: result.status === 'extracted' ? 'estimate' : 'reply',
+        meal_id: result.meal_id,
+        answers_update_id: id,
+        model_call_id: result.model_call_id,
+      });
       // Remember which message asked, so the reply can be matched to this
       // meal. If the send failed, prompt_message_id stays NULL and
       // drainPrompts asks again — a meal nobody was told about is the silent
@@ -538,6 +585,8 @@ export async function drainText(
   client: TelegramClient,
   config: TelegramConfig,
   log: (line: string) => Promise<void>,
+  /** Tests only: a stand-in model, so the loop can run without calling one. */
+  options: { runner?: QueryRunner } = {},
 ): Promise<void> {
   const rows = db
     .prepare<
@@ -566,6 +615,7 @@ export async function drainText(
     const intent = readConfirmation(row.text, replyTargetOf(row.raw));
 
     let reply: string;
+    let meta: Parameters<typeof sendAndRecord>[4] = { kind: 'reply', answers_update_id: row.id };
     try {
       if (intent.kind === 'confirm') {
         reply = confirmPending(db, intent.replyToMessageId);
@@ -578,6 +628,11 @@ export async function drainText(
             (result.meal_id !== undefined ? ` (meal ${result.meal_id})` : ''),
         );
         reply = result.reply;
+        meta = {
+          ...meta,
+          kind: result.status === 'removed' ? 'removed' : 'reply',
+          meal_id: result.meal_id,
+        };
       } else if (intent.kind === 'correct') {
         const result = await applyCorrection(
           db,
@@ -587,11 +642,30 @@ export async function drainText(
               ? { replyToMessageId: intent.replyToMessageId }
               : {}),
             isForwarded: row.is_forwarded === 1,
+            updateId: row.id,
           },
           config.mediaDir,
+          options,
         );
-        await log(withDetail(`text ${row.id}: correction ${result.status}`, result.detail));
+        await log(
+          withDetail(
+            withCall(`text ${row.id}: correction ${result.status}`, result.model_call_id),
+            result.detail,
+          ),
+        );
         reply = result.reply;
+        const kinds: Partial<Record<typeof result.status, BotMessageKind>> = {
+          corrected: 'amended',
+          mismatch: 'mismatch',
+          ambiguous: 'ambiguous',
+          failed: 'failed',
+        };
+        meta = {
+          ...meta,
+          kind: kinds[result.status] ?? 'reply',
+          meal_id: result.meal_id,
+          model_call_id: result.model_call_id,
+        };
       } else {
         reply = 'Got it — noted.';
       }
@@ -605,7 +679,7 @@ export async function drainText(
       new Date().toISOString(),
       row.id,
     );
-    await client.sendMessage(config.allowedChatId, reply);
+    await sendAndRecord(db, client, config, reply, meta);
   }
 }
 
@@ -630,7 +704,10 @@ async function drainPrompts(
       totals,
       confidence: pending.confidence,
     });
-    const promptId = await client.sendMessage(config.allowedChatId, text);
+    const promptId = await sendAndRecord(db, client, config, text, {
+      kind: 'estimate',
+      meal_id: pending.meal_id,
+    });
     if (promptId !== null) {
       repo.setPromptMessageId(pending.meal_id, promptId);
       await log(`meal ${pending.meal_id}: asked for confirmation`);

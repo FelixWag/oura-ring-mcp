@@ -153,11 +153,14 @@ export function buildVoiceApp(deps: VoiceServerDeps): express.Express {
       // voice_log. We use a time-window UPDATE rather than parsing every
       // tool result — sufficient because runs are sequential per voice_log
       // and the dedupe + per-call locking prevents overlap in normal use.
+      // Not a note that came in over Telegram during the same window: it has
+      // its own provenance, and claiming it would mislink it to a dictation.
       const updated = db
         .prepare(
           `UPDATE annotations
               SET voice_log_id = ?
             WHERE voice_log_id IS NULL
+              AND telegram_update_id IS NULL
               AND source = 'local'
               AND created_at >= ?
               AND created_at <= ?`,

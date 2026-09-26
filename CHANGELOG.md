@@ -6,6 +6,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 For the architectural rationale behind each change, see [DECISIONS.md](DECISIONS.md).
 
+## [0.13.0] — 2026-09-26
+
+Foundations for routing free text (next release), and the storage guarantees
+the existing photo and correction paths were missing.
+
+### Added
+
+- **`model_calls`** (schema v18): one row per model call, whatever it decided
+  and whether it worked — purpose, outcome, the raw answer (failures
+  included), error, usage, cost and duration. Started when the call begins and
+  finished in the same transaction as whatever the call wrote; a row left
+  unfinished is a crash, now visible. The log carries only the call id.
+- **`telegram_bot_messages`** (schema v19): every message the bot sends is
+  recorded, so a reply to "Updated:" or "Removed" binds to its meal (only the
+  first estimate used to). Only messages that present a meal bind: a "no" in
+  reply to "that doesn't seem to be about X" does not remove X.
+- Columns for the routing release: `meals.time_source`, and
+  `annotations.telegram_update_id` for notes that arrive over Telegram.
+
+### Fixed
+
+- **One message is at most one meal.** A fault after the meal row was written
+  left the message unmarked, and the retry created a second meal from the
+  same photo that was counted twice. The whole save — meal, link, estimate,
+  confirmation, call outcome and the handled mark — is now one transaction,
+  and a unique key on the source message backs it up (`linkMedia` is a plain
+  INSERT, so the key cannot be silently ignored).
+- **A correction is applied at most once.** The handled mark was written
+  after the amendment committed, with a log write in between; a failure there
+  let the next cycle apply the same correction on top of itself. The mark is
+  now inside the same transaction, with a unique key as a backstop.
+- **The spend cap counts by when calls ran.** It was a counter keyed by the
+  meal's day, so corrections sent today about yesterday's meals were charged
+  to yesterday — effectively uncapped. Now a rolling 24 hours over
+  `model_calls`.
+- **A reply to a removed or too-old meal no longer falls back to "the only
+  recent meal"**, which rewrote a different meal than the one replied to.
+- The voice server's time-window linker no longer claims a Telegram note
+  written during the same window.
+- A failed model call's error names only its type; the SDK's result text is
+  no longer logged. The "numbers didn't look right" photo reply reads as a
+  sentence.
+
 ## [0.12.4] — 2026-09-26
 
 ### Fixed

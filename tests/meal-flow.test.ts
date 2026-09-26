@@ -5,10 +5,11 @@
  * No test calls a model — the runner is injected. Synthetic fixtures only.
  */
 
-import { beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { openDatabase, type Db } from '../src/db/index.js';
 import { TelegramUpdatesRepo } from '../src/db/repos/telegram_updates.ts';
 import { MealsRepo } from '../src/db/repos/meals.ts';
+import { ModelCallsRepo } from '../src/db/repos/model_calls.ts';
 import { correctMeal, parseCorrection, parseExtraction } from '../src/telegram/extractor.ts';
 import { buildMealSystemPrompt, buildMealUserPrompt } from '../src/telegram/prompts.ts';
 import {
@@ -20,7 +21,6 @@ import {
   mealLabel,
   localDayAndTime,
   extractionBudget,
-  recordExtraction,
   formatEstimate,
   DAILY_EXTRACTION_CAP,
   MAX_CORRECTION_DEPTH,
@@ -32,6 +32,22 @@ let db: Db;
 beforeEach(async () => {
   db = await openDatabase(':memory:');
 });
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
+
+const modelCalls = () =>
+  db.prepare('SELECT * FROM model_calls ORDER BY id').all() as Array<{
+    purpose: string;
+    outcome: string | null;
+    meal_id: number | null;
+    extraction_id: number | null;
+    telegram_update_id: number | null;
+    raw_response: string | null;
+    error: string | null;
+  }>;
+const count = (sql: string) => (db.prepare(sql).get() as { n: number }).n;
 
 const GOOD_RESPONSE = JSON.stringify({
   description: 'chicken bowl',
@@ -47,14 +63,16 @@ const GOOD_RESPONSE = JSON.stringify({
 
 function photoRow(overrides: Partial<TelegramUpdateRow> = {}): TelegramUpdateRow {
   const repo = new TelegramUpdatesRepo(db);
+  // A distinct update_id makes a distinct message: one message is one meal.
+  const updateId = overrides.update_id ?? 1;
   repo.storeBatch(
     1,
     [
       {
         bot_id: 1,
-        update_id: 1,
+        update_id: updateId,
         chat_id: 42,
-        message_id: 900,
+        message_id: overrides.message_id ?? 900,
         kind: 'photo',
         text: 'lunch',
         sent_epoch: Math.floor(Date.now() / 1000) - 3600,
@@ -70,8 +88,8 @@ function photoRow(overrides: Partial<TelegramUpdateRow> = {}): TelegramUpdateRow
     0,
   );
   const row = db
-    .prepare('SELECT * FROM telegram_updates WHERE update_id = 1')
-    .get() as TelegramUpdateRow;
+    .prepare('SELECT * FROM telegram_updates WHERE update_id = ?')
+    .get(updateId) as TelegramUpdateRow;
   db.prepare("UPDATE telegram_updates SET media_path = '2026/01/01/abc.jpg' WHERE id = ?").run(
     row.id,
   );
@@ -292,17 +310,91 @@ describe('processing a photo', () => {
     expect(db.prepare('SELECT COUNT(*) AS n FROM meal_extractions').get()).toMatchObject({ n: 0 });
   });
 
+  it('records the call with its outcome, and marks the message in the same write', async () => {
+    const row = photoRow();
+    const result = await processPhoto(db, row, '/media', { runner });
+
+    const [call] = modelCalls();
+    expect(call).toMatchObject({
+      purpose: 'extract_photo',
+      outcome: 'ok',
+      meal_id: result.meal_id,
+      telegram_update_id: row.id,
+      raw_response: GOOD_RESPONSE,
+    });
+    expect(call!.extraction_id).not.toBeNull();
+    expect(result.model_call_id).toBeDefined();
+    const marked = db
+      .prepare('SELECT extracted_at FROM telegram_updates WHERE id = ?')
+      .get(row.id) as {
+      extracted_at: string | null;
+    };
+    expect(marked.extracted_at).not.toBeNull();
+  });
+
+  // Failures used to leave no trace outside the plaintext log.
+  it('keeps what the model said when a photo cannot be read', async () => {
+    const row = photoRow();
+    await processPhoto(db, row, '/media', { runner: async () => 'not json at all' });
+
+    expect(modelCalls()[0]).toMatchObject({
+      purpose: 'extract_photo',
+      outcome: 'failed',
+      raw_response: 'not json at all',
+      error: 'no JSON object in model response',
+    });
+  });
+
+  // As separate commits, a fault after the meal row existed left the message
+  // unmarked, and the retry created a second meal from the same photo that
+  // was counted twice.
+  it('leaves nothing behind when the save fails half-way, so a retry makes one meal', async () => {
+    const row = photoRow();
+    vi.spyOn(MealsRepo.prototype, 'confirm').mockImplementationOnce(() => {
+      throw new Error('disk I/O error');
+    });
+
+    await expect(processPhoto(db, row, '/media', { runner })).rejects.toThrow('disk I/O');
+    expect(count('SELECT COUNT(*) AS n FROM meals')).toBe(0);
+    expect(count('SELECT COUNT(*) AS n FROM meal_media')).toBe(0);
+    expect(count('SELECT COUNT(*) AS n FROM telegram_updates WHERE extracted_at IS NOT NULL')).toBe(
+      0,
+    );
+    expect(modelCalls().map((c) => c.outcome)).toEqual([null]); // visible as a crashed call
+
+    const retry = await processPhoto(db, row, '/media', { runner });
+    expect(retry.status).toBe('extracted');
+    expect(count('SELECT COUNT(*) AS n FROM meals')).toBe(1);
+    expect(count('SELECT COUNT(*) AS n FROM health_samples WHERE meal_id IS NOT NULL')).toBe(4);
+  });
+
   it('says so when the daily cap is reached rather than going quiet', async () => {
     // A photo silently not processed is believed to be logged.
     const row = photoRow();
-    const [day] = localDayAndTime(row.sent_epoch, row.tz_assumed);
-    for (let i = 0; i < DAILY_EXTRACTION_CAP; i += 1) recordExtraction(db, day);
+    const calls = new ModelCallsRepo(db);
+    for (let i = 0; i < DAILY_EXTRACTION_CAP; i += 1) {
+      calls.start({ purpose: 'extract_photo', model: 'm', prompt_version: 'v' });
+    }
 
     const result = await processPhoto(db, row, '/media', { runner });
 
     expect(result.status).toBe('capped');
     expect(result.reply).toContain('limit');
-    expect(extractionBudget(db, day).remaining).toBe(0);
+    expect(extractionBudget(db).remaining).toBe(0);
+  });
+
+  // The cap used to be a counter keyed by the MEAL's day, so a correction sent
+  // today about yesterday's dinner was charged to yesterday: uncapped today.
+  it('counts calls by when they ran, over the last 24 hours', () => {
+    const calls = new ModelCallsRepo(db);
+    calls.start({ purpose: 'correct', model: 'm', prompt_version: 'v' });
+    const old = calls.start({ purpose: 'extract_photo', model: 'm', prompt_version: 'v' });
+    db.prepare('UPDATE model_calls SET started_epoch = started_epoch - 25 * 3600 WHERE id = ?').run(
+      old,
+    );
+    calls.start({ purpose: 'route', model: 'm', prompt_version: 'v' }); // not an estimate
+
+    expect(extractionBudget(db).used).toBe(1);
   });
 
   it('reports a not-food photo instead of inventing a meal', async () => {
@@ -480,11 +572,8 @@ describe('corrections', () => {
 
   it('asks which meal when two are correctable and no reply target is given', async () => {
     await savedMeal();
-    const second = photoRow();
-    db.prepare('UPDATE telegram_updates SET update_id = 2, message_id = 901 WHERE id = ?').run(
-      second.id,
-    );
-    await processPhoto(db, { ...second, message_id: 901 }, '/media', { runner });
+    const second = photoRow({ update_id: 2, message_id: 901 });
+    await processPhoto(db, second, '/media', { runner });
 
     const result = await applyCorrection(
       db,
@@ -626,6 +715,72 @@ describe('corrections', () => {
     expect(result.status).toBe('corrected');
     expect(result.reply.startsWith('Updated "chicken bowl"')).toBe(true);
     expect(result.reply).toContain(meal.local_time.slice(0, 5));
+  });
+
+  it('records the correction call and marks its message in the same write', async () => {
+    const mealId = await savedMeal();
+    const text = photoRow({ update_id: 7, message_id: 907 }); // stands in for the text row
+
+    const result = await applyCorrection(
+      db,
+      { text: 'bigger portion', isForwarded: false, updateId: text.id },
+      '/media',
+      { runner: async () => CORRECTED },
+    );
+
+    expect(result.status).toBe('corrected');
+    const correction = modelCalls().find((c) => c.purpose === 'correct');
+    expect(correction).toMatchObject({
+      outcome: 'ok',
+      meal_id: mealId,
+      telegram_update_id: text.id,
+      raw_response: CORRECTED,
+    });
+    expect(correction!.extraction_id).not.toBeNull();
+    const marked = db
+      .prepare('SELECT extracted_at FROM telegram_updates WHERE id = ?')
+      .get(text.id) as {
+      extracted_at: string | null;
+    };
+    expect(marked.extracted_at).not.toBeNull();
+  });
+
+  it('records a mismatch with its raw answer, without spending a correction', async () => {
+    const mealId = await savedMeal();
+    const answer = '{"mismatch": true, "reason": "No rice here."}';
+
+    await applyCorrection(db, { text: 'the rice was quinoa', isForwarded: false }, '/media', {
+      runner: async () => answer,
+    });
+
+    expect(modelCalls().find((c) => c.purpose === 'correct')).toMatchObject({
+      outcome: 'mismatch',
+      extraction_id: null,
+      raw_response: answer,
+    });
+    expect(
+      db.prepare('SELECT COUNT(*) AS n FROM meal_extractions WHERE meal_id = ?').get(mealId),
+    ).toMatchObject({ n: 1 });
+  });
+
+  // Backstop for a re-run of an already-handled message: one message amends
+  // a given meal at most once, even if something runs it twice.
+  it('never stores two amendments of one meal from the same message', async () => {
+    const mealId = await savedMeal();
+    const text = photoRow({ update_id: 7, message_id: 907 });
+    const correct = () =>
+      applyCorrection(
+        db,
+        { text: 'bigger portion', isForwarded: false, updateId: text.id },
+        '/media',
+        { runner: async () => CORRECTED },
+      );
+
+    expect((await correct()).status).toBe('corrected');
+    expect((await correct()).status).toBe('failed');
+    expect(
+      db.prepare('SELECT COUNT(*) AS n FROM meal_extractions WHERE meal_id = ?').get(mealId),
+    ).toMatchObject({ n: 2 });
   });
 
   it('refuses to amend a voided meal instead of silently not counting it', async () => {

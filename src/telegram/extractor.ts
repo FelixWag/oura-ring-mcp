@@ -42,7 +42,7 @@ export interface ExtractedMeal {
 }
 
 /** A photo extraction. */
-export interface ExtractionResult {
+export interface ExtractionResult extends Partial<CallMetrics> {
   ok: boolean;
   error?: string;
   meal?: ExtractedMeal;
@@ -58,16 +58,16 @@ export interface ExtractionResult {
  * checking in the wrong order, or drop an empty-reason mismatch with a truthy
  * test.
  */
-export type CorrectionOutcome = {
+export type CorrectionOutcome = Partial<CallMetrics> & {
   model: string;
   prompt_version: string;
   /** What the model said — kept on failure too, which is when it is needed. */
   raw_response?: string;
 } & (
-  | { kind: 'amended'; meal: ExtractedMeal }
-  | { kind: 'mismatch'; reason: string }
-  | { kind: 'failed'; error: string }
-);
+    | { kind: 'amended'; meal: ExtractedMeal }
+    | { kind: 'mismatch'; reason: string }
+    | { kind: 'failed'; error: string }
+  );
 
 /** Injected in tests so the suite never calls a model. */
 export type QueryRunner = (args: {
@@ -76,7 +76,36 @@ export type QueryRunner = (args: {
   /** Empty for a text-only correction of a meal with no stored photo. */
   photoPath: string;
   model: string;
-}) => Promise<string>;
+}) => Promise<string | RunnerOutput>;
+
+/** What a runner returns: the answer, plus usage when the real SDK reports it. */
+export interface RunnerOutput {
+  text: string;
+  usage?: unknown;
+  cost_usd?: number;
+}
+
+/** What every model call reports for its `model_calls` row. */
+export interface CallMetrics {
+  usage?: unknown;
+  cost_usd?: number;
+  duration_ms: number;
+}
+
+async function run(
+  runner: QueryRunner,
+  args: Parameters<QueryRunner>[0],
+): Promise<{ text: string } & CallMetrics> {
+  const t0 = Date.now();
+  const out = await runner(args);
+  const { text, usage, cost_usd } = typeof out === 'string' ? { text: out } : out;
+  return {
+    text,
+    duration_ms: Date.now() - t0,
+    ...(usage !== undefined ? { usage } : {}),
+    ...(cost_usd !== undefined ? { cost_usd } : {}),
+  };
+}
 
 /**
  * Pinned: sessions load no settings (src/agent/session.ts), so anything left
@@ -192,11 +221,17 @@ export async function extractMeal(
   const userPrompt = buildMealUserPrompt(ctx);
 
   let raw: string | undefined;
+  let metrics: Partial<CallMetrics> = {};
   try {
-    const runner = options.runner ?? defaultRunner;
-    raw = await runner({ systemPrompt, userPrompt, photoPath: ctx.photoPath, model });
+    const out = await run(options.runner ?? defaultRunner, {
+      systemPrompt,
+      userPrompt,
+      photoPath: ctx.photoPath,
+      model,
+    });
+    ({ text: raw, ...metrics } = out);
     const meal = parseExtraction(raw);
-    return { ok: true, meal, model, prompt_version: PROMPT_VERSION, raw_response: raw };
+    return { ok: true, meal, model, prompt_version: PROMPT_VERSION, raw_response: raw, ...metrics };
   } catch (err) {
     return {
       ok: false,
@@ -204,6 +239,7 @@ export async function extractMeal(
       model,
       prompt_version: PROMPT_VERSION,
       ...(raw !== undefined ? { raw_response: raw } : {}),
+      ...metrics,
     };
   }
 }
@@ -227,13 +263,20 @@ export async function correctMeal(
   const base = { model, prompt_version: CORRECTION_PROMPT_VERSION };
 
   let raw: string | undefined;
+  let metrics: Partial<CallMetrics> = {};
   try {
-    const runner = options.runner ?? defaultRunner;
-    raw = await runner({ systemPrompt, userPrompt, photoPath: ctx.photoPath, model });
-    return { ...base, ...parseCorrection(raw), raw_response: raw };
+    const out = await run(options.runner ?? defaultRunner, {
+      systemPrompt,
+      userPrompt,
+      photoPath: ctx.photoPath,
+      model,
+    });
+    ({ text: raw, ...metrics } = out);
+    return { ...base, ...metrics, ...parseCorrection(raw), raw_response: raw };
   } catch (err) {
     return {
       ...base,
+      ...metrics,
       kind: 'failed',
       error: (err as Error).message,
       ...(raw !== undefined ? { raw_response: raw } : {}),
@@ -275,21 +318,23 @@ const defaultRunner: QueryRunner = async ({ systemPrompt, userPrompt, photoPath,
   });
 
   let answer = '';
+  let usage: unknown;
+  let cost_usd: number | undefined;
   for await (const message of iterator) {
     if (message.type === 'assistant' && message.message?.content) {
       for (const block of message.message.content) {
         if (block.type === 'text') answer += block.text;
       }
     }
-    if (message.type === 'result' && message.subtype !== 'success') {
-      throw new Error(
-        'result' in message && typeof message.result === 'string'
-          ? message.result
-          : 'extraction failed',
-      );
+    if (message.type === 'result') {
+      usage = message.usage;
+      cost_usd = message.total_cost_usd;
+      // The subtype, not `result`: this error is logged, and whether the SDK
+      // puts model text into `result` on failure is not something to rely on.
+      if (message.subtype !== 'success') throw new Error(`model call ended: ${message.subtype}`);
     }
   }
 
   if (!answer.trim()) throw new Error('model returned no text');
-  return answer;
+  return { text: answer, usage, ...(cost_usd !== undefined ? { cost_usd } : {}) };
 };

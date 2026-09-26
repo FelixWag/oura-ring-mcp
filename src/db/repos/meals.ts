@@ -217,11 +217,16 @@ export class MealsRepo {
     return tx();
   }
 
+  /**
+   * Link a meal to the message it came from.
+   *
+   * A plain INSERT, deliberately: one source message creates at most one meal
+   * (idx_meal_media_source), and OR IGNORE would turn that guard into a silent
+   * no-op while a duplicate meal went on counting. Throws on a duplicate.
+   */
   linkMedia(mealId: number, sourceKind: SourceKind, sourceId: number): void {
     this.db
-      .prepare(
-        `INSERT OR IGNORE INTO meal_media (meal_id, source_kind, source_id) VALUES (?, ?, ?)`,
-      )
+      .prepare(`INSERT INTO meal_media (meal_id, source_kind, source_id) VALUES (?, ?, ?)`)
       .run(mealId, sourceKind, sourceId);
   }
 
@@ -371,17 +376,24 @@ export class MealsRepo {
     meal_id: number;
     source_id: number;
     prompt_message_id: number | null;
+    /**
+     * The bot's messages that PRESENT this meal ("Saved:", "Updated:"), so a
+     * reply to any of them binds. Not messages that merely mention it — a
+     * reply "no" to "that doesn't seem to be about X" must not remove X.
+     */
+    bot_message_ids: number[];
     description: string | null;
     depth: number;
   }> {
     const cutoff = Math.floor(Date.now() / 1000) - withinHours * 3600;
-    return this.db
+    const rows = this.db
       .prepare<
         [number, number],
         {
           meal_id: number;
           source_id: number;
           prompt_message_id: number | null;
+          bot_message_ids: string | null;
           description: string | null;
           depth: number;
         }
@@ -389,6 +401,8 @@ export class MealsRepo {
         `SELECT m.id AS meal_id,
                 COALESCE(t.message_id, 0) AS source_id,
                 m.prompt_message_id AS prompt_message_id,
+                (SELECT group_concat(b.message_id) FROM telegram_bot_messages b
+                  WHERE b.meal_id = m.id AND b.kind IN ('estimate', 'amended')) AS bot_message_ids,
                 e.description AS description,
                 (SELECT COUNT(*) FROM meal_extractions x WHERE x.meal_id = m.id) - 1 AS depth
            FROM meals m
@@ -399,6 +413,10 @@ export class MealsRepo {
           ORDER BY m.eaten_epoch DESC LIMIT ?`,
       )
       .all(cutoff, limit);
+    return rows.map((row) => ({
+      ...row,
+      bot_message_ids: row.bot_message_ids ? row.bot_message_ids.split(',').map(Number) : [],
+    }));
   }
 
   /**
@@ -410,15 +428,20 @@ export class MealsRepo {
     messageId: number,
   ): { meal_id: number; status: MealStatus; eaten_epoch: number } | undefined {
     return this.db
-      .prepare<[number, number], { meal_id: number; status: MealStatus; eaten_epoch: number }>(
+      .prepare<
+        [number, number, number],
+        { meal_id: number; status: MealStatus; eaten_epoch: number }
+      >(
         `SELECT m.id AS meal_id, m.status, m.eaten_epoch
            FROM meals m
            LEFT JOIN meal_media mm ON mm.meal_id = m.id AND mm.source_kind = 'telegram'
            LEFT JOIN telegram_updates t ON t.id = mm.source_id
           WHERE m.prompt_message_id = ? OR t.message_id = ?
+             OR m.id IN (SELECT b.meal_id FROM telegram_bot_messages b
+                          WHERE b.message_id = ? AND b.kind IN ('estimate', 'amended', 'removed'))
           ORDER BY m.id DESC LIMIT 1`,
       )
-      .get(messageId, messageId);
+      .get(messageId, messageId, messageId);
   }
 
   /** What this meal currently contributes, read back from the projection. */
