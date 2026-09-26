@@ -12,52 +12,113 @@
  */
 
 import type { Db } from '../db/index.js';
-import { MealsRepo, MealValidationError } from '../db/repos/meals.js';
-import { ModelCallsRepo, type FinishModelCall } from '../db/repos/model_calls.js';
-import type { TelegramUpdateRow } from '../db/repos/telegram_updates.js';
+import { MealsRepo, MealValidationError, type NewExtraction } from '../db/repos/meals.js';
+import {
+  ModelCallsRepo,
+  type FinishModelCall,
+  type ModelCallOutcome,
+} from '../db/repos/model_calls.js';
+import { TelegramUpdatesRepo, type TelegramUpdateRow } from '../db/repos/telegram_updates.js';
 import {
   extractMeal,
   correctMeal,
   DEFAULT_MODEL,
   type CallMetrics,
+  type ExtractedMeal,
   type ExtractionResult,
   type QueryRunner,
 } from './extractor.js';
 import { CORRECTION_PROMPT_VERSION, PROMPT_VERSION } from './prompts.js';
 
 /**
- * Estimates per rolling 24 hours, photos and corrections together. Every one
- * spends money; a flood should not.
+ * Estimates per rolling window, photos and corrections together. Every one
+ * spends money; a flood should not. Rolling, not per calendar day: the old
+ * per-day counter was keyed by the meal's day, which left corrections to
+ * yesterday's meals uncapped.
  */
-export const DAILY_EXTRACTION_CAP = 40;
-const SPEND_PURPOSES = ['extract_photo', 'extract_text', 'correct'] as const;
+export const ESTIMATE_CAP = 40;
+export const ESTIMATE_CAP_WINDOW_HOURS = 24;
+/** Routing calls are not estimates; the router caps them separately. */
+const ESTIMATE_PURPOSES = ['extract_photo', 'extract_text', 'correct'] as const;
 
-/** What a finished call records besides its outcome: the answer and its cost. */
-function callRecord(result: { raw_response?: string } & Partial<CallMetrics>): FinishModelCall {
+/**
+ * Model calls one message may cause before it is given up on. A save that
+ * fails the same way every cycle is not a transient fault, and each retry is a
+ * paid call: unbounded, one message spent the whole day's cap.
+ */
+export const MAX_ATTEMPTS_PER_MESSAGE = 3;
+
+/** How a call ended, with what the model said and what it cost. */
+function finishRecord(
+  outcome: ModelCallOutcome,
+  result: { raw_response?: string } & Partial<CallMetrics>,
+  extra: Pick<FinishModelCall, 'meal_id' | 'extraction_id' | 'decision' | 'error'> = {},
+): FinishModelCall {
   return {
-    outcome: 'ok',
+    outcome,
     raw_response: result.raw_response ?? null,
     usage: result.usage,
     cost_usd: result.cost_usd ?? null,
     duration_ms: result.duration_ms ?? null,
+    ...extra,
   };
 }
 
-/** Mark a message handled. Called inside the transaction that acted on it. */
-function markHandled(db: Db, updateId: number | undefined): void {
-  if (updateId === undefined) return;
-  db.prepare('UPDATE telegram_updates SET extracted_at = ? WHERE id = ?').run(
-    new Date().toISOString(),
-    updateId,
-  );
+/**
+ * End a model call. Its outcome, whatever it wrote, and the handled mark
+ * commit together: a restart between any two either pays for the call again
+ * or applies its result twice.
+ */
+function settleCall<T>(
+  db: Db,
+  call: { id: number; updateId: number },
+  write: () => { record: FinishModelCall; result: T },
+): T {
+  return db.transaction(() => {
+    const { record, result } = write();
+    new ModelCallsRepo(db).finish(call.id, record);
+    new TelegramUpdatesRepo(db).markHandled(call.updateId);
+    return result;
+  })();
 }
 
-/** A plausibility violation as the end of a sentence: "(energy consumed above …)". */
+/** An accepted estimate in the shape addExtraction stores. */
+function storedEstimate(
+  result: { model: string; prompt_version: string; raw_response?: string },
+  meal: ExtractedMeal,
+  description: string,
+): NewExtraction {
+  return {
+    model: result.model,
+    prompt_version: result.prompt_version,
+    confidence: meal.confidence,
+    description,
+    totals: meal.totals,
+    raw_response: result.raw_response ?? null,
+    items: meal.items.map((item) => ({
+      name: item.name,
+      portion_text: item.portion_text ?? null,
+      grams: item.grams ?? null,
+      confidence: item.confidence ?? null,
+    })),
+  };
+}
+
+/**
+ * A plausibility violation as the end of a sentence: "(energy consumed above
+ * …)". A violation's `reason` is written to follow "<nutrient> <value> — ", so
+ * on its own it needs its nutrient to read as a sentence.
+ */
 function violationClause(err: unknown): string {
   const violation = err instanceof MealValidationError ? err.violations[0] : undefined;
   return violation
     ? ` (${violation.nutrient.replace(/^dietary_/, '').replace(/_/g, ' ')} ${violation.reason})`
     : '';
+}
+
+/** A duplicate the unique keys refused: the change is already there. */
+function isUniqueConflict(err: unknown): boolean {
+  return (err as { code?: unknown }).code === 'SQLITE_CONSTRAINT_UNIQUE';
 }
 
 export type ConfirmIntent =
@@ -151,11 +212,11 @@ export interface CorrectableMeal {
  * the three cannot disagree about which meal a reply means.
  */
 export function mealRepliedTo<
-  T extends { prompt_message_id: number | null; source_id: number; bot_message_ids?: number[] },
+  T extends { prompt_message_id: number | null; source_id: number; bot_message_ids: number[] },
 >(meals: T[], replyToMessageId: number): T | undefined {
   return (
     meals.find((m) => m.prompt_message_id === replyToMessageId) ??
-    meals.find((m) => m.bot_message_ids?.includes(replyToMessageId)) ??
+    meals.find((m) => m.bot_message_ids.includes(replyToMessageId)) ??
     meals.find((m) => m.source_id === replyToMessageId)
   );
 }
@@ -270,8 +331,14 @@ export async function applyCorrection(
     text: string;
     replyToMessageId?: number;
     isForwarded: boolean;
-    /** The telegram_updates row being handled: marked in the same write. */
-    updateId?: number;
+    /**
+     * The telegram_updates row being handled. Required: it is marked in the
+     * same write as the amendment, and it is half of the key that stops one
+     * message amending a meal twice — a NULL there collides with nothing.
+     */
+    updateId: number;
+    /** The bot the message came through; scopes reply lookups. */
+    botId?: number;
   },
   mediaRoot: string,
   options: { runner?: QueryRunner; model?: string } = {},
@@ -284,24 +351,24 @@ export async function applyCorrection(
     return { status: 'refused', reply: "That looks forwarded, so I haven't changed anything." };
   }
 
-  const correctable = repo.correctableMeals(CORRECTION_WINDOW_HOURS);
+  const correctable = repo.correctableMeals(CORRECTION_WINDOW_HOURS, 10, correction.botId);
 
-  // A reply to a meal that is removed or too old must not fall back to "the
-  // only recent meal": that would rewrite a different meal than the one the
-  // user was looking at when they replied.
+  // A reply names its meal or nothing. It never falls back to "the only recent
+  // meal": that rewrote a different meal than the message replied to — a
+  // removed one, an old one, or a bot message that was never about a meal.
   const replyTo = correction.replyToMessageId;
   if (replyTo !== undefined && !mealRepliedTo(correctable, replyTo)) {
-    const known = repo.findByTelegramMessage(replyTo);
-    if (known) {
-      return {
-        status: 'refused',
-        meal_id: known.meal_id,
-        reply:
-          known.status === 'voided'
-            ? "That meal was removed, so there's nothing to correct."
-            : `That meal is older than ${CORRECTION_WINDOW_HOURS}h, so I can't change it from here.`,
-      };
-    }
+    const known = repo.findByTelegramMessage(replyTo, correction.botId);
+    return {
+      status: 'refused',
+      ...(known ? { meal_id: known.meal_id } : {}),
+      reply: !known
+        ? "That message isn't one of your meals, so nothing changed. Reply to the meal's " +
+          '"Saved:" message with the change.'
+        : known.status === 'voided'
+          ? "That meal was removed, so there's nothing to correct."
+          : `That meal is older than ${CORRECTION_WINDOW_HOURS}h, so I can't change it from here.`,
+    };
   }
 
   const { target, ambiguous } = resolveCorrectionTarget(correctable, replyTo);
@@ -330,6 +397,26 @@ export async function applyCorrection(
   if (!meal || !previous) return { status: 'failed', reply: "I couldn't find that meal any more." };
   const label = mealLabel(target.description, meal);
 
+  const calls = new ModelCallsRepo(db);
+  // Checked before paying for a model call, not left to the unique key to
+  // catch afterwards.
+  if (calls.hasAccepted(correction.updateId, target.meal_id)) {
+    return {
+      status: 'refused',
+      meal_id: target.meal_id,
+      reply: `That change is already applied to ${label}.`,
+    };
+  }
+  if (calls.countForUpdate(correction.updateId) >= MAX_ATTEMPTS_PER_MESSAGE) {
+    new TelegramUpdatesRepo(db).markHandled(correction.updateId);
+    return {
+      status: 'failed',
+      meal_id: target.meal_id,
+      reply: `I tried that change ${MAX_ATTEMPTS_PER_MESSAGE} times and couldn't save it, so I've stopped. ${label} is unchanged.`,
+      detail: `gave up after ${MAX_ATTEMPTS_PER_MESSAGE} attempts`,
+    };
+  }
+
   if (target.depth >= MAX_CORRECTION_DEPTH) {
     return {
       status: 'refused',
@@ -340,12 +427,12 @@ export async function applyCorrection(
     };
   }
 
-  const budget = extractionBudget(db);
+  const budget = estimateBudget(db);
   if (budget.remaining <= 0) {
     return {
       status: 'capped',
       meal_id: target.meal_id,
-      reply: `I've hit the limit of ${DAILY_EXTRACTION_CAP} analyses in 24 hours, so I haven't changed ${label}.`,
+      reply: `I've hit the limit of ${ESTIMATE_CAP} analyses in ${ESTIMATE_CAP_WINDOW_HOURS} hours, so I haven't changed ${label}.`,
     };
   }
 
@@ -358,14 +445,18 @@ export async function applyCorrection(
     )
     .get(target.meal_id);
 
-  const calls = new ModelCallsRepo(db);
-  const callId = calls.start({
-    purpose: 'correct',
-    telegram_update_id: correction.updateId ?? null,
-    meal_id: target.meal_id,
-    model: options.model ?? DEFAULT_MODEL,
-    prompt_version: CORRECTION_PROMPT_VERSION,
-  });
+  // Chosen once, so the call's row records the model that actually ran.
+  const model = options.model ?? DEFAULT_MODEL;
+  const call = {
+    id: calls.start({
+      purpose: 'correct',
+      telegram_update_id: correction.updateId,
+      meal_id: target.meal_id,
+      model,
+      prompt_version: CORRECTION_PROMPT_VERSION,
+    }),
+    updateId: correction.updateId,
+  };
   const before = repo.projectedTotals(target.meal_id);
   const result = await correctMeal(
     {
@@ -376,88 +467,82 @@ export async function applyCorrection(
       timezone: meal.tz,
       previous,
     },
-    options,
+    { ...options, model },
   );
-  // Every outcome records the call and marks the message in one write: a
-  // restart between the two would otherwise run (and pay for) it again.
-  const finish = (record: FinishModelCall): void =>
-    db.transaction(() => {
-      calls.finish(callId, record);
-      markHandled(db, correction.updateId);
-    })();
 
   if (result.kind === 'mismatch') {
     // The model says the correction is about a different meal. Nothing is
     // written: storing an unchanged extraction would spend one of the meal's
     // corrections and report "nothing changed" as if it had been applied.
-    finish({ ...callRecord(result), outcome: 'mismatch' });
     const reason = result.reason ? ` (${result.reason.replace(/\.$/, '')})` : '';
-    return {
-      status: 'mismatch',
-      meal_id: target.meal_id,
-      model_call_id: callId,
-      reply:
-        `That doesn't seem to be about ${label}${reason}, so nothing changed. If you meant ` +
-        `another meal, swipe to reply to its "Saved:" message and send it again.`,
-    };
+    return settleCall(db, call, () => ({
+      record: finishRecord('mismatch', result),
+      result: {
+        status: 'mismatch',
+        meal_id: target.meal_id,
+        model_call_id: call.id,
+        reply:
+          `That doesn't seem to be about ${label}${reason}, so nothing changed. If you meant ` +
+          `another meal, swipe to reply to its "Saved:" message and send it again.`,
+      },
+    }));
   }
   if (result.kind === 'failed') {
     // Plain words: the parser's reason ("model response has no totals") means
     // nothing to the person reading this in a chat.
-    finish({ ...callRecord(result), outcome: 'failed', error: result.error });
-    return {
-      status: 'failed',
-      meal_id: target.meal_id,
-      model_call_id: callId,
-      reply: `I couldn't apply that to ${label}, so nothing changed. Try rephrasing it.`,
-      detail: result.error,
-    };
+    return settleCall(db, call, () => ({
+      record: finishRecord('failed', result, { error: result.error }),
+      result: {
+        status: 'failed',
+        meal_id: target.meal_id,
+        model_call_id: call.id,
+        reply: `I couldn't apply that to ${label}, so nothing changed. Try rephrasing it.`,
+        detail: result.error,
+      },
+    }));
   }
 
   try {
     // The amendment, the call's outcome and the handled mark commit together.
     // Marking afterwards left a window — a failed log write was enough — in
     // which a restart applied the same correction again on top of itself.
-    const amended = result.meal;
-    db.transaction(() => {
-      const extractionId = repo.addExtraction(target.meal_id, {
-        model: result.model,
-        prompt_version: result.prompt_version,
-        confidence: amended.confidence,
-        description: amended.description || target.description || 'meal',
-        totals: amended.totals,
-        raw_response: result.raw_response ?? null,
-        items: amended.items.map((item) => ({
-          name: item.name,
-          portion_text: item.portion_text ?? null,
-          grams: item.grams ?? null,
-          confidence: item.confidence ?? null,
-        })),
-      });
-      calls.finish(callId, {
-        ...callRecord(result),
-        outcome: 'ok',
-        meal_id: target.meal_id,
-        extraction_id: extractionId,
-      });
-      markHandled(db, correction.updateId);
-    })();
+    settleCall(db, call, () => {
+      const extractionId = repo.addExtraction(
+        target.meal_id,
+        storedEstimate(
+          result,
+          result.meal,
+          result.meal.description || target.description || 'meal',
+        ),
+      );
+      return {
+        record: finishRecord('ok', result, {
+          meal_id: target.meal_id,
+          extraction_id: extractionId,
+        }),
+        result: undefined,
+      };
+    });
   } catch (err) {
-    // The amendment was not stored, so the original stands untouched. A
-    // violation's `reason` is written to follow "<nutrient> <value> — ", so it
-    // needs its nutrient to read as a sentence.
-    const detail =
+    // Nothing was stored, so the original stands untouched. Each cause says
+    // what it was: "numbers I don't believe" for every failure blamed the
+    // model for a duplicate or a database fault.
+    const [reply, detail] =
       err instanceof MealValidationError
-        ? 'amendment failed plausibility bounds'
-        : `amendment not stored: ${(err as Error).name}`;
-    finish({ ...callRecord(result), outcome: 'failed', error: detail });
-    return {
-      status: 'failed',
-      meal_id: target.meal_id,
-      model_call_id: callId,
-      reply: `That correction gave numbers I don't believe for ${label}, so I've left it as it was${violationClause(err)}.`,
-      detail,
-    };
+        ? [
+            `That correction gave numbers I don't believe for ${label}, so I've left it as it was${violationClause(err)}.`,
+            'amendment failed plausibility bounds',
+          ]
+        : isUniqueConflict(err)
+          ? [`That change is already applied to ${label}.`, 'amendment already stored']
+          : [
+              `I couldn't save that change to ${label}, so nothing changed.`,
+              `amendment not stored: ${(err as Error).name}`,
+            ];
+    return settleCall(db, call, () => ({
+      record: finishRecord('failed', result, { error: detail }),
+      result: { status: 'failed', meal_id: target.meal_id, model_call_id: call.id, reply, detail },
+    }));
   }
 
   // Read back what was actually written rather than what was computed: the
@@ -470,7 +555,7 @@ export async function applyCorrection(
   return {
     status: 'corrected',
     meal_id: target.meal_id,
-    model_call_id: callId,
+    model_call_id: call.id,
     reply:
       changes.length > 0
         ? `Updated ${label}:\n${changes.join('\n')}${depthNote}`
@@ -498,7 +583,11 @@ export interface RemovalResult {
  * the meal", and a reply to anything that is not a meal never falls back to
  * "the only recent one".
  */
-export function rejectMeal(db: Db, replyToMessageId: number | undefined): RemovalResult {
+export function rejectMeal(
+  db: Db,
+  replyToMessageId: number | undefined,
+  botId?: number,
+): RemovalResult {
   if (replyToMessageId === undefined) {
     return {
       status: 'needs_reply',
@@ -507,9 +596,12 @@ export function rejectMeal(db: Db, replyToMessageId: number | undefined): Remova
   }
 
   const repo = new MealsRepo(db);
-  const target = mealRepliedTo(repo.correctableMeals(CORRECTION_WINDOW_HOURS), replyToMessageId);
+  const target = mealRepliedTo(
+    repo.correctableMeals(CORRECTION_WINDOW_HOURS, 10, botId),
+    replyToMessageId,
+  );
   if (!target) {
-    const known = repo.findByTelegramMessage(replyToMessageId);
+    const known = repo.findByTelegramMessage(replyToMessageId, botId);
     const cutoff = Math.floor(Date.now() / 1000) - CORRECTION_WINDOW_HOURS * 3600;
     if (known?.status === 'voided') {
       return {
@@ -556,6 +648,8 @@ export interface PendingMeal {
   source_id: number;
   /** message_id of the bot's "reply ok to save this" message. */
   prompt_message_id: number | null;
+  /** Other bot messages presenting the meal (none for a meal still pending). */
+  bot_message_ids: number[];
   description: string | null;
 }
 
@@ -582,15 +676,13 @@ export function resolvePendingTarget(
 }
 
 /**
- * Estimates in the last 24 hours, and whether there is room for another.
- *
- * Counted from `model_calls` by when each call started. It used to be a
- * counter keyed by the MEAL's day, so a correction sent today about
- * yesterday's dinner was charged to yesterday — effectively uncapped.
+ * Estimates in the rolling window, and whether there is room for another.
+ * Counted from `model_calls` by when each call started, unfinished calls
+ * included: a call in flight is spending.
  */
-export function extractionBudget(db: Db): { used: number; remaining: number } {
-  const used = new ModelCallsRepo(db).countSince(SPEND_PURPOSES, 24);
-  return { used, remaining: Math.max(0, DAILY_EXTRACTION_CAP - used) };
+export function estimateBudget(db: Db): { used: number; remaining: number } {
+  const used = new ModelCallsRepo(db).countSince(ESTIMATE_PURPOSES, ESTIMATE_CAP_WINDOW_HOURS);
+  return { used, remaining: Math.max(0, ESTIMATE_CAP - used) };
 }
 
 /**
@@ -662,23 +754,36 @@ export async function processPhoto(
   }
 
   const [localDay, localTime] = localDayAndTime(row.sent_epoch, row.tz_assumed);
-  const budget = extractionBudget(db);
+  const calls = new ModelCallsRepo(db);
+  if (calls.countForUpdate(row.id) >= MAX_ATTEMPTS_PER_MESSAGE) {
+    new TelegramUpdatesRepo(db).markHandled(row.id);
+    return {
+      status: 'failed',
+      reply: `I tried that photo ${MAX_ATTEMPTS_PER_MESSAGE} times and couldn't save it, so I've stopped. Send it again if you like.`,
+      detail: `gave up after ${MAX_ATTEMPTS_PER_MESSAGE} attempts`,
+    };
+  }
+  const budget = estimateBudget(db);
   if (budget.remaining <= 0) {
     return {
       status: 'capped',
       reply:
-        `I've hit the limit of ${DAILY_EXTRACTION_CAP} analyses in 24 hours, so this photo is ` +
-        `stored but not analysed. Send it again later and I'll run it.`,
+        `I've hit the limit of ${ESTIMATE_CAP} analyses in ${ESTIMATE_CAP_WINDOW_HOURS} hours, ` +
+        `so this photo is stored but not analysed. Send it again later and I'll run it.`,
     };
   }
 
-  const calls = new ModelCallsRepo(db);
-  const callId = calls.start({
-    purpose: 'extract_photo',
-    telegram_update_id: row.id,
-    model: options.model ?? DEFAULT_MODEL,
-    prompt_version: PROMPT_VERSION,
-  });
+  // Chosen once, so the call's row records the model that actually ran.
+  const model = options.model ?? DEFAULT_MODEL;
+  const call = {
+    id: calls.start({
+      purpose: 'extract_photo',
+      telegram_update_id: row.id,
+      model,
+      prompt_version: PROMPT_VERSION,
+    }),
+    updateId: row.id,
+  };
   const extraction: ExtractionResult = await extractMeal(
     {
       photoPath: `${mediaRoot}/${row.media_path}`,
@@ -687,36 +792,30 @@ export async function processPhoto(
       localDay,
       timezone: row.tz_assumed,
     },
-    options,
+    { ...options, model },
   );
 
   if (!extraction.ok || !extraction.meal) {
-    db.transaction(() => {
-      calls.finish(callId, {
-        ...callRecord(extraction),
-        outcome: 'failed',
-        error: extraction.error,
-      });
-      markHandled(db, row.id);
-    })();
-    return {
-      status: 'failed',
-      model_call_id: callId,
-      reply:
-        "I couldn't get an estimate out of that photo, so nothing was saved. Try sending it again.",
-      ...(extraction.error ? { detail: extraction.error } : {}),
-    };
+    return settleCall(db, call, () => ({
+      record: finishRecord('failed', extraction, { error: extraction.error ?? null }),
+      result: {
+        status: 'failed',
+        model_call_id: call.id,
+        reply:
+          "I couldn't get an estimate out of that photo, so nothing was saved. Try sending it again.",
+        ...(extraction.error ? { detail: extraction.error } : {}),
+      },
+    }));
   }
   if (extraction.meal.not_food) {
-    db.transaction(() => {
-      calls.finish(callId, { ...callRecord(extraction), outcome: 'not_food' });
-      markHandled(db, row.id);
-    })();
-    return {
-      status: 'not_food',
-      model_call_id: callId,
-      reply: "That doesn't look like food, so I haven't logged it.",
-    };
+    return settleCall(db, call, () => ({
+      record: finishRecord('not_food', extraction),
+      result: {
+        status: 'not_food',
+        model_call_id: call.id,
+        reply: "That doesn't look like food, so I haven't logged it.",
+      },
+    }));
   }
 
   // One write, after the model has answered: the meal, its link to this
@@ -725,69 +824,68 @@ export async function processPhoto(
   // after createMeal left the message unmarked, and the retry created a
   // second meal from the same photo that was counted twice.
   const meal = extraction.meal;
-  return db.transaction((): ProcessPhotoResult => {
-    const mealId = repo.createMeal({
-      eaten_epoch: row.sent_epoch,
-      local_day: localDay,
-      local_time: localTime,
-      tz: row.tz_assumed,
-      // Telegram strips EXIF from compressed photos, so for this path the zone
-      // is the server's assumption, recorded as such.
-      tz_source: 'configured',
+  try {
+    return settleCall<ProcessPhotoResult>(db, call, () => {
+      const mealId = repo.createMeal({
+        eaten_epoch: row.sent_epoch,
+        local_day: localDay,
+        local_time: localTime,
+        tz: row.tz_assumed,
+        // Telegram strips EXIF from compressed photos, so for this path the
+        // zone is the server's assumption, recorded as such.
+        tz_source: 'configured',
+      });
+      repo.linkMedia(mealId, 'telegram', row.id);
+      try {
+        const extractionId = repo.addExtraction(
+          mealId,
+          storedEstimate(extraction, meal, meal.description),
+        );
+        if (AUTO_CONFIRM) repo.confirm(mealId, 'telegram-auto');
+        return {
+          record: finishRecord('ok', extraction, { meal_id: mealId, extraction_id: extractionId }),
+          result: {
+            status: 'extracted',
+            meal_id: mealId,
+            model_call_id: call.id,
+            reply: formatEstimate(meal),
+          },
+        };
+      } catch (err) {
+        if (!(err instanceof MealValidationError)) throw err;
+        // The numbers failed plausibility. The meal row stays (the photo is
+        // real and pending is visible), but nothing is projected and the user
+        // is told rather than left with a silently missing meal.
+        return {
+          record: finishRecord('failed', extraction, {
+            meal_id: mealId,
+            error: 'estimate failed plausibility bounds',
+          }),
+          result: {
+            status: 'failed',
+            meal_id: mealId,
+            model_call_id: call.id,
+            reply: `I read that meal but the numbers didn't look right, so I haven't saved an estimate${violationClause(err)}.`,
+            detail: 'estimate failed plausibility bounds',
+          },
+        };
+      }
     });
-    repo.linkMedia(mealId, 'telegram', row.id);
-
-    let result: ProcessPhotoResult;
-    try {
-      const extractionId = repo.addExtraction(mealId, {
-        model: extraction.model,
-        prompt_version: extraction.prompt_version,
-        confidence: meal.confidence,
-        description: meal.description,
-        totals: meal.totals,
-        raw_response: extraction.raw_response ?? null,
-        items: meal.items.map((item) => ({
-          name: item.name,
-          portion_text: item.portion_text ?? null,
-          grams: item.grams ?? null,
-          confidence: item.confidence ?? null,
-        })),
-      });
-      if (AUTO_CONFIRM) repo.confirm(mealId, 'telegram-auto');
-      calls.finish(callId, {
-        ...callRecord(extraction),
-        outcome: 'ok',
-        meal_id: mealId,
-        extraction_id: extractionId,
-      });
-      result = {
-        status: 'extracted',
-        meal_id: mealId,
-        model_call_id: callId,
-        reply: formatEstimate(meal),
-      };
-    } catch (err) {
-      if (!(err instanceof MealValidationError)) throw err;
-      // The numbers failed plausibility. The meal row stays (the photo is real
-      // and pending is visible), but nothing is projected and the user is told
-      // rather than left with a silently missing meal.
-      calls.finish(callId, {
-        ...callRecord(extraction),
-        outcome: 'failed',
-        meal_id: mealId,
-        error: 'estimate failed plausibility bounds',
-      });
-      result = {
+  } catch (err) {
+    // The save was rolled back, so nothing was stored. Recorded and marked
+    // rather than left for a retry: a fault that repeats would otherwise pay
+    // for a fresh model call every cycle until the day's cap was gone.
+    const detail = `estimate not stored: ${(err as Error).name}`;
+    return settleCall(db, call, () => ({
+      record: finishRecord('failed', extraction, { error: detail }),
+      result: {
         status: 'failed',
-        meal_id: mealId,
-        model_call_id: callId,
-        reply: `I read that meal but the numbers didn't look right, so I haven't saved an estimate${violationClause(err)}.`,
-        detail: 'estimate failed plausibility bounds',
-      };
-    }
-    markHandled(db, row.id);
-    return result;
-  })();
+        model_call_id: call.id,
+        reply: "I couldn't save that estimate, so nothing was logged. Try sending the photo again.",
+        detail,
+      },
+    }));
+  }
 }
 
 /** The message the user actually reads. Numbers first, confidence stated plainly. */

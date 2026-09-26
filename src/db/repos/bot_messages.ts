@@ -17,6 +17,19 @@ export type BotMessageKind =
   | 'failed'
   | 'reply';
 
+/**
+ * A reply to these acts on their meal: they PRESENT it. Not 'mismatch' or
+ * 'failed' — "no" in reply to "that doesn't seem to be about X" must not
+ * remove X. A new kind binds to nothing until it is added here on purpose.
+ */
+export const PRESENTS_MEAL = ['estimate', 'amended'] as const satisfies readonly BotMessageKind[];
+
+/** These name a meal well enough to explain why a reply cannot act on it. */
+export const IDENTIFIES_MEAL = [
+  ...PRESENTS_MEAL,
+  'removed',
+] as const satisfies readonly BotMessageKind[];
+
 export interface NewBotMessage {
   bot_id: number;
   chat_id: number;

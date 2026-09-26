@@ -12,6 +12,12 @@
 
 import type { Db } from '../index.js';
 
+/**
+ * A backstop on stored error length, not the redaction: error strings are
+ * built to carry no model text (see the extractor's throw sites).
+ */
+const MAX_ERROR_LENGTH = 1000;
+
 export type ModelCallPurpose = 'route' | 'extract_photo' | 'extract_text' | 'correct';
 export type ModelCallOutcome = 'ok' | 'not_food' | 'mismatch' | 'ambiguous' | 'invalid' | 'failed';
 
@@ -96,7 +102,9 @@ export class ModelCallsRepo {
         result.extraction_id ?? null,
         result.decision ?? null,
         result.raw_response ?? null,
-        result.error === undefined || result.error === null ? null : result.error.slice(0, 1000),
+        result.error === undefined || result.error === null
+          ? null
+          : result.error.slice(0, MAX_ERROR_LENGTH),
         result.usage === undefined ? null : JSON.stringify(result.usage),
         result.cost_usd ?? null,
         result.duration_ms ?? null,
@@ -119,6 +127,34 @@ export class ModelCallsRepo {
       >(`SELECT COUNT(*) AS n FROM model_calls WHERE purpose IN (${placeholders}) AND started_epoch >= ?`)
       .get(...purposes, since);
     return row?.n ?? 0;
+  }
+
+  /**
+   * Calls already made for this message, whatever their outcome. Bounds the
+   * retries of a fault that repeats: without it, a message whose save failed
+   * the same way every cycle paid for a new call each time until the day's
+   * cap was gone.
+   */
+  countForUpdate(telegramUpdateId: number): number {
+    const row = this.db
+      .prepare<
+        [number],
+        { n: number }
+      >('SELECT COUNT(*) AS n FROM model_calls WHERE telegram_update_id = ?')
+      .get(telegramUpdateId);
+    return row?.n ?? 0;
+  }
+
+  /** Has this message already produced an accepted estimate for this meal? */
+  hasAccepted(telegramUpdateId: number, mealId: number): boolean {
+    return (
+      this.db
+        .prepare(
+          `SELECT 1 FROM model_calls
+            WHERE telegram_update_id = ? AND meal_id = ? AND extraction_id IS NOT NULL LIMIT 1`,
+        )
+        .get(telegramUpdateId, mealId) !== undefined
+    );
   }
 
   get(id: number): ModelCallRow | undefined {

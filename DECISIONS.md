@@ -1159,6 +1159,16 @@ message that merely mentions one ("that doesn't seem to be about …", "I
 couldn't apply that to …") does not. Otherwise a "no" meaning "you're wrong"
 would remove the meal it names.
 
+Review found the one failure the transactions made more likely rather than
+less. Once a save is a single write, a fault inside it rolls everything back,
+including the handled mark. The message is retried, and every retry is a
+paid model call. A fault that repeats (an estimate item with no name failing a
+NOT NULL, reproduced) spent the whole day's cap from one photo. Two changes
+close it. A failure to save is now recorded and marked like any other outcome,
+and each message may cause at most three model calls, counted from
+`model_calls`. So the retry policy is bounded by the data, not by luck. Items
+are also checked before anything is written.
+
 The migration only adds. It was dry-run against a copy of the live database
 before release: row counts unchanged, integrity and foreign keys clean. That
 matters here because every service applies migrations when it opens the

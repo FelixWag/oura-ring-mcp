@@ -181,6 +181,17 @@ export class TelegramUpdatesRepo {
   }
 
   /**
+   * Mark a message handled, so no drain loop acts on it again. Called inside
+   * the transaction that acted on it wherever that wrote anything: marking
+   * afterwards left a window in which a restart repeated the write.
+   */
+  markHandled(id: number): void {
+    this.db
+      .prepare('UPDATE telegram_updates SET extracted_at = ? WHERE id = ?')
+      .run(new Date().toISOString(), id);
+  }
+
+  /**
    * The offset for the next poll: one past everything we have observed,
    * accepted or rejected. Scoped to this bot, because `update_id` restarts
    * for a different token.

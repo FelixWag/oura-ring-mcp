@@ -43,10 +43,24 @@ the existing photo and correction paths were missing.
   `model_calls`.
 - **A reply to a removed or too-old meal no longer falls back to "the only
   recent meal"**, which rewrote a different meal than the one replied to.
+- **One message cannot spend the whole cap.** A save that failed the same way
+  every cycle (reproduced with an estimate item that had no name) was retried
+  each poll, a paid call each time, until the day's cap was gone. Any failure
+  to save is now recorded and marked, a message gets at most three model
+  calls, and estimate items are validated (a name, finite numbers) before
+  anything is written.
+- **A correction replying to a message that is not a meal is refused**, like
+  a "no" — it no longer falls back to the only recent meal. A correction
+  already applied is recognised before paying for another model call, and
+  each failure says what it was (a duplicate, a database fault, implausible
+  numbers) instead of always blaming the numbers.
+- **Replies are matched only against meals from the same bot**: message ids
+  restart at 1 in a new bot's chat.
+- **A failed log write no longer suppresses the bot's reply.**
 - The voice server's time-window linker no longer claims a Telegram note
   written during the same window.
-- A failed model call's error names only its type; the SDK's result text is
-  no longer logged. The "numbers didn't look right" photo reply reads as a
+- A failed model call's error names only its type; neither the SDK's result
+  text nor its own thrown error text is logged. The "numbers didn't look right" photo reply reads as a
   sentence.
 
 ## [0.12.4] — 2026-09-26

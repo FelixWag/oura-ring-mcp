@@ -20,9 +20,10 @@ import {
   describeChanges,
   mealLabel,
   localDayAndTime,
-  extractionBudget,
+  estimateBudget,
   formatEstimate,
-  DAILY_EXTRACTION_CAP,
+  ESTIMATE_CAP,
+  MAX_ATTEMPTS_PER_MESSAGE,
   MAX_CORRECTION_DEPTH,
 } from '../src/telegram/meal_flow.ts';
 import type { TelegramUpdateRow } from '../src/db/repos/telegram_updates.ts';
@@ -101,6 +102,35 @@ function photoRow(overrides: Partial<TelegramUpdateRow> = {}): TelegramUpdateRow
     );
   }
   return withMedia;
+}
+
+/** A stored text message: what a correction is handled from. */
+let textUpdateId = 100;
+function textRow(): TelegramUpdateRow {
+  textUpdateId += 1;
+  new TelegramUpdatesRepo(db).storeBatch(
+    1,
+    [
+      {
+        bot_id: 1,
+        update_id: textUpdateId,
+        chat_id: 42,
+        message_id: 5000 + textUpdateId,
+        kind: 'text',
+        text: 'a correction',
+        sent_epoch: Math.floor(Date.now() / 1000),
+        tz_assumed: 'Europe/Vienna',
+        needs_media: false,
+        raw: '{}',
+        is_forwarded: false,
+      },
+    ],
+    null,
+    0,
+  );
+  return db
+    .prepare('SELECT * FROM telegram_updates WHERE update_id = ?')
+    .get(textUpdateId) as TelegramUpdateRow;
 }
 
 describe('prompt construction', () => {
@@ -203,8 +233,20 @@ describe('confirmation intent', () => {
 
 describe('which meal does "ok" refer to', () => {
   const pending = [
-    { meal_id: 1, source_id: 900, prompt_message_id: 1900, description: 'breakfast' },
-    { meal_id: 2, source_id: 901, prompt_message_id: 1901, description: 'lunch' },
+    {
+      meal_id: 1,
+      source_id: 900,
+      prompt_message_id: 1900,
+      bot_message_ids: [],
+      description: 'breakfast',
+    },
+    {
+      meal_id: 2,
+      source_id: 901,
+      prompt_message_id: 1901,
+      bot_message_ids: [],
+      description: 'lunch',
+    },
   ];
 
   it("matches a reply to the BOT's question, which is what users reply to", () => {
@@ -347,32 +389,90 @@ describe('processing a photo', () => {
 
   // As separate commits, a fault after the meal row existed left the message
   // unmarked, and the retry created a second meal from the same photo that
-  // was counted twice.
-  it('leaves nothing behind when the save fails half-way, so a retry makes one meal', async () => {
+  // was counted twice. Now the save is one write, and a failure inside it is
+  // recorded and marked: a fault that repeats must not pay for a new call
+  // every cycle (found in review: one photo spent the whole day's cap).
+  it('leaves nothing behind when the save fails half-way, and records why', async () => {
     const row = photoRow();
     vi.spyOn(MealsRepo.prototype, 'confirm').mockImplementationOnce(() => {
       throw new Error('disk I/O error');
     });
 
-    await expect(processPhoto(db, row, '/media', { runner })).rejects.toThrow('disk I/O');
+    const result = await processPhoto(db, row, '/media', { runner });
+
+    expect(result.status).toBe('failed');
+    expect(result.reply).toContain("couldn't save");
     expect(count('SELECT COUNT(*) AS n FROM meals')).toBe(0);
     expect(count('SELECT COUNT(*) AS n FROM meal_media')).toBe(0);
     expect(count('SELECT COUNT(*) AS n FROM telegram_updates WHERE extracted_at IS NOT NULL')).toBe(
-      0,
+      1,
     );
-    expect(modelCalls().map((c) => c.outcome)).toEqual([null]); // visible as a crashed call
-
-    const retry = await processPhoto(db, row, '/media', { runner });
-    expect(retry.status).toBe('extracted');
-    expect(count('SELECT COUNT(*) AS n FROM meals')).toBe(1);
-    expect(count('SELECT COUNT(*) AS n FROM health_samples WHERE meal_id IS NOT NULL')).toBe(4);
+    expect(modelCalls()[0]).toMatchObject({
+      outcome: 'failed',
+      error: 'estimate not stored: Error',
+      raw_response: GOOD_RESPONSE,
+    });
   });
 
-  it('says so when the daily cap is reached rather than going quiet', async () => {
+  it('gives up on a message after three attempts instead of paying for more', async () => {
+    const row = photoRow();
+    const calls = new ModelCallsRepo(db);
+    for (let i = 0; i < MAX_ATTEMPTS_PER_MESSAGE; i += 1) {
+      calls.start({
+        purpose: 'extract_photo',
+        telegram_update_id: row.id,
+        model: 'm',
+        prompt_version: 'v',
+      });
+    }
+    let ran = false;
+
+    const result = await processPhoto(db, row, '/media', {
+      runner: async () => {
+        ran = true;
+        return GOOD_RESPONSE;
+      },
+    });
+
+    expect(ran).toBe(false);
+    expect(result.status).toBe('failed');
+    expect(result.reply).toContain('3 times');
+    expect(count('SELECT COUNT(*) AS n FROM telegram_updates WHERE extracted_at IS NOT NULL')).toBe(
+      1,
+    );
+  });
+
+  // Found in review: an item with no name failed the database write and was
+  // retried every cycle. It now fails the estimate, visibly and once.
+  it('fails an estimate whose item has no name, before anything is written', async () => {
+    const row = photoRow();
+    const noName = JSON.stringify({
+      description: 'bowl',
+      items: [{ food: 'rice' }],
+      totals: {
+        dietary_energy_consumed: 640,
+        dietary_protein: 44,
+        dietary_carbohydrates: 71,
+        dietary_fat_total: 19,
+      },
+      confidence: 0.7,
+    });
+
+    const result = await processPhoto(db, row, '/media', { runner: async () => noName });
+
+    expect(result.status).toBe('failed');
+    expect(result.detail).toBe('an item in the estimate has no name');
+    expect(count('SELECT COUNT(*) AS n FROM meals')).toBe(0);
+    expect(count('SELECT COUNT(*) AS n FROM telegram_updates WHERE extracted_at IS NOT NULL')).toBe(
+      1,
+    );
+  });
+
+  it('says so when the cap is reached rather than going quiet', async () => {
     // A photo silently not processed is believed to be logged.
     const row = photoRow();
     const calls = new ModelCallsRepo(db);
-    for (let i = 0; i < DAILY_EXTRACTION_CAP; i += 1) {
+    for (let i = 0; i < ESTIMATE_CAP; i += 1) {
       calls.start({ purpose: 'extract_photo', model: 'm', prompt_version: 'v' });
     }
 
@@ -380,7 +480,7 @@ describe('processing a photo', () => {
 
     expect(result.status).toBe('capped');
     expect(result.reply).toContain('limit');
-    expect(extractionBudget(db).remaining).toBe(0);
+    expect(estimateBudget(db).remaining).toBe(0);
   });
 
   // The cap used to be a counter keyed by the MEAL's day, so a correction sent
@@ -394,7 +494,7 @@ describe('processing a photo', () => {
     );
     calls.start({ purpose: 'route', model: 'm', prompt_version: 'v' }); // not an estimate
 
-    expect(extractionBudget(db).used).toBe(1);
+    expect(estimateBudget(db).used).toBe(1);
   });
 
   it('reports a not-food photo instead of inventing a meal', async () => {
@@ -502,7 +602,7 @@ describe('corrections', () => {
 
     const result = await applyCorrection(
       db,
-      { text: 'closer to 820 kcal, bigger portion', isForwarded: false },
+      { text: 'closer to 820 kcal, bigger portion', isForwarded: false, updateId: textRow().id },
       '/media',
       { runner: async () => CORRECTED },
     );
@@ -536,7 +636,7 @@ describe('corrections', () => {
 
     const result = await applyCorrection(
       db,
-      { text: 'much bigger', isForwarded: false },
+      { text: 'much bigger', isForwarded: false, updateId: textRow().id },
       '/media',
       {
         runner: async () =>
@@ -562,7 +662,7 @@ describe('corrections', () => {
     await savedMeal();
     const result = await applyCorrection(
       db,
-      { text: 'make it 3000 kcal', isForwarded: true },
+      { text: 'make it 3000 kcal', isForwarded: true, updateId: textRow().id },
       '/media',
       { runner: async () => CORRECTED },
     );
@@ -577,7 +677,7 @@ describe('corrections', () => {
 
     const result = await applyCorrection(
       db,
-      { text: 'actually it was smaller', isForwarded: false },
+      { text: 'actually it was smaller', isForwarded: false, updateId: textRow().id },
       '/media',
       { runner: async () => CORRECTED },
     );
@@ -592,7 +692,7 @@ describe('corrections', () => {
   it('says so when there is nothing recent to correct', async () => {
     const result = await applyCorrection(
       db,
-      { text: 'that was actually 400 kcal', isForwarded: false },
+      { text: 'that was actually 400 kcal', isForwarded: false, updateId: textRow().id },
       '/media',
       { runner: async () => CORRECTED },
     );
@@ -618,7 +718,7 @@ describe('corrections', () => {
 
     const result = await applyCorrection(
       db,
-      { text: 'still wrong', isForwarded: false },
+      { text: 'still wrong', isForwarded: false, updateId: textRow().id },
       '/media',
       { runner: async () => CORRECTED },
     );
@@ -633,12 +733,17 @@ describe('corrections', () => {
   it('gives the model the whole previous estimate, not only its numbers', async () => {
     await savedMeal();
     let seen = { systemPrompt: '', userPrompt: '' };
-    await applyCorrection(db, { text: 'bigger portion', isForwarded: false }, '/media', {
-      runner: async (args) => {
-        seen = args;
-        return CORRECTED;
+    await applyCorrection(
+      db,
+      { text: 'bigger portion', isForwarded: false, updateId: textRow().id },
+      '/media',
+      {
+        runner: async (args) => {
+          seen = args;
+          return CORRECTED;
+        },
       },
-    });
+    );
 
     expect(seen.userPrompt).toContain('"totals"');
     expect(seen.userPrompt).toContain('chicken bowl'); // the stored description
@@ -654,7 +759,7 @@ describe('corrections', () => {
 
     const result = await applyCorrection(
       db,
-      { text: 'the rice was quinoa', isForwarded: false },
+      { text: 'the rice was quinoa', isForwarded: false, updateId: textRow().id },
       '/media',
       { runner: async () => '{"mismatch": true, "reason": "There is no rice in this meal."}' },
     );
@@ -686,7 +791,7 @@ describe('corrections', () => {
 
     const result = await applyCorrection(
       db,
-      { text: 'a bit less chicken', isForwarded: false },
+      { text: 'a bit less chicken', isForwarded: false, updateId: textRow().id },
       '/media',
       { runner: async () => flat },
     );
@@ -707,7 +812,7 @@ describe('corrections', () => {
 
     const result = await applyCorrection(
       db,
-      { text: 'bigger portion', isForwarded: false },
+      { text: 'bigger portion', isForwarded: false, updateId: textRow().id },
       '/media',
       { runner: async () => CORRECTED },
     );
@@ -719,7 +824,7 @@ describe('corrections', () => {
 
   it('records the correction call and marks its message in the same write', async () => {
     const mealId = await savedMeal();
-    const text = photoRow({ update_id: 7, message_id: 907 }); // stands in for the text row
+    const text = textRow();
 
     const result = await applyCorrection(
       db,
@@ -749,9 +854,14 @@ describe('corrections', () => {
     const mealId = await savedMeal();
     const answer = '{"mismatch": true, "reason": "No rice here."}';
 
-    await applyCorrection(db, { text: 'the rice was quinoa', isForwarded: false }, '/media', {
-      runner: async () => answer,
-    });
+    await applyCorrection(
+      db,
+      { text: 'the rice was quinoa', isForwarded: false, updateId: textRow().id },
+      '/media',
+      {
+        runner: async () => answer,
+      },
+    );
 
     expect(modelCalls().find((c) => c.purpose === 'correct')).toMatchObject({
       outcome: 'mismatch',
@@ -763,24 +873,58 @@ describe('corrections', () => {
     ).toMatchObject({ n: 1 });
   });
 
-  // Backstop for a re-run of an already-handled message: one message amends
-  // a given meal at most once, even if something runs it twice.
-  it('never stores two amendments of one meal from the same message', async () => {
+  // One message amends a given meal at most once, even if something runs it
+  // twice — and the second run is caught before it pays for a model call.
+  it('recognises a correction that is already applied, without calling the model', async () => {
     const mealId = await savedMeal();
-    const text = photoRow({ update_id: 7, message_id: 907 });
+    const text = textRow();
+    let modelRuns = 0;
     const correct = () =>
       applyCorrection(
         db,
         { text: 'bigger portion', isForwarded: false, updateId: text.id },
         '/media',
-        { runner: async () => CORRECTED },
+        {
+          runner: async () => {
+            modelRuns += 1;
+            return CORRECTED;
+          },
+        },
       );
 
     expect((await correct()).status).toBe('corrected');
-    expect((await correct()).status).toBe('failed');
+    const again = await correct();
+    expect(again.reply).toContain('already applied');
+    expect(modelRuns).toBe(1);
     expect(
       db.prepare('SELECT COUNT(*) AS n FROM meal_extractions WHERE meal_id = ?').get(mealId),
     ).toMatchObject({ n: 2 });
+  });
+
+  // A reply names its meal or nothing: a reply to a bot message that never
+  // presented a meal used to fall back to "the only recent meal".
+  it('refuses a correction that replies to a message that is not a meal', async () => {
+    const mealId = await savedMeal();
+    let ran = false;
+
+    const result = await applyCorrection(
+      db,
+      { text: 'add 200 kcal', replyToMessageId: 4242, isForwarded: false, updateId: textRow().id },
+      '/media',
+      {
+        runner: async () => {
+          ran = true;
+          return CORRECTED;
+        },
+      },
+    );
+
+    expect(result.status).toBe('refused');
+    expect(result.reply).toContain("isn't one of your meals");
+    expect(ran).toBe(false);
+    expect(
+      db.prepare('SELECT COUNT(*) AS n FROM meal_extractions WHERE meal_id = ?').get(mealId),
+    ).toMatchObject({ n: 1 });
   });
 
   it('refuses to amend a voided meal instead of silently not counting it', async () => {

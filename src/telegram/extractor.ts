@@ -92,7 +92,7 @@ export interface CallMetrics {
   duration_ms: number;
 }
 
-async function run(
+async function timedRun(
   runner: QueryRunner,
   args: Parameters<QueryRunner>[0],
 ): Promise<{ text: string } & CallMetrics> {
@@ -142,13 +142,34 @@ export function parseExtraction(text: string): ExtractedMeal {
 
   return {
     description: typeof parsed.description === 'string' ? parsed.description : '',
-    items: Array.isArray(parsed.items) ? parsed.items : [],
+    items: Array.isArray(parsed.items) ? parsed.items.map(checkedItem) : [],
     totals,
     confidence:
       typeof parsed.confidence === 'number' && parsed.confidence >= 0 && parsed.confidence <= 1
         ? parsed.confidence
         : null,
     notes: typeof parsed.notes === 'string' ? parsed.notes : null,
+  };
+}
+
+/**
+ * One item, checked field by field. Not trusted as it arrives: an item with no
+ * string name failed the database write (NOT NULL) and was retried every poll
+ * cycle, each retry a paid call, until the day's cap was gone. A malformed
+ * item fails the estimate here instead, visibly and once.
+ */
+function checkedItem(raw: unknown): ExtractedItem {
+  const item = (raw ?? {}) as Record<string, unknown>;
+  const name = typeof item['name'] === 'string' ? item['name'].trim() : '';
+  if (!name) throw new Error('an item in the estimate has no name');
+  const number = (value: unknown) =>
+    typeof value === 'number' && Number.isFinite(value) ? value : null;
+  const confidence = number(item['confidence']);
+  return {
+    name,
+    portion_text: typeof item['portion_text'] === 'string' ? item['portion_text'] : null,
+    grams: number(item['grams']),
+    confidence: confidence !== null && confidence >= 0 && confidence <= 1 ? confidence : null,
   };
 }
 
@@ -223,7 +244,7 @@ export async function extractMeal(
   let raw: string | undefined;
   let metrics: Partial<CallMetrics> = {};
   try {
-    const out = await run(options.runner ?? defaultRunner, {
+    const out = await timedRun(options.runner ?? defaultRunner, {
       systemPrompt,
       userPrompt,
       photoPath: ctx.photoPath,
@@ -265,7 +286,7 @@ export async function correctMeal(
   let raw: string | undefined;
   let metrics: Partial<CallMetrics> = {};
   try {
-    const out = await run(options.runner ?? defaultRunner, {
+    const out = await timedRun(options.runner ?? defaultRunner, {
       systemPrompt,
       userPrompt,
       photoPath: ctx.photoPath,
@@ -283,6 +304,9 @@ export async function correctMeal(
     };
   }
 }
+
+/** An error this file wrote, so its message is known to carry no model text. */
+class ModelCallError extends Error {}
 
 /** The real agent call. Isolated so tests can replace it wholesale. */
 const defaultRunner: QueryRunner = async ({ systemPrompt, userPrompt, photoPath, model }) => {
@@ -320,19 +344,29 @@ const defaultRunner: QueryRunner = async ({ systemPrompt, userPrompt, photoPath,
   let answer = '';
   let usage: unknown;
   let cost_usd: number | undefined;
-  for await (const message of iterator) {
-    if (message.type === 'assistant' && message.message?.content) {
-      for (const block of message.message.content) {
-        if (block.type === 'text') answer += block.text;
+  try {
+    for await (const message of iterator) {
+      if (message.type === 'assistant' && message.message?.content) {
+        for (const block of message.message.content) {
+          if (block.type === 'text') answer += block.text;
+        }
+      }
+      if (message.type === 'result') {
+        usage = message.usage;
+        cost_usd = message.total_cost_usd;
+        // The subtype, not `result`: this error is logged, and whether the SDK
+        // puts model text into `result` on failure is not something to rely on.
+        if (message.subtype !== 'success' || message.is_error) {
+          throw new ModelCallError(`model call ended: ${message.subtype}`);
+        }
       }
     }
-    if (message.type === 'result') {
-      usage = message.usage;
-      cost_usd = message.total_cost_usd;
-      // The subtype, not `result`: this error is logged, and whether the SDK
-      // puts model text into `result` on failure is not something to rely on.
-      if (message.subtype !== 'success') throw new Error(`model call ended: ${message.subtype}`);
-    }
+  } catch (err) {
+    if (err instanceof ModelCallError) throw err;
+    // The SDK's own errors can quote the result text ("Claude Code returned an
+    // error result: …"), and this message is logged. Keep only what kind of
+    // error it was.
+    throw new ModelCallError(`model call failed (${(err as Error).name})`);
   }
 
   if (!answer.trim()) throw new Error('model returned no text');

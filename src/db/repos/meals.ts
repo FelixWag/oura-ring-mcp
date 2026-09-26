@@ -16,6 +16,7 @@
  */
 
 import type { Db } from '../index.js';
+import { IDENTIFIES_MEAL, PRESENTS_MEAL } from './bot_messages.js';
 import { toCanonical, CANONICAL_UNITS } from '../../health/units.js';
 import {
   validateMealTotals,
@@ -102,6 +103,15 @@ const NUTRIENT_TYPES = Object.keys(CANONICAL_UNITS).filter((t) => t.startsWith('
 
 function nowIso(): string {
   return new Date().toISOString();
+}
+
+/** Named parameters for an IN list of bot message kinds. */
+function kindParams(kinds: readonly string[]): { sql: string; params: Record<string, string> } {
+  const params: Record<string, string> = {};
+  kinds.forEach((kind, i) => {
+    params[`kind${i}`] = kind;
+  });
+  return { sql: kinds.map((_, i) => `@kind${i}`).join(', '), params };
 }
 
 export class MealsRepo {
@@ -372,6 +382,12 @@ export class MealsRepo {
   correctableMeals(
     withinHours = 24,
     limit = 10,
+    /**
+     * Only meals that came through this bot. Message ids restart at 1 in a new
+     * bot's chat, so without it a reply to the new bot's message N could bind
+     * to the meal whose old-bot estimate was also message N.
+     */
+    botId?: number,
   ): Array<{
     meal_id: number;
     source_id: number;
@@ -386,9 +402,10 @@ export class MealsRepo {
     depth: number;
   }> {
     const cutoff = Math.floor(Date.now() / 1000) - withinHours * 3600;
+    const kinds = kindParams(PRESENTS_MEAL);
     const rows = this.db
       .prepare<
-        [number, number],
+        [Record<string, unknown>],
         {
           meal_id: number;
           source_id: number;
@@ -402,17 +419,19 @@ export class MealsRepo {
                 COALESCE(t.message_id, 0) AS source_id,
                 m.prompt_message_id AS prompt_message_id,
                 (SELECT group_concat(b.message_id) FROM telegram_bot_messages b
-                  WHERE b.meal_id = m.id AND b.kind IN ('estimate', 'amended')) AS bot_message_ids,
+                  WHERE b.meal_id = m.id AND b.kind IN (${kinds.sql})
+                    AND (@botId IS NULL OR b.bot_id = @botId)) AS bot_message_ids,
                 e.description AS description,
                 (SELECT COUNT(*) FROM meal_extractions x WHERE x.meal_id = m.id) - 1 AS depth
            FROM meals m
            JOIN meal_extractions e ON e.id = m.current_extraction_id
            LEFT JOIN meal_media mm ON mm.meal_id = m.id AND mm.source_kind = 'telegram'
            LEFT JOIN telegram_updates t ON t.id = mm.source_id
-          WHERE m.status <> 'voided' AND m.eaten_epoch >= ?
-          ORDER BY m.eaten_epoch DESC LIMIT ?`,
+          WHERE m.status <> 'voided' AND m.eaten_epoch >= @cutoff
+            AND (@botId IS NULL OR t.bot_id = @botId)
+          ORDER BY m.eaten_epoch DESC LIMIT @limit`,
       )
-      .all(cutoff, limit);
+      .all({ cutoff, limit, botId: botId ?? null, ...kinds.params });
     return rows.map((row) => ({
       ...row,
       bot_message_ids: row.bot_message_ids ? row.bot_message_ids.split(',').map(Number) : [],
@@ -426,22 +445,26 @@ export class MealsRepo {
    */
   findByTelegramMessage(
     messageId: number,
+    botId?: number,
   ): { meal_id: number; status: MealStatus; eaten_epoch: number } | undefined {
+    const kinds = kindParams(IDENTIFIES_MEAL);
     return this.db
       .prepare<
-        [number, number, number],
+        [Record<string, unknown>],
         { meal_id: number; status: MealStatus; eaten_epoch: number }
       >(
         `SELECT m.id AS meal_id, m.status, m.eaten_epoch
            FROM meals m
            LEFT JOIN meal_media mm ON mm.meal_id = m.id AND mm.source_kind = 'telegram'
            LEFT JOIN telegram_updates t ON t.id = mm.source_id
-          WHERE m.prompt_message_id = ? OR t.message_id = ?
-             OR m.id IN (SELECT b.meal_id FROM telegram_bot_messages b
-                          WHERE b.message_id = ? AND b.kind IN ('estimate', 'amended', 'removed'))
+          WHERE (m.prompt_message_id = @id OR t.message_id = @id
+                 OR m.id IN (SELECT b.meal_id FROM telegram_bot_messages b
+                              WHERE b.message_id = @id AND b.kind IN (${kinds.sql})
+                                AND (@botId IS NULL OR b.bot_id = @botId)))
+            AND (@botId IS NULL OR t.bot_id = @botId)
           ORDER BY m.id DESC LIMIT 1`,
       )
-      .get(messageId, messageId, messageId);
+      .get({ id: messageId, botId: botId ?? null, ...kinds.params });
   }
 
   /** What this meal currently contributes, read back from the projection. */

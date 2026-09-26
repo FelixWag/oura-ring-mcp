@@ -689,6 +689,7 @@ describe('replies', () => {
         text: stored.text!,
         ...(replyTo !== undefined ? { replyToMessageId: replyTo } : {}),
         isForwarded: false,
+        updateId: stored.id,
       },
       '/media',
       { runner: async () => CORRECTED },
@@ -776,6 +777,15 @@ describe('replies', () => {
       new MealsRepo(db).void(first, 'test setup: leave one meal');
 
       const result = rejectMeal(db, 999);
+      expect(result.status).toBe('not_a_meal');
+      expect(status(second)).toBe('confirmed');
+    });
+
+    // Message ids restart at 1 in a new bot's chat, so a reply is only ever
+    // matched against meals that came through the same bot.
+    it("does not match a reply against another bot's meals", async () => {
+      const { second } = await albumOfTwoMeals();
+      const result = rejectMeal(db, 903, CONFIG.botId + 1);
       expect(result.status).toBe('not_a_meal');
       expect(status(second)).toBe('confirmed');
     });

@@ -39,7 +39,9 @@ import {
   formatEstimate,
   mealLabel,
   rejectMeal,
+  type CorrectionResult,
   type PendingMeal,
+  type ProcessPhotoResult,
 } from './meal_flow.js';
 
 export interface ClassifiedMessage {
@@ -374,9 +376,10 @@ export async function drainMedia(
  * each one so an explicit reply can be matched to it.
  */
 function pendingMeals(db: Db): PendingMeal[] {
-  return db
-    .prepare<[], PendingMeal>(
-      `SELECT m.id AS meal_id, t.message_id AS source_id,
+  return (
+    db
+      .prepare<[], Omit<PendingMeal, 'bot_message_ids'>>(
+        `SELECT m.id AS meal_id, t.message_id AS source_id,
               m.prompt_message_id AS prompt_message_id, e.description AS description
          FROM meals m
          JOIN meal_media mm ON mm.meal_id = m.id AND mm.source_kind = 'telegram'
@@ -384,8 +387,11 @@ function pendingMeals(db: Db): PendingMeal[] {
          LEFT JOIN meal_extractions e ON e.id = m.current_extraction_id
         WHERE m.status = 'unconfirmed'
         ORDER BY m.id DESC`,
-    )
-    .all();
+      )
+      .all()
+      // A pending meal has had no estimate presented beyond its first prompt.
+      .map((meal) => ({ ...meal, bot_message_ids: [] }))
+  );
 }
 
 /**
@@ -454,17 +460,55 @@ const EDIT_NOT_RERUN =
  * meal. Only the first estimate used to be remembered; a reply to "Updated:"
  * or "Removed" matched nothing.
  */
+interface SentMessageMeta {
+  kind: BotMessageKind;
+  meal_id?: number | undefined;
+  answers_update_id?: number | undefined;
+  model_call_id?: number | undefined;
+}
+
+/**
+ * What each outcome's reply is recorded as. Total on purpose: a new status
+ * must decide whether its reply presents a meal (and so binds a reply to it)
+ * instead of silently becoming 'reply'.
+ */
+const PHOTO_REPLY_KIND: Record<ProcessPhotoResult['status'], BotMessageKind> = {
+  extracted: 'estimate',
+  failed: 'failed',
+  not_food: 'reply',
+  refused: 'reply',
+  capped: 'reply',
+};
+const CORRECTION_REPLY_KIND: Record<CorrectionResult['status'], BotMessageKind> = {
+  corrected: 'amended',
+  mismatch: 'mismatch',
+  failed: 'failed',
+  ambiguous: 'ambiguous',
+  refused: 'reply',
+  capped: 'reply',
+  no_target: 'reply',
+};
+
+/**
+ * A log that cannot stop a reply. A failed log write used to skip the rest of
+ * the loop body: the change was saved and marked, and the user never told.
+ */
+function quietly(log: (line: string) => Promise<void>): (line: string) => Promise<void> {
+  return async (line) => {
+    try {
+      await log(line);
+    } catch (err) {
+      process.stderr.write(`telegram log write failed: ${(err as Error).name}\n`);
+    }
+  };
+}
+
 async function sendAndRecord(
   db: Db,
   client: TelegramClient,
   config: TelegramConfig,
   text: string,
-  meta: {
-    kind: BotMessageKind;
-    meal_id?: number | undefined;
-    answers_update_id?: number | undefined;
-    model_call_id?: number | undefined;
-  },
+  meta: SentMessageMeta,
 ): Promise<number | null> {
   const messageId = await client.sendMessage(config.allowedChatId, text);
   if (messageId !== null) {
@@ -496,10 +540,7 @@ async function skipEdit(
   kind: 'photo' | 'text',
   id: number,
 ): Promise<void> {
-  db.prepare('UPDATE telegram_updates SET extracted_at = ? WHERE id = ?').run(
-    new Date().toISOString(),
-    id,
-  );
+  new TelegramUpdatesRepo(db).markHandled(id);
   await log(`${kind} ${id}: edit of a handled message, not re-run`);
   await sendAndRecord(db, client, config, EDIT_NOT_RERUN, { kind: 'reply', answers_update_id: id });
 }
@@ -516,6 +557,7 @@ async function drainPhotos(
   config: TelegramConfig,
   log: (line: string) => Promise<void>,
 ): Promise<void> {
+  const note = quietly(log);
   const rows = db
     .prepare<[], { id: number; bot_id: number; chat_id: number; message_id: number }>(
       `SELECT t.id, t.bot_id, t.chat_id, t.message_id FROM telegram_updates t
@@ -528,7 +570,7 @@ async function drainPhotos(
 
   for (const { id, bot_id, chat_id, message_id } of rows) {
     if (isEditOfHandledMessage(db, { id, bot_id, chat_id, message_id })) {
-      await skipEdit(db, client, config, log, 'photo', id);
+      await skipEdit(db, client, config, note, 'photo', id);
       continue;
     }
     const row = db
@@ -541,18 +583,16 @@ async function drainPhotos(
 
     try {
       const result = await processPhoto(db, row, config.mediaDir);
-      // Marked whatever the outcome: a photo that produced no meal must not
-      // be retried on every cycle, spending money and repeating the reply.
-      db.prepare('UPDATE telegram_updates SET extracted_at = ? WHERE id = ?').run(
-        new Date().toISOString(),
-        id,
-      );
-      await log(
+      // Outcomes that ran a model are already marked, in the transaction that
+      // saved them. This marks the ones that wrote nothing (refused, capped),
+      // so they are not retried every cycle, repeating the reply.
+      new TelegramUpdatesRepo(db).markHandled(id);
+      await note(
         withDetail(withCall(`photo ${id}: ${result.status}`, result.model_call_id), result.detail),
       );
 
       const promptId = await sendAndRecord(db, client, config, result.reply, {
-        kind: result.status === 'extracted' ? 'estimate' : 'reply',
+        kind: PHOTO_REPLY_KIND[result.status],
         meal_id: result.meal_id,
         answers_update_id: id,
         model_call_id: result.model_call_id,
@@ -567,7 +607,7 @@ async function drainPhotos(
     } catch (err) {
       // A crash is different from a refusal: leave extracted_at unset so a
       // transient fault (a model hiccup, a full disk) gets another chance.
-      await log(`photo ${id}: extraction crashed: ${(err as Error).message}`);
+      await note(`photo ${id}: extraction crashed: ${(err as Error).name}`);
     }
   }
 }
@@ -576,9 +616,9 @@ async function drainPhotos(
  * Handle text messages: confirmations, rejections, corrections, notes.
  *
  * Drained rather than handled in the batch loop, because a correction runs a
- * model. `extracted_at` marks the attempt whatever the outcome, so a restart
- * mid-correction cannot apply the same amendment twice — an append-only chain
- * would keep both, and if the two model runs differ they disagree forever.
+ * model. A correction marks its message inside the transaction that stores
+ * it, so a restart cannot apply the same amendment twice; the mark at the end
+ * of this loop covers only outcomes that wrote nothing.
  */
 export async function drainText(
   db: Db,
@@ -588,6 +628,7 @@ export async function drainText(
   /** Tests only: a stand-in model, so the loop can run without calling one. */
   options: { runner?: QueryRunner } = {},
 ): Promise<void> {
+  const note = quietly(log);
   const rows = db
     .prepare<
       [],
@@ -609,21 +650,21 @@ export async function drainText(
 
   for (const row of rows) {
     if (isEditOfHandledMessage(db, row)) {
-      await skipEdit(db, client, config, log, 'text', row.id);
+      await skipEdit(db, client, config, note, 'text', row.id);
       continue;
     }
     const intent = readConfirmation(row.text, replyTargetOf(row.raw));
 
     let reply: string;
-    let meta: Parameters<typeof sendAndRecord>[4] = { kind: 'reply', answers_update_id: row.id };
+    let meta: SentMessageMeta = { kind: 'reply', answers_update_id: row.id };
     try {
       if (intent.kind === 'confirm') {
         reply = confirmPending(db, intent.replyToMessageId);
       } else if (intent.kind === 'reject') {
         // Logged, with the meal: a removal cannot be undone from chat, so the
         // log is what links a voided meal to the message that asked for it.
-        const result = rejectMeal(db, intent.replyToMessageId);
-        await log(
+        const result = rejectMeal(db, intent.replyToMessageId, config.botId);
+        await note(
           `text ${row.id}: no ${result.status}` +
             (result.meal_id !== undefined ? ` (meal ${result.meal_id})` : ''),
         );
@@ -643,26 +684,21 @@ export async function drainText(
               : {}),
             isForwarded: row.is_forwarded === 1,
             updateId: row.id,
+            botId: config.botId,
           },
           config.mediaDir,
           options,
         );
-        await log(
+        await note(
           withDetail(
             withCall(`text ${row.id}: correction ${result.status}`, result.model_call_id),
             result.detail,
           ),
         );
         reply = result.reply;
-        const kinds: Partial<Record<typeof result.status, BotMessageKind>> = {
-          corrected: 'amended',
-          mismatch: 'mismatch',
-          ambiguous: 'ambiguous',
-          failed: 'failed',
-        };
         meta = {
           ...meta,
-          kind: kinds[result.status] ?? 'reply',
+          kind: CORRECTION_REPLY_KIND[result.status],
           meal_id: result.meal_id,
           model_call_id: result.model_call_id,
         };
@@ -670,15 +706,13 @@ export async function drainText(
         reply = 'Got it — noted.';
       }
     } catch (err) {
-      // Left unmarked so a transient fault gets another attempt.
-      await log(`text ${row.id}: failed: ${(err as Error).message}`);
+      // Left unmarked so a transient fault gets another attempt; the attempt
+      // limit per message stops one that repeats.
+      await note(`text ${row.id}: failed: ${(err as Error).name}`);
       continue;
     }
 
-    db.prepare('UPDATE telegram_updates SET extracted_at = ? WHERE id = ?').run(
-      new Date().toISOString(),
-      row.id,
-    );
+    new TelegramUpdatesRepo(db).markHandled(row.id);
     await sendAndRecord(db, client, config, reply, meta);
   }
 }
