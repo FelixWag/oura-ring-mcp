@@ -67,24 +67,79 @@ export function isForwarded(message: TelegramMessage): boolean {
 }
 
 /**
+ * What a forward keeps: that it arrived, when, in which chat. Everything else
+ * — text, caption, media names, story, poll, origin — is someone else's, and
+ * nothing reads a forward's content (it is classified 'other' and its media
+ * is never downloaded), so an allowlist loses nothing. The names of dropped
+ * keys are kept, so an unknown kind stays visible rather than silent.
+ */
+const KEPT_FORWARD_KEYS = new Set([
+  'message_id',
+  'date',
+  'edit_date',
+  'chat',
+  'from',
+  'media_group_id',
+]);
+
+/**
+ * Other people carried inside the owner's own messages. A list of known
+ * shapes, not a guarantee: the owner's own content has to stay lossless, so an
+ * allowlist would lose it whenever Telegram adds a field.
+ */
+const THIRD_PARTY_KEYS = [
+  'quote', // the quoted part of a replied-to message
+  'external_reply', // a reply to a message in another chat: names its sender
+  'contact', // a contact card: someone's name, phone number, user id
+  'story', // a shared story: its poster's chat
+  'reply_to_story',
+  'pinned_message', // a whole nested message, forwards included
+  'users_shared',
+  'chat_shared',
+  'giveaway',
+  'giveaway_winners', // a list of users
+  'checklist', // tasks record who completed them
+] as const;
+
+/**
  * Strip a nested third party out of an update before it is stored.
  *
  * `reply_to_message` and `quote` embed another person's message wholesale —
  * their user id, their name, their words — inside an update whose envelope is
  * the owner's. "Nothing about a third party is stored" has to survive the
- * nesting, not just the top level.
+ * nesting, not just the top level — and forwards, contacts, stories and
+ * replies to other chats are nestings too.
  */
 export function redactNested(update: TelegramUpdate): TelegramUpdate {
   const clean = JSON.parse(JSON.stringify(update)) as TelegramUpdate;
   for (const message of [clean.message, clean.edited_message]) {
     if (!message) continue;
+    const fields = message as unknown as Record<string, unknown>;
+
+    if (isForwarded(message)) {
+      const origin = message.forward_origin as { type?: unknown } | undefined;
+      const originType = typeof origin?.type === 'string' ? origin.type : 'unknown';
+      const dropped = Object.keys(fields).filter((key) => !KEPT_FORWARD_KEYS.has(key));
+      for (const key of dropped) delete fields[key];
+      fields['forwarded'] = { origin_type: originType, dropped_keys: dropped.sort() };
+      continue;
+    }
+
+    for (const key of THIRD_PARTY_KEYS) delete fields[key];
+    // A mention by name (`text_mention`) carries that person's user record;
+    // text pasted from a group can bring one along. Keep where it is, drop who.
+    for (const key of ['entities', 'caption_entities'] as const) {
+      const entities = fields[key];
+      if (!Array.isArray(entities)) continue;
+      for (const entity of entities as Array<Record<string, unknown>>) delete entity['user'];
+    }
+
     // Keep the id, drop the message. The id is the only thing that binds a
     // reply to a meal, and it carries no one's name or words. Deleting it too
     // made every reply arrive as a bare message: from v0.11 to v0.12.1 no
     // correction or "no" could name its meal, and each asked "which meal?".
     const replyTo = asMessageId(message.reply_to_message?.message_id);
     delete message.reply_to_message;
-    delete message.quote;
     if (replyTo !== undefined) {
       message.reply_to_message = { message_id: replyTo } as TelegramMessage;
     }
@@ -360,6 +415,56 @@ function withDetail(line: string, detail: string | undefined): string {
 }
 
 /**
+ * Is this row an edit of a message the bot already acted on?
+ *
+ * An edit arrives as a new row for the same message, and the drain loops pick
+ * up any row not yet handled. Re-running it was wrong both ways: an edited
+ * correction was applied on top of its own result, and an edited photo caption
+ * created a second meal from the same photo that counted twice. So the edit is
+ * recorded, not re-run, and the reply says so.
+ */
+export function isEditOfHandledMessage(
+  db: Db,
+  row: { id: number; bot_id: number; chat_id: number; message_id: number },
+): boolean {
+  // bot_id: message ids are numbered per bot and restart at 1 for a new bot,
+  // so without it a new bot's messages would collide with the old bot's.
+  return (
+    db
+      .prepare(
+        `SELECT 1 FROM telegram_updates
+          WHERE bot_id = ? AND chat_id = ? AND message_id = ? AND id <> ?
+            AND extracted_at IS NOT NULL
+          LIMIT 1`,
+      )
+      .get(row.bot_id, row.chat_id, row.message_id, row.id) !== undefined
+  );
+}
+
+// General on purpose: the original may have been a failed photo or a question,
+// so there is not always a "Saved:" message to point at.
+const EDIT_NOT_RERUN =
+  "I've already answered that message, so I haven't re-run the edit. Send the " +
+  'change as a new message, or reply to the meal\'s "Saved:" message.';
+
+/** Mark a row handled without acting on it, and tell the user why. */
+async function skipEdit(
+  db: Db,
+  client: TelegramClient,
+  config: TelegramConfig,
+  log: (line: string) => Promise<void>,
+  kind: 'photo' | 'text',
+  id: number,
+): Promise<void> {
+  db.prepare('UPDATE telegram_updates SET extracted_at = ? WHERE id = ?').run(
+    new Date().toISOString(),
+    id,
+  );
+  await log(`${kind} ${id}: edit of a handled message, not re-run`);
+  await client.sendMessage(config.allowedChatId, EDIT_NOT_RERUN);
+}
+
+/**
  * Analyse photos whose file has landed. One extraction per message, and the
  * reply always says what happened — a photo silently left unanalysed is
  * believed to have been logged.
@@ -372,8 +477,8 @@ async function drainPhotos(
   log: (line: string) => Promise<void>,
 ): Promise<void> {
   const rows = db
-    .prepare<[], { id: number }>(
-      `SELECT t.id FROM telegram_updates t
+    .prepare<[], { id: number; bot_id: number; chat_id: number; message_id: number }>(
+      `SELECT t.id, t.bot_id, t.chat_id, t.message_id FROM telegram_updates t
         WHERE t.status = 'stored' AND t.kind IN ('photo', 'document')
           AND t.media_path IS NOT NULL AND t.superseded_by IS NULL
           AND t.extracted_at IS NULL
@@ -381,7 +486,11 @@ async function drainPhotos(
     )
     .all();
 
-  for (const { id } of rows) {
+  for (const { id, bot_id, chat_id, message_id } of rows) {
+    if (isEditOfHandledMessage(db, { id, bot_id, chat_id, message_id })) {
+      await skipEdit(db, client, config, log, 'photo', id);
+      continue;
+    }
     const row = db
       .prepare<
         [number],
@@ -424,21 +533,36 @@ async function drainPhotos(
  * mid-correction cannot apply the same amendment twice — an append-only chain
  * would keep both, and if the two model runs differ they disagree forever.
  */
-async function drainText(
+export async function drainText(
   db: Db,
   client: TelegramClient,
   config: TelegramConfig,
   log: (line: string) => Promise<void>,
 ): Promise<void> {
   const rows = db
-    .prepare<[], { id: number; text: string | null; raw: string; is_forwarded: number }>(
-      `SELECT id, text, raw, is_forwarded FROM telegram_updates
+    .prepare<
+      [],
+      {
+        id: number;
+        bot_id: number;
+        chat_id: number;
+        message_id: number;
+        text: string | null;
+        raw: string;
+        is_forwarded: number;
+      }
+    >(
+      `SELECT id, bot_id, chat_id, message_id, text, raw, is_forwarded FROM telegram_updates
         WHERE kind = 'text' AND extracted_at IS NULL AND superseded_by IS NULL
         ORDER BY id LIMIT 5`,
     )
     .all();
 
   for (const row of rows) {
+    if (isEditOfHandledMessage(db, row)) {
+      await skipEdit(db, client, config, log, 'text', row.id);
+      continue;
+    }
     const intent = readConfirmation(row.text, replyTargetOf(row.raw));
 
     let reply: string;

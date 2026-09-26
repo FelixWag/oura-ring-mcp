@@ -104,9 +104,13 @@ export class TelegramUpdatesRepo {
     // An edit arrives as a new update carrying the same message_id. Keep both
     // and point the older at the newer, so a consumer reading the message
     // later can tell which version is current rather than counting both.
+    // Scoped by bot: message ids in a private chat are numbered per bot and
+    // restart at 1 for a new one, so without bot_id an edit under a new bot
+    // could supersede an unrelated message the old bot received.
     const supersede = this.db.prepare(
       `UPDATE telegram_updates SET superseded_by = ?
-        WHERE chat_id = ? AND message_id = ? AND id <> ? AND superseded_by IS NULL`,
+        WHERE bot_id = ? AND chat_id = ? AND message_id = ? AND id <> ?
+          AND superseded_by IS NULL`,
     );
     const setMeta = this.db.prepare(
       `INSERT INTO schema_meta (key, value) VALUES (?, ?)
@@ -148,6 +152,7 @@ export class TelegramUpdatesRepo {
           if (u.edits_message_id != null) {
             supersede.run(
               Number(info.lastInsertRowid),
+              u.bot_id,
               u.chat_id,
               u.edits_message_id,
               Number(info.lastInsertRowid),
