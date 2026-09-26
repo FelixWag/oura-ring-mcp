@@ -1084,3 +1084,25 @@ Deferred: keeping a failed correction's raw model answer somewhere durable. It
 is returned now, but it has no home. It doesn't belong in `meal_extractions`
 (an extraction counts towards the correction cap), nor in the log (a plaintext
 copy of meal data). It needs its own table, and so a storage review first.
+
+## v0.12.4: the owner's envelope, and edits that acted twice
+
+Both came from a security review of v0.12.2. The rule is "nothing about a
+third party is stored", and redaction enforced it only for the one nesting it
+knew about, a quoted reply. Three others reached the raw JSON inside messages
+from the owner's own chat: a forward (its text and its sender's id and name), a
+reply to a message from another chat (`external_reply`), and a shared contact
+card. Redaction now removes all three. A forward keeps only the kind of its
+origin, so the record still says a message was forwarded, just not by whom.
+This remains a list of known shapes, not a guarantee. A field Telegram adds
+later would pass through, which is why the tests are written as "this
+stranger's name must not appear" rather than "this key is absent".
+
+Edits were the other finding. An edit arrives as a new row for the same message,
+and the loops that act on messages picked it up like a new one. For a
+correction, that applied the amendment a second time on top of its own result.
+For a photo whose caption was edited, it created a second meal from the same
+photo, and both counted. An edit of a message the bot has already acted on is
+now recorded, marked handled, and answered: the reply says the edit was not
+applied and how to make the change instead. An edit that arrives before the
+original was handled still replaces it, as before.

@@ -74,10 +74,44 @@ export function isForwarded(message: TelegramMessage): boolean {
  * the owner's. "Nothing about a third party is stored" has to survive the
  * nesting, not just the top level.
  */
+/** Everything that says who a forwarded message came from. */
+const FORWARD_FIELDS = [
+  'forward_origin',
+  'forward_from',
+  'forward_from_chat',
+  'forward_sender_name',
+  'forward_signature',
+  'forward_date',
+  'via_bot',
+] as const;
+
 export function redactNested(update: TelegramUpdate): TelegramUpdate {
   const clean = JSON.parse(JSON.stringify(update)) as TelegramUpdate;
   for (const message of [clean.message, clean.edited_message]) {
     if (!message) continue;
+
+    // Other people, carried inside the owner's own message: a reply to a
+    // message in another chat names that chat's sender, and a contact card is
+    // someone else's name and phone number.
+    delete message.external_reply;
+    delete message.contact;
+
+    // A forward's words and origin are someone else's. The indexed `text`
+    // column was already nulled for forwards; `raw` kept both. Keep only the
+    // KIND of origin, which says "forwarded" without saying from whom.
+    if (isForwarded(message)) {
+      const origin = message.forward_origin as { type?: unknown } | undefined;
+      const originType = typeof origin?.type === 'string' ? origin.type : 'unknown';
+      for (const field of FORWARD_FIELDS) delete message[field];
+      delete message.text;
+      delete message.caption;
+      delete message.entities;
+      delete message.caption_entities;
+      (message as TelegramMessage & { forwarded?: unknown }).forwarded = {
+        origin_type: originType,
+      };
+    }
+
     // Keep the id, drop the message. The id is the only thing that binds a
     // reply to a meal, and it carries no one's name or words. Deleting it too
     // made every reply arrive as a bare message: from v0.11 to v0.12.1 no
@@ -360,6 +394,51 @@ function withDetail(line: string, detail: string | undefined): string {
 }
 
 /**
+ * Is this row an edit of a message the bot already acted on?
+ *
+ * An edit arrives as a new row for the same message, and the drain loops pick
+ * up any row not yet handled. Re-running it was wrong both ways: an edited
+ * correction was applied on top of its own result, and an edited photo caption
+ * created a second meal from the same photo that counted twice. So the edit is
+ * recorded, not re-run, and the reply says so.
+ */
+export function isEditOfHandledMessage(
+  db: Db,
+  row: { id: number; chat_id: number; message_id: number },
+): boolean {
+  return (
+    db
+      .prepare(
+        `SELECT 1 FROM telegram_updates
+          WHERE chat_id = ? AND message_id = ? AND id <> ? AND extracted_at IS NOT NULL
+          LIMIT 1`,
+      )
+      .get(row.chat_id, row.message_id, row.id) !== undefined
+  );
+}
+
+const EDIT_NOT_RERUN =
+  "I've already acted on that message, so I haven't re-run the edit. To change a " +
+  'meal, reply to its "Saved:" message with what to change.';
+
+/** Mark a row handled without acting on it, and tell the user why. */
+async function skipEdit(
+  db: Db,
+  client: TelegramClient,
+  config: TelegramConfig,
+  log: (line: string) => Promise<void>,
+  kind: 'photo' | 'text',
+  id: number,
+): Promise<void> {
+  db.prepare('UPDATE telegram_updates SET extracted_at = ? WHERE id = ?').run(
+    new Date().toISOString(),
+    id,
+  );
+  await log(`${kind} ${id}: edit of a handled message, not re-run`);
+  await client.sendMessage(config.allowedChatId, EDIT_NOT_RERUN);
+}
+
+/**
  * Analyse photos whose file has landed. One extraction per message, and the
  * reply always says what happened — a photo silently left unanalysed is
  * believed to have been logged.
@@ -372,8 +451,8 @@ async function drainPhotos(
   log: (line: string) => Promise<void>,
 ): Promise<void> {
   const rows = db
-    .prepare<[], { id: number }>(
-      `SELECT t.id FROM telegram_updates t
+    .prepare<[], { id: number; chat_id: number; message_id: number }>(
+      `SELECT t.id, t.chat_id, t.message_id FROM telegram_updates t
         WHERE t.status = 'stored' AND t.kind IN ('photo', 'document')
           AND t.media_path IS NOT NULL AND t.superseded_by IS NULL
           AND t.extracted_at IS NULL
@@ -381,7 +460,11 @@ async function drainPhotos(
     )
     .all();
 
-  for (const { id } of rows) {
+  for (const { id, chat_id, message_id } of rows) {
+    if (isEditOfHandledMessage(db, { id, chat_id, message_id })) {
+      await skipEdit(db, client, config, log, 'photo', id);
+      continue;
+    }
     const row = db
       .prepare<
         [number],
@@ -424,21 +507,35 @@ async function drainPhotos(
  * mid-correction cannot apply the same amendment twice — an append-only chain
  * would keep both, and if the two model runs differ they disagree forever.
  */
-async function drainText(
+export async function drainText(
   db: Db,
   client: TelegramClient,
   config: TelegramConfig,
   log: (line: string) => Promise<void>,
 ): Promise<void> {
   const rows = db
-    .prepare<[], { id: number; text: string | null; raw: string; is_forwarded: number }>(
-      `SELECT id, text, raw, is_forwarded FROM telegram_updates
+    .prepare<
+      [],
+      {
+        id: number;
+        chat_id: number;
+        message_id: number;
+        text: string | null;
+        raw: string;
+        is_forwarded: number;
+      }
+    >(
+      `SELECT id, chat_id, message_id, text, raw, is_forwarded FROM telegram_updates
         WHERE kind = 'text' AND extracted_at IS NULL AND superseded_by IS NULL
         ORDER BY id LIMIT 5`,
     )
     .all();
 
   for (const row of rows) {
+    if (isEditOfHandledMessage(db, row)) {
+      await skipEdit(db, client, config, log, 'text', row.id);
+      continue;
+    }
     const intent = readConfirmation(row.text, replyTargetOf(row.raw));
 
     let reply: string;

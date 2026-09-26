@@ -32,12 +32,21 @@ export interface TelegramMessage {
   // visible at review time rather than travelling invisibly inside `raw`.
   forward_origin?: unknown;
   forward_from?: unknown;
+  forward_from_chat?: unknown;
   forward_sender_name?: string;
+  forward_signature?: string;
+  forward_date?: number;
   via_bot?: unknown;
   reply_to_message?: TelegramMessage;
   quote?: unknown;
+  /** A reply to a message in ANOTHER chat: carries that chat's sender. */
+  external_reply?: unknown;
+  /** A shared contact card: someone else's name, phone number, user id. */
+  contact?: unknown;
   text?: string;
   caption?: string;
+  entities?: unknown;
+  caption_entities?: unknown;
   photo?: TelegramPhotoSize[];
   voice?: { file_id: string; file_unique_id: string; duration: number; file_size?: number };
   document?: {

@@ -15,6 +15,8 @@ import {
   processBatch,
   replyTargetOf,
   confirmPending,
+  drainText,
+  isEditOfHandledMessage,
   type ClassifiedMessage,
 } from '../src/telegram/server.ts';
 import {
@@ -25,7 +27,7 @@ import {
 } from '../src/telegram/meal_flow.ts';
 import { normalizeExtension } from '../src/telegram/media.ts';
 import type { TelegramConfig } from '../src/config.ts';
-import type { TelegramMessage, TelegramUpdate } from '../src/telegram/client.ts';
+import type { TelegramClient, TelegramMessage, TelegramUpdate } from '../src/telegram/client.ts';
 
 const CONFIG: TelegramConfig = {
   botToken: '123456789:test-secret-never-real',
@@ -223,6 +225,128 @@ describe('edits', () => {
     expect(rows[0]?.text).toBe('chicken bowl');
     expect(rows[0]?.superseded_by).not.toBeNull();
     expect(rows[1]?.superseded_by).toBeNull();
+  });
+  // From a security review: edits were re-run like new messages. An edited
+  // correction was applied on top of its own result, and an edited photo
+  // caption made a second meal from the same photo that counted twice.
+  it('recognises an edit of a message that was already acted on', () => {
+    processBatch([update(1, { message_id: 700, text: 'a bit more rice' })], repo, CONFIG);
+    db.prepare("UPDATE telegram_updates SET extracted_at = '2026-01-01T00:00:00Z'").run();
+    processBatch(
+      [
+        {
+          update_id: 2,
+          edited_message: message({ message_id: 700, text: 'a bit more rice, please' }),
+        },
+      ],
+      repo,
+      CONFIG,
+    );
+
+    const edit = db.prepare('SELECT * FROM telegram_updates WHERE update_id = 2').get() as {
+      id: number;
+      chat_id: number;
+      message_id: number;
+    };
+    expect(isEditOfHandledMessage(db, edit)).toBe(true);
+  });
+
+  it('treats an edit of a message not yet acted on as the message to act on', () => {
+    processBatch([update(1, { message_id: 700, text: 'a bit more rice' })], repo, CONFIG);
+    processBatch(
+      [{ update_id: 2, edited_message: message({ message_id: 700, text: 'more rice' }) }],
+      repo,
+      CONFIG,
+    );
+    const edit = db.prepare('SELECT * FROM telegram_updates WHERE update_id = 2').get() as {
+      id: number;
+      chat_id: number;
+      message_id: number;
+    };
+    expect(isEditOfHandledMessage(db, edit)).toBe(false);
+  });
+
+  it('does not re-run an edited text: it replies that the edit was not applied', async () => {
+    processBatch([update(1, { message_id: 700, text: 'a bit more rice' })], repo, CONFIG);
+    db.prepare("UPDATE telegram_updates SET extracted_at = '2026-01-01T00:00:00Z'").run();
+    processBatch(
+      [{ update_id: 2, edited_message: message({ message_id: 700, text: 'more rice' }) }],
+      repo,
+      CONFIG,
+    );
+
+    const sent: string[] = [];
+    const logged: string[] = [];
+    const client = {
+      sendMessage: async (_chat: number, text: string) => {
+        sent.push(text);
+        return 1;
+      },
+    } as unknown as TelegramClient;
+    await drainText(db, client, CONFIG, async (line) => {
+      logged.push(line);
+    });
+
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toContain("haven't re-run the edit");
+    expect(logged.join('\n')).toContain('edit of a handled message');
+    const edit = db
+      .prepare('SELECT extracted_at FROM telegram_updates WHERE update_id = 2')
+      .get() as { extracted_at: string | null };
+    expect(edit.extracted_at).not.toBeNull();
+  });
+});
+
+describe("third parties inside the owner's messages", () => {
+  const storedRaw = () =>
+    (db.prepare('SELECT raw FROM telegram_updates').get() as { raw: string }).raw;
+
+  it("keeps a forward's kind of origin but not who sent it or what it said", () => {
+    processBatch(
+      [
+        update(1, {
+          text: "a stranger's words",
+          entities: [{ type: 'bold', offset: 0, length: 1 }],
+          forward_origin: {
+            type: 'user',
+            date: 1_767_225_000,
+            sender_user: { id: 999, is_bot: false, first_name: 'Stranger' },
+          },
+        }),
+      ],
+      repo,
+      CONFIG,
+    );
+    const raw = storedRaw();
+    expect(raw).not.toContain('stranger');
+    expect(raw).not.toContain('Stranger');
+    expect(raw).not.toContain('999');
+    expect(JSON.parse(raw).message.forwarded).toEqual({ origin_type: 'user' });
+    const row = db.prepare('SELECT is_forwarded FROM telegram_updates').get() as {
+      is_forwarded: number;
+    };
+    expect(row.is_forwarded).toBe(1);
+  });
+
+  it('drops a reply to another chat and a shared contact card', () => {
+    processBatch(
+      [
+        update(1, {
+          text: 'my own words',
+          external_reply: {
+            origin: { type: 'user', sender_user: { id: 999, first_name: 'Stranger' } },
+          },
+          contact: { phone_number: '+10000000000', first_name: 'Stranger', user_id: 999 },
+        }),
+      ],
+      repo,
+      CONFIG,
+    );
+    const raw = storedRaw();
+    expect(raw).toContain('my own words'); // the owner's own text is kept
+    expect(raw).not.toContain('Stranger');
+    expect(raw).not.toContain('+10000000000');
+    expect(raw).not.toContain('999');
   });
 });
 
