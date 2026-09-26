@@ -1113,3 +1113,63 @@ applied and how to make the change instead. An edit that arrives before the
 original was handled still replaces it, as before. The check is scoped by bot:
 message ids in a private chat are numbered per bot and restart at 1, so without
 it a new bot's messages would be mistaken for edits of the old bot's.
+
+## v0.13: model_calls, and the guarantees that were only in code
+
+The routing release needs to record what a model decided, and to store meals
+that come from text. A storage review before building it found that three
+guarantees the photo path already depended on existed only in code, and that
+the text path would inherit all three. First, one message becomes at most one
+meal. Second, a correction is applied at most once. Third, the spend cap counts
+what was spent today. Each could fail on data that looks entirely normal, so
+each was fixed on its own before the new feature.
+
+"One message, one meal" was enforced by marking the message after it was
+handled. The meal was written in steps — meal, link, estimate, confirmation —
+each its own commit, and the mark came last. A fault anywhere in between left a
+meal and an unmarked message, so the retry made a second meal that counted
+twice. The existing unique key on the meal's media included the meal id, so it
+could never catch this, and the link used `INSERT OR IGNORE`, so a better key
+would have been silently skipped. The save is now one transaction that
+includes the mark. It happens after the model has answered, so a crash leaves
+everything or nothing. A unique key on the source message backs it up, with a
+plain INSERT so the key actually fires.
+
+Corrections had the same gap in a smaller form. The amendment committed, a log
+line was written, and then the mark. So a failed log write was enough to apply
+"add a bread roll" twice. The mark moved into the amendment's transaction, and
+a unique key (message, meal) over accepted estimates makes a repeat
+impossible, not merely unlikely.
+
+The cap was a per-day counter keyed by the day of the meal. So a correction sent
+this morning about last night's dinner was charged to yesterday. Model calls
+now have their own table, `model_calls`: one row per call, started when it
+begins and finished with whatever it wrote, keeping failures and their raw
+answers that previously lived only in a plaintext log. The cap is a count over
+that table for the last 24 hours. A table rather than a column on each
+consumer, because the two questions that matter cross purposes: "what did
+today cost" counts photo estimates and corrections together, and "what
+happened to this message" follows a routing decision into an extraction.
+
+Replies bind to a meal through the bot message they answer, and the bot now
+records every message it sends. Only the first estimate used to be
+remembered, so a reply to "Updated:" matched nothing. Deliberately, only
+messages that _present_ a meal ("Saved:", "Updated:") bind a reply to it. A
+message that merely mentions one ("that doesn't seem to be about …", "I
+couldn't apply that to …") does not. Otherwise a "no" meaning "you're wrong"
+would remove the meal it names.
+
+Review found the one failure the transactions made more likely rather than
+less. Once a save is a single write, a fault inside it rolls everything back,
+including the handled mark. The message is retried, and every retry is a
+paid model call. A fault that repeats (an estimate item with no name failing a
+NOT NULL, reproduced) spent the whole day's cap from one photo. Two changes
+close it. A failure to save is now recorded and marked like any other outcome,
+and each message may cause at most three model calls, counted from
+`model_calls`. So the retry policy is bounded by the data, not by luck. Items
+are also checked before anything is written.
+
+The migration only adds. It was dry-run against a copy of the live database
+before release: row counts unchanged, integrity and foreign keys clean. That
+matters here because every service applies migrations when it opens the
+database, so a migration that fails on real data stops all of them at once.

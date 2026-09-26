@@ -304,11 +304,22 @@ describe('provenance', () => {
     const mealId = repo.createMeal(MEAL);
     repo.linkMedia(mealId, 'telegram', 11);
     repo.linkMedia(mealId, 'telegram', 12);
-    repo.linkMedia(mealId, 'telegram', 12); // idempotent
 
     const rows = db
       .prepare('SELECT source_id FROM meal_media WHERE meal_id = ? ORDER BY source_id')
       .all(mealId) as Array<{ source_id: number }>;
     expect(rows.map((r) => r.source_id)).toEqual([11, 12]);
+  });
+
+  // One message is at most one meal. The old key included meal_id, so a
+  // retry after a crash created a second meal from the same photo that was
+  // counted twice — and linkMedia's OR IGNORE hid it. Now it fails loudly.
+  it('refuses a second meal from the same source message', () => {
+    const first = repo.createMeal(MEAL);
+    repo.linkMedia(first, 'telegram', 11);
+    const second = repo.createMeal(MEAL);
+
+    expect(() => repo.linkMedia(second, 'telegram', 11)).toThrow(/UNIQUE/);
+    expect(() => repo.linkMedia(first, 'telegram', 11)).toThrow(/UNIQUE/);
   });
 });

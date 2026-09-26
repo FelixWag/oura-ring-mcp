@@ -689,6 +689,7 @@ describe('replies', () => {
         text: stored.text!,
         ...(replyTo !== undefined ? { replyToMessageId: replyTo } : {}),
         isForwarded: false,
+        updateId: stored.id,
       },
       '/media',
       { runner: async () => CORRECTED },
@@ -780,6 +781,15 @@ describe('replies', () => {
       expect(status(second)).toBe('confirmed');
     });
 
+    // Message ids restart at 1 in a new bot's chat, so a reply is only ever
+    // matched against meals that came through the same bot.
+    it("does not match a reply against another bot's meals", async () => {
+      const { second } = await albumOfTwoMeals();
+      const result = rejectMeal(db, 903, CONFIG.botId + 1);
+      expect(result.status).toBe('not_a_meal');
+      expect(status(second)).toBe('confirmed');
+    });
+
     it('says a meal was already removed when "no" is sent to it twice', async () => {
       const { second } = await albumOfTwoMeals();
       rejectMeal(db, 903);
@@ -792,6 +802,109 @@ describe('replies', () => {
     it('says an "ok" has nothing to do, rather than "nothing waiting"', async () => {
       await albumOfTwoMeals();
       expect(confirmPending(db, 903)).toContain('Already saved');
+    });
+  });
+
+  describe('the text loop', () => {
+    const status = (id: number) =>
+      (db.prepare('SELECT status FROM meals WHERE id = ?').get(id) as { status: string }).status;
+    const fakeClient = (ids: number[]) => {
+      const sent: string[] = [];
+      let next = 0;
+      const client = {
+        sendMessage: async (_chat: number, text: string) => {
+          sent.push(text);
+          return ids[next++] ?? null;
+        },
+      } as unknown as TelegramClient;
+      return { client, sent };
+    };
+    const extractions = (mealId: number) =>
+      (
+        db.prepare('SELECT COUNT(*) AS n FROM meal_extractions WHERE meal_id = ?').get(mealId) as {
+          n: number;
+        }
+      ).n;
+
+    // The handled mark used to be written after the correction committed, with
+    // a log write in between. A failure there left the message unmarked, and
+    // the next cycle applied the same correction again on top of itself.
+    it('applies a correction once even if logging fails right after it', async () => {
+      const { second } = await albumOfTwoMeals();
+      processBatch(
+        [
+          update(20, {
+            message_id: 910,
+            text: 'a different spread',
+            reply_to_message: botEstimate(903),
+          }),
+        ],
+        repo,
+        CONFIG,
+      );
+      const { client } = fakeClient([950, 951]);
+      let failLog = true;
+      const log = async () => {
+        if (failLog) throw new Error('log disk full');
+      };
+
+      await drainText(db, client, CONFIG, log, { runner: async () => CORRECTED }).catch(() => {});
+      failLog = false;
+      await drainText(db, client, CONFIG, log, { runner: async () => CORRECTED });
+
+      expect(extractions(second)).toBe(2); // the original and ONE amendment
+      const corrections = db
+        .prepare("SELECT COUNT(*) AS n FROM model_calls WHERE purpose = 'correct'")
+        .get() as { n: number };
+      expect(corrections.n).toBe(1);
+    });
+
+    // Only the first estimate used to be remembered, so a reply to "Updated:"
+    // matched nothing and fell back to "which meal?".
+    it('binds a reply to the bot\'s "Updated:" message to that meal', async () => {
+      const { first, second } = await albumOfTwoMeals();
+      processBatch(
+        [
+          update(20, {
+            message_id: 910,
+            text: 'a different spread',
+            reply_to_message: botEstimate(903),
+          }),
+        ],
+        repo,
+        CONFIG,
+      );
+      const { client, sent } = fakeClient([950]);
+      await drainText(db, client, CONFIG, async () => {}, { runner: async () => CORRECTED });
+      expect(sent[0]).toContain('Updated "bread with spread"');
+
+      const removal = rejectMeal(db, 950); // "no" in reply to "Updated:"
+      expect(removal).toMatchObject({ status: 'removed', meal_id: second });
+      expect(status(first)).toBe('confirmed');
+    });
+
+    // A message that only mentions a meal does not stand for it: "no" in reply
+    // to "that doesn't seem to be about X" must not remove X.
+    it('does not bind a reply to a mismatch message to the meal it mentions', async () => {
+      const { second } = await albumOfTwoMeals();
+      processBatch(
+        [
+          update(20, {
+            message_id: 910,
+            text: 'the rice was quinoa',
+            reply_to_message: botEstimate(903),
+          }),
+        ],
+        repo,
+        CONFIG,
+      );
+      const { client } = fakeClient([952]);
+      await drainText(db, client, CONFIG, async () => {}, {
+        runner: async () => '{"mismatch": true, "reason": "No rice here."}',
+      });
+
+      expect(rejectMeal(db, 952).status).toBe('not_a_meal');
+      expect(status(second)).toBe('confirmed');
     });
   });
 

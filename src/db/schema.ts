@@ -914,6 +914,112 @@ const MIGRATIONS: readonly Migration[] = [
         ON meals(id) WHERE status = 'unconfirmed' AND prompt_message_id IS NULL;
     `,
   },
+  {
+    version: 18,
+    name: 'v0.13: model_calls, one meal per source message, meal time source, telegram notes',
+    sql: `
+      -- Every model invocation, whatever it decided and whether it worked.
+      -- meal_extractions stays the record of ACCEPTED estimates: it is counted
+      -- for the per-meal correction depth and its totals are NOT NULL, so a
+      -- failed or mismatched call cannot live there — and did not live
+      -- anywhere, which left failures visible only in a plaintext log.
+      -- Inserted when the call starts (outcome NULL) and finished once, in the
+      -- same transaction as whatever the call wrote; an old row with outcome
+      -- NULL is a process that died mid-call. The spend cap is a COUNT over
+      -- this table by instant: a counter keyed by the meal's day let
+      -- corrections to yesterday's meals go uncapped today.
+      CREATE TABLE IF NOT EXISTS model_calls (
+        id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+        purpose             TEXT NOT NULL,
+        telegram_update_id  INTEGER REFERENCES telegram_updates(id), -- the message that caused it
+        meal_id             INTEGER REFERENCES meals(id),  -- extract: meal created; correct: meal amended; route: accepted target
+        extraction_id       INTEGER REFERENCES meal_extractions(id), -- only when an estimate was accepted
+        model               TEXT NOT NULL,                 -- as requested
+        prompt_version      TEXT NOT NULL,
+        started_epoch       INTEGER NOT NULL,
+        duration_ms         INTEGER,
+        outcome             TEXT,                          -- NULL = never finished
+        decision            TEXT,                          -- route only; vocabulary checked in code, it will grow
+        context             TEXT,                          -- JSON of ids shown to the model, never text
+        raw_response        TEXT,                          -- verbatim, failures included; never written to the log
+        error               TEXT,                          -- the reason, with model text kept out
+        usage               TEXT,                          -- SDK usage JSON, verbatim
+        cost_usd            REAL,                          -- as the SDK reports it; notional under a subscription
+        CHECK (purpose IN ('route', 'extract_photo', 'extract_text', 'correct')),
+        CHECK (outcome IS NULL OR outcome IN
+               ('ok', 'not_food', 'mismatch', 'ambiguous', 'invalid', 'failed')),
+        CHECK (decision IS NULL OR purpose = 'route'),
+        CHECK (extraction_id IS NULL OR
+               (purpose <> 'route' AND outcome = 'ok' AND meal_id IS NOT NULL))
+      );
+      CREATE INDEX IF NOT EXISTS idx_model_calls_spend ON model_calls(purpose, started_epoch);
+      CREATE INDEX IF NOT EXISTS idx_model_calls_update ON model_calls(telegram_update_id)
+        WHERE telegram_update_id IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS idx_model_calls_meal ON model_calls(meal_id)
+        WHERE meal_id IS NOT NULL;
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_model_calls_extraction
+        ON model_calls(extraction_id) WHERE extraction_id IS NOT NULL;
+      -- One message amends a given meal at most once, so a restart after the
+      -- amendment committed cannot stack "add a bread roll" twice. Keyed on
+      -- (message, meal) rather than message alone, so one message may still
+      -- amend one meal and create another.
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_model_calls_one_write
+        ON model_calls(telegram_update_id, meal_id) WHERE extraction_id IS NOT NULL;
+
+      -- One source message creates at most one meal. The v15 key includes
+      -- meal_id, so it never stopped a retry from creating a second meal from
+      -- the same photo, projected and counted twice. Writers must use a plain
+      -- INSERT: OR IGNORE turns this guard into a silent no-op while the
+      -- duplicate meal still counts.
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_meal_media_source ON meal_media(source_kind, source_id);
+
+      -- How eaten_epoch was decided. A photo is eaten when it is sent; "I had
+      -- it an hour ago" is not. The words stay in telegram_updates and the
+      -- model's reading of them in model_calls, so this can be re-derived.
+      ALTER TABLE meals ADD COLUMN time_source TEXT NOT NULL DEFAULT 'message'
+        CHECK (time_source IN ('message', 'stated', 'exif'));
+
+      -- Telegram provenance for notes, beside voice_log_id: at most one channel
+      -- per row, and only on local rows.
+      ALTER TABLE annotations ADD COLUMN telegram_update_id INTEGER REFERENCES telegram_updates(id)
+        CHECK (telegram_update_id IS NULL OR (voice_log_id IS NULL AND source = 'local'));
+      CREATE INDEX IF NOT EXISTS idx_annotations_telegram_update
+        ON annotations(telegram_update_id) WHERE telegram_update_id IS NOT NULL;
+    `,
+  },
+  {
+    version: 19,
+    name: 'v0.13: telegram_bot_messages (what the bot said, so replies bind)',
+    sql: `
+      -- A reply binds to the bot message it answers. Only the first estimate
+      -- was remembered (meals.prompt_message_id), so a reply to "Updated:" or
+      -- "Removed" matched nothing and fell back to "which meal?". Keyed by bot
+      -- as well, because message ids restart at 1 in a new bot's chat.
+      -- meals.prompt_message_id stays, as drainPrompts' "not yet told" flag.
+      CREATE TABLE IF NOT EXISTS telegram_bot_messages (
+        id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+        bot_id              INTEGER NOT NULL,
+        chat_id             INTEGER NOT NULL,
+        message_id          INTEGER NOT NULL,
+        kind                TEXT NOT NULL,      -- estimate, amended, removed, reply, …; checked in code
+        meal_id             INTEGER REFERENCES meals(id),
+        answers_update_id   INTEGER REFERENCES telegram_updates(id),
+        model_call_id       INTEGER REFERENCES model_calls(id),
+        text                TEXT,               -- what the user was actually told
+        sent_epoch          INTEGER,            -- NULL only for rows backfilled from v17
+        UNIQUE (bot_id, chat_id, message_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_telegram_bot_messages_meal
+        ON telegram_bot_messages(meal_id) WHERE meal_id IS NOT NULL;
+      INSERT OR IGNORE INTO telegram_bot_messages
+        (bot_id, chat_id, message_id, kind, meal_id, answers_update_id)
+      SELECT t.bot_id, t.chat_id, m.prompt_message_id, 'estimate', m.id, t.id
+        FROM meals m
+        JOIN meal_media mm ON mm.meal_id = m.id AND mm.source_kind = 'telegram'
+        JOIN telegram_updates t ON t.id = mm.source_id
+       WHERE m.prompt_message_id IS NOT NULL;
+    `,
+  },
 ];
 
 export function currentSchemaVersion(db: Database): number {

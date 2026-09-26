@@ -5,6 +5,7 @@ import { buildVoiceApp } from '../src/voice/server.ts';
 import { Deduper } from '../src/voice/dedupe.ts';
 import { buildSystemPrompt } from '../src/voice/prompts.ts';
 import { VoiceLogsRepo } from '../src/db/repos/voice_logs.ts';
+import { TelegramUpdatesRepo } from '../src/db/repos/telegram_updates.ts';
 
 const TOKEN = 'test-token-abc';
 const MCP_ENTRY = '/tmp/fake-mcp-entry.js';
@@ -219,6 +220,70 @@ describe('POST /v1/log — agent invocation', () => {
     });
     expect(appendedLines).toHaveLength(1);
     expect(appendedLines[0]).toMatch(/voice_log=1\s+ok\s+1 annotations/);
+  });
+});
+
+describe('POST /v1/log — linking annotations', () => {
+  // A note that arrived over Telegram during a voice run has its own
+  // provenance. The time-window linker used to claim anything unlinked in
+  // the window, which would attach a Telegram note to a dictation.
+  it('links its own annotations, not a Telegram note made at the same time', async () => {
+    new TelegramUpdatesRepo(db).storeBatch(
+      1,
+      [
+        {
+          bot_id: 1,
+          update_id: 1,
+          chat_id: 42,
+          message_id: 900,
+          kind: 'text',
+          text: 'a synthetic note',
+          sent_epoch: Math.floor(Date.now() / 1000),
+          tz_assumed: 'UTC',
+          needs_media: false,
+          raw: '{}',
+          is_forwarded: false,
+        },
+      ],
+      null,
+      0,
+    );
+    const telegramRow = (db.prepare('SELECT id FROM telegram_updates').get() as { id: number }).id;
+    const insert = (telegramUpdateId: number | null) => {
+      const now = new Date().toISOString();
+      db.prepare(
+        `INSERT INTO annotations
+           (tag_type_code, start_time, start_day, source, created_at, updated_at, telegram_update_id)
+         VALUES ('tag_generic_coffee', ?, ?, 'local', ?, ?, ?)`,
+      ).run(now, now.slice(0, 10), now, now, telegramUpdateId);
+    };
+    const fakeAgent = vi.fn(async () => {
+      const started_at = new Date().toISOString();
+      insert(null); // the dictation's own annotation
+      insert(telegramRow); // a Telegram note, written during the same window
+      return {
+        ok: true,
+        annotation_count: 1,
+        summary: 'Logged 1',
+        started_at,
+        finished_at: new Date().toISOString(),
+      };
+    });
+    const app = buildApp({ runAgentOverride: fakeAgent });
+    const res = await request(app).post('/v1/log').set('Authorization', `Bearer ${TOKEN}`).send({
+      text: 'had a coffee',
+      captured_at: '2026-05-19T08:00:00Z',
+      timezone: 'UTC',
+    });
+    expect(res.status).toBe(200);
+
+    const rows = db
+      .prepare('SELECT voice_log_id, telegram_update_id FROM annotations ORDER BY id')
+      .all();
+    expect(rows).toEqual([
+      { voice_log_id: 1, telegram_update_id: null },
+      { voice_log_id: null, telegram_update_id: telegramRow },
+    ]);
   });
 });
 

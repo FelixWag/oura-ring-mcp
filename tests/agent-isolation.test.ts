@@ -23,13 +23,23 @@ import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const { captured } = vi.hoisted(() => ({ captured: [] as Record<string, unknown>[] }));
+const { captured, sdk } = vi.hoisted(() => ({
+  captured: [] as Record<string, unknown>[],
+  /** Set to make the mocked SDK throw its own error mid-session. */
+  sdk: { throwWith: null as string | null },
+}));
 
 // One canned reply for every session. It is a meal estimate so the extractor
 // can parse it; the voice agent ignores the text.
 vi.mock('@anthropic-ai/claude-agent-sdk', () => ({
   query: ({ options }: { options: Record<string, unknown> }) => {
     captured.push(options);
+    if (sdk.throwWith !== null) {
+      const message = sdk.throwWith;
+      return (async function* () {
+        throw new Error(message);
+      })();
+    }
     return (async function* () {
       yield {
         type: 'assistant',
@@ -66,6 +76,7 @@ beforeEach(() => {
   // Never let a test create the agent cwd beside the real database.
   process.env.OURA_DB_PATH = join(tmp, 'data.sqlite');
   captured.length = 0;
+  sdk.throwWith = null;
 });
 
 afterEach(() => {
@@ -260,5 +271,18 @@ describe('every SDK call site', () => {
         }).toEqual({ name, isolatedLast: true, tools: true, model: true, effort: true });
       }
     }
+  });
+});
+
+describe('an SDK error', () => {
+  // The SDK's own errors can quote the result text ("Claude Code returned an
+  // error result: …"), and a failed call's error is logged. Only its kind is.
+  it('never carries the SDK error text into the result', async () => {
+    sdk.throwWith = 'Claude Code returned an error result: SECRET-MODEL-TEXT';
+    const result = await extractMeal(mealContext());
+
+    expect(result.ok).toBe(false);
+    expect(result.error).toBe('model call failed (Error)');
+    expect(JSON.stringify(result)).not.toContain('SECRET-MODEL-TEXT');
   });
 });
